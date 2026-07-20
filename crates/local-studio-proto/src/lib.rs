@@ -191,6 +191,8 @@ pub struct RequestAuth {
     pub capability: Capability,
 }
 
+pub type SessionsReadAuth = RequestAuth;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MutationAuth {
@@ -553,6 +555,167 @@ pub struct SessionMetadata {
     pub model_id: Option<String>,
     #[serde(deserialize_with = "deserialize_optional_identifier")]
     pub provider_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionListCursorKind {
+    #[serde(rename = "session_list_cursor")]
+    SessionListCursor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionListCursor {
+    #[serde(rename = "type")]
+    pub kind: SessionListCursorKind,
+    #[serde(deserialize_with = "deserialize_opaque_token")]
+    pub token: String,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    pub revision: u64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionDescriptor {
+    pub session: ExternalSessionIdentity,
+    pub metadata: SessionMetadata,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    pub revision: u64,
+    pub archived: bool,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionListRequestKind {
+    #[serde(rename = "session_list_request")]
+    SessionListRequest,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListRequest {
+    #[serde(rename = "type")]
+    pub kind: SessionListRequestKind,
+    pub protocol_version: ProtocolVersion,
+    pub auth: SessionsReadAuth,
+    pub cursor: Option<SessionListCursor>,
+    pub limit: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionListRequestWire {
+    #[serde(rename = "type")]
+    kind: SessionListRequestKind,
+    protocol_version: ProtocolVersion,
+    auth: SessionsReadAuth,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    cursor: Option<SessionListCursor>,
+    #[serde(deserialize_with = "deserialize_session_limit")]
+    limit: u16,
+}
+
+impl<'de> Deserialize<'de> for SessionListRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let request = SessionListRequestWire::deserialize(deserializer)?;
+        if request.auth.capability != Capability::SessionsRead {
+            return Err(D::Error::custom(
+                "session list auth must require sessions.read",
+            ));
+        }
+        if request
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| !cursor.has_more)
+        {
+            return Err(D::Error::custom(
+                "session list continuation cursor must advertise another page",
+            ));
+        }
+        Ok(Self {
+            kind: request.kind,
+            protocol_version: request.protocol_version,
+            auth: request.auth,
+            cursor: request.cursor,
+            limit: request.limit,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionListPageKind {
+    #[serde(rename = "session_list_page")]
+    SessionListPage,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListPage {
+    #[serde(rename = "type")]
+    pub kind: SessionListPageKind,
+    pub protocol_version: ProtocolVersion,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub request_id: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub controller_id: String,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    pub revision: u64,
+    pub sessions: Vec<SessionDescriptor>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub cursor: Option<SessionListCursor>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionListPageWire {
+    #[serde(rename = "type")]
+    kind: SessionListPageKind,
+    protocol_version: ProtocolVersion,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    request_id: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    controller_id: String,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    revision: u64,
+    sessions: Vec<SessionDescriptor>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    cursor: Option<SessionListCursor>,
+}
+
+impl<'de> Deserialize<'de> for SessionListPage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let page = SessionListPageWire::deserialize(deserializer)?;
+        if page.sessions.len() > 200 {
+            return Err(D::Error::custom(
+                "session list page must contain at most 200 sessions",
+            ));
+        }
+        if page
+            .cursor
+            .as_ref()
+            .is_some_and(|cursor| !cursor.has_more || cursor.revision != page.revision)
+        {
+            return Err(D::Error::custom(
+                "session list cursor must continue the page revision",
+            ));
+        }
+        Ok(Self {
+            kind: page.kind,
+            protocol_version: page.protocol_version,
+            request_id: page.request_id,
+            controller_id: page.controller_id,
+            revision: page.revision,
+            sessions: page.sessions,
+            cursor: page.cursor,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1530,6 +1693,109 @@ mod tests {
         unsafe_cursor["cursor"] = cursor;
         unsafe_cursor["cursor"]["revision"] = json!(MAX_SAFE_JSON_INTEGER + 1);
         assert!(serde_json::from_value::<SessionReadRequest>(unsafe_cursor).is_err());
+    }
+
+    #[test]
+    fn session_list_wire_is_strict_bounded_and_revision_bound() {
+        let auth = json!({
+            "device": {
+                "deviceId": "a".repeat(64),
+                "keyId": "a".repeat(64),
+                "algorithm": "ed25519"
+            },
+            "requestId": "request-list-1",
+            "issuedAt": "2026-07-20T12:00:00Z",
+            "expiresAt": "2026-07-20T12:00:30Z",
+            "nonce": "nonce_list_1234567890",
+            "bodyHash": "b".repeat(64),
+            "signature": "A".repeat(86),
+            "capability": "sessions.read"
+        });
+        let first = json!({
+            "type": "session_list_request",
+            "protocolVersion": 1,
+            "auth": auth,
+            "cursor": null,
+            "limit": 50
+        });
+        let parsed = serde_json::from_value::<SessionListRequest>(first.clone()).unwrap();
+        assert_eq!(parsed.limit, 50);
+        assert!(parsed.cursor.is_none());
+
+        let cursor = json!({
+            "type": "session_list_cursor",
+            "token": "cursor-token-1",
+            "revision": 4,
+            "hasMore": true
+        });
+        let mut continuation = first.clone();
+        continuation["cursor"] = cursor.clone();
+        assert!(serde_json::from_value::<SessionListRequest>(continuation).is_ok());
+
+        let mut exhausted = first.clone();
+        exhausted["cursor"] = cursor.clone();
+        exhausted["cursor"]["hasMore"] = json!(false);
+        assert!(serde_json::from_value::<SessionListRequest>(exhausted).is_err());
+
+        for invalid_limit in [0, 201] {
+            let mut invalid = first.clone();
+            invalid["limit"] = json!(invalid_limit);
+            assert!(serde_json::from_value::<SessionListRequest>(invalid).is_err());
+        }
+        let mut wrong_capability = first.clone();
+        wrong_capability["auth"]["capability"] = json!("stats.read");
+        assert!(serde_json::from_value::<SessionListRequest>(wrong_capability).is_err());
+        let mut missing_cursor = first.clone();
+        missing_cursor.as_object_mut().unwrap().remove("cursor");
+        assert!(serde_json::from_value::<SessionListRequest>(missing_cursor).is_err());
+        let mut unknown = first;
+        unknown["path"] = json!("/private/sessions");
+        assert!(serde_json::from_value::<SessionListRequest>(unknown).is_err());
+
+        let descriptor = json!({
+            "session": {
+                "kind": "external_session",
+                "authority": "local-studio",
+                "installationId": "controller-1",
+                "sessionId": "session-1"
+            },
+            "metadata": {
+                "title": "A session",
+                "cwd": "/tmp/project",
+                "createdAt": "2026-07-20T11:00:00Z",
+                "updatedAt": "2026-07-20T12:00:00Z",
+                "modelId": "model-1",
+                "providerId": null
+            },
+            "revision": 4,
+            "archived": false,
+            "active": true
+        });
+        let page = json!({
+            "type": "session_list_page",
+            "protocolVersion": 1,
+            "requestId": "request-list-1",
+            "controllerId": "controller-1",
+            "revision": 4,
+            "sessions": [descriptor],
+            "cursor": cursor
+        });
+        let parsed = serde_json::from_value::<SessionListPage>(page.clone()).unwrap();
+        assert_eq!(parsed.sessions.len(), 1);
+
+        let mut wrong_revision = page.clone();
+        wrong_revision["cursor"]["revision"] = json!(3);
+        assert!(serde_json::from_value::<SessionListPage>(wrong_revision).is_err());
+        let mut false_cursor = page.clone();
+        false_cursor["cursor"]["hasMore"] = json!(false);
+        assert!(serde_json::from_value::<SessionListPage>(false_cursor).is_err());
+        let mut leaked = page.clone();
+        leaked["sessions"][0]["sourcePath"] = json!("/private/session.jsonl");
+        assert!(serde_json::from_value::<SessionListPage>(leaked).is_err());
+        let mut too_many = page;
+        too_many["cursor"] = Value::Null;
+        too_many["sessions"] = Value::Array(vec![too_many["sessions"][0].clone(); 201]);
+        assert!(serde_json::from_value::<SessionListPage>(too_many).is_err());
     }
 
     #[test]

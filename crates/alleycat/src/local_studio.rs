@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::net::IpAddr;
@@ -8,7 +9,8 @@ use alleycat_bridge_core::{Bridge, Conn, JsonRpcError};
 use alleycat_local_studio_proto::{
     BridgeError, CapabilitiesManifest, CapabilitiesManifestKind, Capability, ControllerSnapshot,
     ControllerSnapshotRequest, ErrorCode, ErrorResult, ErrorResultKind, LocalStudioAdvertisement,
-    ProtocolVersion, SessionAuthority, SessionPage, SessionReadRequest,
+    ProtocolVersion, SessionAuthority, SessionListPage, SessionListRequest, SessionPage,
+    SessionReadRequest,
 };
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
@@ -458,6 +460,61 @@ impl LocalStudioBridge {
         }
     }
 
+    async fn session_list(&self, params: Value) -> Value {
+        let request_id = request_id_from(&params);
+        let request: SessionListRequest = match serde_json::from_value(params) {
+            Ok(request) => request,
+            Err(_) => {
+                return typed_error(
+                    ErrorCode::InvalidRequest,
+                    "Session list request is invalid",
+                    request_id,
+                    false,
+                );
+            }
+        };
+        let node_id = self.authenticated_node.to_string();
+        if request.auth.device.device_id != node_id || request.auth.device.key_id != node_id {
+            return typed_error(
+                ErrorCode::Unauthorized,
+                "Request identity does not match the authenticated connection",
+                request.auth.request_id,
+                false,
+            );
+        }
+        let context = match self.authorize(Capability::SessionsRead) {
+            Ok(context) => context,
+            Err(_) => {
+                return typed_error(
+                    ErrorCode::CapabilityDenied,
+                    "sessions.read is not granted",
+                    request.auth.request_id,
+                    false,
+                );
+            }
+        };
+        let body = match serde_json::to_vec(&request) {
+            Ok(body) if body.len() <= MAX_HTTP_BODY_BYTES => body,
+            _ => {
+                return typed_error(
+                    ErrorCode::PayloadTooLarge,
+                    "Session list request exceeds the size limit",
+                    request.auth.request_id,
+                    false,
+                );
+            }
+        };
+        match forward_session_list(&context.metadata, &request, body).await {
+            Ok(value) => value,
+            Err(error) => typed_error(
+                error.code,
+                error.message,
+                request.auth.request_id,
+                error.retriable,
+            ),
+        }
+    }
+
     async fn session_read(&self, params: Value) -> Value {
         let request_id = request_id_from(&params);
         let request: SessionReadRequest = match serde_json::from_value(params) {
@@ -517,14 +574,18 @@ impl LocalStudioBridge {
 #[async_trait]
 impl Bridge for LocalStudioBridge {
     async fn initialize(&self, _ctx: &Conn, _params: Value) -> Result<Value, JsonRpcError> {
+        let mut methods = vec![
+            "localStudio/capabilities",
+            "localStudio/controller/read",
+            "localStudio/session/read",
+        ];
+        if self.authorize(Capability::SessionsRead).is_ok() {
+            methods.push("localStudio/session/list");
+        }
         Ok(json!({
             "userAgent": format!("alleycat-local-studio/{}", env!("CARGO_PKG_VERSION")),
             "capabilities": {
-                "methods": [
-                    "localStudio/capabilities",
-                    "localStudio/controller/read",
-                    "localStudio/session/read"
-                ]
+                "methods": methods
             }
         }))
     }
@@ -538,6 +599,7 @@ impl Bridge for LocalStudioBridge {
         match method {
             "localStudio/capabilities" => Ok(self.capabilities(params).await),
             "localStudio/controller/read" => Ok(self.controller_read(params).await),
+            "localStudio/session/list" => Ok(self.session_list(params).await),
             "localStudio/session/read" => Ok(self.session_read(params).await),
             other => Err(JsonRpcError::method_not_found(other)),
         }
@@ -599,6 +661,42 @@ async fn forward_controller_read(
                 .capabilities
                 .iter()
                 .any(|capability| !IMPLEMENTED_CAPABILITIES.contains(capability))
+        {
+            return Err(ForwardError::unavailable());
+        }
+        return Ok(response.value);
+    }
+
+    validate_gateway_error(&response.value, &request.auth.request_id)?;
+    Ok(response.value)
+}
+
+async fn forward_session_list(
+    metadata: &GatewayMetadata,
+    request: &SessionListRequest,
+    body: Vec<u8>,
+) -> Result<Value, ForwardError> {
+    let response = forward_gateway(metadata, body).await?;
+    if response.status.is_success() {
+        let page: SessionListPage = serde_json::from_value(response.value.clone())
+            .map_err(|_| ForwardError::unavailable())?;
+        let mut identities = HashSet::with_capacity(page.sessions.len());
+        if page.request_id != request.auth.request_id
+            || page.controller_id != metadata.controller_id
+            || request
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.revision != page.revision)
+            || page.sessions.len() > usize::from(request.limit)
+            || page.sessions.len() > MAX_SESSION_PAGE_ITEMS
+            || page.sessions.iter().any(|descriptor| {
+                descriptor.session.authority != SessionAuthority::LocalStudio
+                    || descriptor.session.installation_id != metadata.controller_id
+                    || !identities.insert((
+                        descriptor.session.installation_id.clone(),
+                        descriptor.session.session_id.clone(),
+                    ))
+            })
         {
             return Err(ForwardError::unavailable());
         }
@@ -853,6 +951,65 @@ mod tests {
             "cursor": null,
             "limit": 50
         })
+    }
+
+    fn session_list_request(node: &EndpointId) -> Value {
+        json!({
+            "type": "session_list_request",
+            "protocolVersion": 1,
+            "auth": {
+                "device": {
+                    "deviceId": node.to_string(),
+                    "keyId": node.to_string(),
+                    "algorithm": "ed25519"
+                },
+                "requestId": "request-list-1",
+                "issuedAt": "2026-07-20T18:29:50.000Z",
+                "expiresAt": "2026-07-20T18:30:20.000Z",
+                "nonce": "session-list-nonce-1234",
+                "bodyHash": "d".repeat(64),
+                "signature": "D".repeat(86),
+                "capability": "sessions.read"
+            },
+            "cursor": null,
+            "limit": 50
+        })
+    }
+
+    fn session_list_page_body() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "type": "session_list_page",
+            "protocolVersion": 1,
+            "requestId": "request-list-1",
+            "controllerId": CONTROLLER_ID,
+            "revision": 7,
+            "sessions": [{
+                "session": {
+                    "kind": "external_session",
+                    "authority": "local-studio",
+                    "installationId": CONTROLLER_ID,
+                    "sessionId": "019f7ca0-1f06-78a3-b4f2-58b6672994af"
+                },
+                "metadata": {
+                    "title": "Acceptance session",
+                    "cwd": null,
+                    "createdAt": "2026-07-20T18:00:00.000Z",
+                    "updatedAt": "2026-07-20T18:30:00.000Z",
+                    "modelId": null,
+                    "providerId": null
+                },
+                "revision": 3,
+                "archived": false,
+                "active": true
+            }],
+            "cursor": {
+                "type": "session_list_cursor",
+                "token": "session-list-cursor-1",
+                "revision": 7,
+                "hasMore": true
+            }
+        }))
+        .unwrap()
     }
 
     fn session_page_body() -> Vec<u8> {
@@ -1241,6 +1398,211 @@ mod tests {
             gateway_secret_header = GATEWAY_SECRET_HEADER,
             test_secret = TEST_SECRET.to_ascii_lowercase()
         )));
+    }
+
+    #[tokio::test]
+    async fn session_list_is_advertised_only_for_granted_callers_and_denied_without_grant() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        write_metadata(&metadata, "http://127.0.0.1:9/api/litter-bridge/v1");
+        let node = iroh::SecretKey::generate().public();
+        let bridge = LocalStudioBridge::new(node);
+        let conn = bridge_conn(&node);
+
+        let denied_methods = bridge.initialize(&conn, json!({})).await.unwrap();
+        assert!(
+            !denied_methods["capabilities"]["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("localStudio/session/list"))
+        );
+        let denied = bridge.session_list(session_list_request(&node)).await;
+        assert_eq!(error_code(&denied), "capability_denied");
+
+        grant_capabilities(node, &[Capability::SessionsRead]);
+        let granted_methods = bridge.initialize(&conn, json!({})).await.unwrap();
+        assert!(
+            granted_methods["capabilities"]["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("localStudio/session/list"))
+        );
+    }
+
+    #[tokio::test]
+    async fn session_list_requires_connection_identity_before_gateway_io() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        write_metadata(&metadata, "http://127.0.0.1:9/api/litter-bridge/v1");
+        let node = iroh::SecretKey::generate().public();
+        let other = iroh::SecretKey::generate().public();
+        grant_capabilities(node, &[Capability::SessionsRead]);
+        let bridge = LocalStudioBridge::new(node);
+
+        let denied = bridge.session_list(session_list_request(&other)).await;
+        assert_eq!(error_code(&denied), "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn session_list_forwards_exact_signed_body_with_secret_and_live_revoke_denies() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        let node = iroh::SecretKey::generate().public();
+        grant_capabilities(node, &[Capability::SessionsRead]);
+        let body = session_list_page_body();
+        let (url, server) = spawn_http_response(
+            "200 OK",
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Content-Length".into(), body.len().to_string()),
+            ],
+            body,
+        )
+        .await;
+        write_metadata(&metadata, &url);
+        let bridge = LocalStudioBridge::new(node);
+        let conn = bridge_conn(&node);
+        let signed_request = session_list_request(&node);
+
+        let response = bridge
+            .dispatch(&conn, "localStudio/session/list", signed_request.clone())
+            .await
+            .unwrap();
+        assert_eq!(response["type"], "session_list_page");
+        assert_eq!(response["sessions"].as_array().unwrap().len(), 1);
+        let received = server.await.unwrap();
+        let received_lower = received.to_ascii_lowercase();
+        assert!(received_lower.contains(&format!(
+            "{gateway_secret_header}: {test_secret}",
+            gateway_secret_header = GATEWAY_SECRET_HEADER,
+            test_secret = TEST_SECRET.to_ascii_lowercase()
+        )));
+        let forwarded_body = received.split("\r\n\r\n").nth(1).unwrap();
+        let forwarded: Value = serde_json::from_str(forwarded_body).unwrap();
+        assert_eq!(forwarded, signed_request);
+        assert!(forwarded.get("method").is_none());
+
+        let mut store = GrantStore::load().unwrap();
+        assert!(
+            store
+                .revoke_capabilities(&node, &[Capability::SessionsRead])
+                .unwrap()
+        );
+        store.save().unwrap();
+        let methods = bridge.initialize(&conn, json!({})).await.unwrap();
+        assert!(
+            !methods["capabilities"]["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("localStudio/session/list"))
+        );
+        let denied = bridge
+            .dispatch(
+                &conn,
+                "localStudio/session/list",
+                session_list_request(&node),
+            )
+            .await
+            .unwrap();
+        assert_eq!(error_code(&denied), "capability_denied");
+    }
+
+    #[tokio::test]
+    async fn session_list_accepts_only_strict_pages_and_request_bound_errors() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        let node = iroh::SecretKey::generate().public();
+        grant_capabilities(node, &[Capability::SessionsRead]);
+        let bridge = LocalStudioBridge::new(node);
+
+        let valid_page: Value = serde_json::from_slice(&session_list_page_body()).unwrap();
+        let mut wrong_request = valid_page.clone();
+        wrong_request["requestId"] = json!("request-other");
+        let mut invalid_cursor = valid_page.clone();
+        invalid_cursor["cursor"]["revision"] = json!(6);
+        let mut foreign_session = valid_page.clone();
+        foreign_session["sessions"][0]["session"]["installationId"] = json!("controller-other");
+        let mut duplicate_session = valid_page.clone();
+        duplicate_session["sessions"] = json!([
+            valid_page["sessions"][0].clone(),
+            valid_page["sessions"][0].clone()
+        ]);
+
+        for invalid_page in [
+            wrong_request,
+            invalid_cursor,
+            foreign_session,
+            duplicate_session,
+        ] {
+            let invalid_body = serde_json::to_vec(&invalid_page).unwrap();
+            let (invalid_url, invalid_server) = spawn_http_response(
+                "200 OK",
+                vec![
+                    ("Content-Type".into(), "application/json".into()),
+                    ("Content-Length".into(), invalid_body.len().to_string()),
+                ],
+                invalid_body,
+            )
+            .await;
+            write_metadata(&metadata, &invalid_url);
+            let unavailable = bridge.session_list(session_list_request(&node)).await;
+            assert_eq!(error_code(&unavailable), "controller_unavailable");
+            invalid_server.await.unwrap();
+        }
+
+        let mismatched_error = serde_json::to_vec(&json!({
+            "type": "error",
+            "protocolVersion": 1,
+            "requestId": "request-other",
+            "error": {
+                "code": "not_found",
+                "message": "sessions not found",
+                "retriable": false,
+                "requestId": "request-other",
+                "details": null
+            }
+        }))
+        .unwrap();
+        let (mismatch_url, mismatch_server) = spawn_http_response(
+            "404 Not Found",
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Content-Length".into(), mismatched_error.len().to_string()),
+            ],
+            mismatched_error,
+        )
+        .await;
+        write_metadata(&metadata, &mismatch_url);
+        let unavailable = bridge.session_list(session_list_request(&node)).await;
+        assert_eq!(error_code(&unavailable), "controller_unavailable");
+        mismatch_server.await.unwrap();
+
+        let matching_error = serde_json::to_vec(&json!({
+            "type": "error",
+            "protocolVersion": 1,
+            "requestId": "request-list-1",
+            "error": {
+                "code": "not_found",
+                "message": "sessions not found",
+                "retriable": false,
+                "requestId": "request-list-1",
+                "details": null
+            }
+        }))
+        .unwrap();
+        let (error_url, error_server) = spawn_http_response(
+            "404 Not Found",
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Content-Length".into(), matching_error.len().to_string()),
+            ],
+            matching_error,
+        )
+        .await;
+        write_metadata(&metadata, &error_url);
+        let not_found = bridge.session_list(session_list_request(&node)).await;
+        assert_eq!(error_code(&not_found), "not_found");
+        error_server.await.unwrap();
     }
 
     #[tokio::test]
