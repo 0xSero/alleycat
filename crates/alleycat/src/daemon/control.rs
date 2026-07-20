@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use alleycat_local_studio_proto::Capability;
+
 use crate::protocol::{AgentInfo, PairPayload};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,8 +32,20 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expires_at: Option<String>,
     },
+    /// Grant an explicit non-empty set from the closed protocol-v1 capability enum.
+    LocalStudioGrantCapabilities {
+        endpoint_id: String,
+        capabilities: Vec<Capability>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<String>,
+    },
     /// Revoke protocol-v1 `stats.read` for one authenticated endpoint ID.
     LocalStudioRevokeStatsRead { endpoint_id: String },
+    /// Revoke an explicit non-empty set from the closed protocol-v1 capability enum.
+    LocalStudioRevokeCapabilities {
+        endpoint_id: String,
+        capabilities: Vec<Capability>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +115,8 @@ pub fn token_fingerprint(token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -137,6 +153,30 @@ mod tests {
             })
             .unwrap()["op"],
             "local_studio_revoke_stats_read"
+        );
+
+        let explicit = Request::LocalStudioGrantCapabilities {
+            endpoint_id: "c".repeat(64),
+            capabilities: vec![Capability::StatsRead, Capability::SessionsRead],
+            expires_at: None,
+        };
+        let encoded = serde_json::to_value(explicit).unwrap();
+        assert_eq!(encoded["op"], "local_studio_grant_capabilities");
+        assert_eq!(
+            encoded["capabilities"],
+            json!(["stats.read", "sessions.read"])
+        );
+        assert!(matches!(
+            serde_json::from_value::<Request>(encoded).unwrap(),
+            Request::LocalStudioGrantCapabilities { .. }
+        ));
+        assert!(
+            serde_json::from_value::<Request>(json!({
+                "op": "local_studio_grant_capabilities",
+                "endpoint_id": "d".repeat(64),
+                "capabilities": ["all"]
+            }))
+            .is_err()
         );
     }
 

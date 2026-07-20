@@ -199,6 +199,16 @@ impl GrantStore {
         endpoint_id: EndpointId,
         expires_at: Option<DateTime<Utc>>,
     ) -> anyhow::Result<()> {
+        self.grant_capabilities(endpoint_id, &[Capability::StatsRead], expires_at)
+    }
+
+    pub fn grant_capabilities(
+        &mut self,
+        endpoint_id: EndpointId,
+        capabilities: &[Capability],
+        expires_at: Option<DateTime<Utc>>,
+    ) -> anyhow::Result<()> {
+        let requested = validate_capability_selection(capabilities)?;
         let key = endpoint_id.to_string();
         let mut grant = self.nodes.remove(&key).unwrap_or(PairedNodeGrant {
             endpoint_id: key,
@@ -208,10 +218,12 @@ impl GrantStore {
             revoked_at: None,
             actions: Vec::new(),
         });
-        if !grant.grants.contains(&Capability::StatsRead) {
-            grant.grants.push(Capability::StatsRead);
-            grant.grants.sort_unstable();
+        for capability in requested {
+            if !grant.grants.contains(&capability) {
+                grant.grants.push(capability);
+            }
         }
+        grant.grants.sort_unstable();
         grant.expires_at = expires_at;
         grant.revoked_at = None;
         self.replace(grant)
@@ -230,14 +242,27 @@ impl GrantStore {
     }
 
     pub fn revoke_stats_read(&mut self, endpoint_id: &EndpointId) -> bool {
+        self.revoke_capabilities(endpoint_id, &[Capability::StatsRead])
+            .unwrap_or(false)
+    }
+
+    pub fn revoke_capabilities(
+        &mut self,
+        endpoint_id: &EndpointId,
+        capabilities: &[Capability],
+    ) -> anyhow::Result<bool> {
+        let requested = validate_capability_selection(capabilities)?;
         let Some(grant) = self.nodes.get_mut(&endpoint_id.to_string()) else {
-            return false;
+            return Ok(false);
         };
         let before = grant.grants.len();
         grant
             .grants
-            .retain(|capability| *capability != Capability::StatsRead);
-        grant.grants.len() != before
+            .retain(|capability| !requested.contains(capability));
+        if requested.contains(&Capability::ModelsControl) {
+            grant.actions.clear();
+        }
+        Ok(grant.grants.len() != before)
     }
 
     pub fn effective(
@@ -287,6 +312,19 @@ impl GrantStore {
         self.effective(endpoint_id, now)
             .is_some_and(|grant| grant.allows_action(action))
     }
+}
+
+fn validate_capability_selection(
+    capabilities: &[Capability],
+) -> anyhow::Result<BTreeSet<Capability>> {
+    if capabilities.is_empty() {
+        bail!("at least one explicit Local Studio capability is required");
+    }
+    let requested = capabilities.iter().copied().collect::<BTreeSet<_>>();
+    if requested.len() != capabilities.len() {
+        bail!("duplicate Local Studio capability selection");
+    }
+    Ok(requested)
 }
 
 fn validate_grant(grant: &PairedNodeGrant) -> anyhow::Result<()> {
@@ -554,6 +592,64 @@ mod tests {
         assert!(store.revoke_stats_read(&id));
         assert!(!store.allows_capability(&id, Capability::StatsRead, now()));
         assert!(store.allows_capability(&id, Capability::SessionsRead, now()));
+    }
+
+    #[test]
+    fn explicit_capability_grants_and_revocations_are_narrow() {
+        let id = endpoint();
+        let mut store = GrantStore::empty();
+        store
+            .grant_capabilities(id, &[Capability::StatsRead, Capability::SessionsRead], None)
+            .unwrap();
+
+        assert!(store.allows_capability(&id, Capability::StatsRead, now()));
+        assert!(store.allows_capability(&id, Capability::SessionsRead, now()));
+        assert!(!store.allows_capability(&id, Capability::SessionsWrite, now()));
+        assert!(!store.allows_capability(&id, Capability::AgentTurn, now()));
+
+        assert!(
+            store
+                .revoke_capabilities(&id, &[Capability::SessionsRead])
+                .unwrap()
+        );
+        assert!(store.allows_capability(&id, Capability::StatsRead, now()));
+        assert!(!store.allows_capability(&id, Capability::SessionsRead, now()));
+    }
+
+    #[test]
+    fn capability_selection_rejects_empty_or_duplicate_requests() {
+        let id = endpoint();
+        let mut store = GrantStore::empty();
+        assert!(store.grant_capabilities(id, &[], None).is_err());
+        assert!(
+            store
+                .grant_capabilities(
+                    id,
+                    &[Capability::SessionsRead, Capability::SessionsRead],
+                    None,
+                )
+                .is_err()
+        );
+        assert!(store.nodes().next().is_none());
+    }
+
+    #[test]
+    fn revoking_models_control_also_revokes_action_targets() {
+        let id = endpoint();
+        let mut store = GrantStore::from_document(PairedNodesDocument {
+            version: PAIRED_NODES_STORE_VERSION,
+            nodes: vec![grant(&id)],
+        })
+        .unwrap();
+
+        assert!(
+            store
+                .revoke_capabilities(&id, &[Capability::ModelsControl])
+                .unwrap()
+        );
+        let stored = store.nodes().next().unwrap();
+        assert!(!stored.grants.contains(&Capability::ModelsControl));
+        assert!(stored.actions.is_empty());
     }
 
     #[test]
