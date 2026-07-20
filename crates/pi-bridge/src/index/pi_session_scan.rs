@@ -11,13 +11,35 @@
 //! Only the subset of entry fields that contribute to the listing surface
 //! (`session_info` for the user-defined name; `message` entries for counts, the first
 //! user message preview, the all-text search blob, and the modified-time fallback)
-//! are parsed. Everything else is discarded.
+//! are parsed. Everything else is discarded. Startup reads at most 64 KiB per file;
+//! larger histories retain a bounded summary and use file mtime for freshness.
 
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+/// Maximum prefix read from one historical session during startup hydration.
+///
+/// The index only needs the header and a useful preview. Full session replay is
+/// handled by the normal thread-read path. Bounding this scan prevents a corrupt
+/// or runaway JSONL file from delaying daemon readiness or being copied into
+/// several multi-gigabyte in-memory representations.
+const MAX_SESSION_SCAN_BYTES: u64 = 64 * 1024;
+
+#[derive(Debug)]
+struct SessionScanOutcome {
+    info: Option<PiSessionInfo>,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct DirectoryScanOutcome {
+    sessions: Vec<PiSessionInfo>,
+    truncated_sessions: usize,
+}
 
 /// One scanned pi session, mirroring `SessionInfo` in pi's session-manager.ts:168-182.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -73,14 +95,33 @@ fn dirs_home() -> Option<PathBuf> {
     directories::UserDirs::new().map(|u| u.home_dir().to_path_buf())
 }
 
-/// Port of `listSessionsFromDir`. Reads every `*.jsonl` file in `dir` and parses
-/// each into a `PiSessionInfo`, dropping files that fail to parse or lack a header.
-/// Order matches filesystem iteration order — sort at the call site if needed.
+/// Port of `listSessionsFromDir`. Reads a bounded prefix of every `*.jsonl` file
+/// in `dir` and parses each into a `PiSessionInfo`, dropping files that fail to
+/// parse or lack a header. Order matches filesystem iteration order — sort at the
+/// call site if needed.
 pub async fn list_sessions_from_dir(dir: &Path) -> Vec<PiSessionInfo> {
+    let outcome = scan_sessions_from_dir(dir).await;
+    if outcome.truncated_sessions > 0 {
+        tracing::debug!(
+            directory = %dir.display(),
+            truncated_sessions = outcome.truncated_sessions,
+            scan_limit_bytes = MAX_SESSION_SCAN_BYTES,
+            "pi hydration used bounded summaries for oversized session files"
+        );
+    }
+    outcome.sessions
+}
+
+async fn scan_sessions_from_dir(dir: &Path) -> DirectoryScanOutcome {
     let mut sessions = Vec::new();
     let mut read_dir = match fs::read_dir(dir).await {
         Ok(rd) => rd,
-        Err(_) => return sessions,
+        Err(_) => {
+            return DirectoryScanOutcome {
+                sessions,
+                truncated_sessions: 0,
+            };
+        }
     };
 
     let mut paths = Vec::new();
@@ -91,12 +132,20 @@ pub async fn list_sessions_from_dir(dir: &Path) -> Vec<PiSessionInfo> {
         }
     }
 
+    let mut truncated_sessions = 0usize;
     for path in paths {
-        if let Some(info) = build_session_info(&path).await {
+        let outcome = build_session_info_with_limit(&path, MAX_SESSION_SCAN_BYTES).await;
+        if outcome.truncated {
+            truncated_sessions += 1;
+        }
+        if let Some(info) = outcome.info {
             sessions.push(info);
         }
     }
-    sessions
+    DirectoryScanOutcome {
+        sessions,
+        truncated_sessions,
+    }
 }
 
 /// Port of `SessionManager.listAll`. Walks every immediate subdirectory of
@@ -123,8 +172,20 @@ pub async fn list_all() -> Vec<PiSessionInfo> {
     }
 
     let mut sessions = Vec::new();
+    let mut truncated_sessions = 0usize;
     for dir in subdirs {
-        sessions.extend(list_sessions_from_dir(&dir).await);
+        let outcome = scan_sessions_from_dir(&dir).await;
+        sessions.extend(outcome.sessions);
+        truncated_sessions += outcome.truncated_sessions;
+    }
+
+    if truncated_sessions > 0 {
+        tracing::warn!(
+            root = %sessions_dir.display(),
+            truncated_sessions,
+            scan_limit_bytes = MAX_SESSION_SCAN_BYTES,
+            "pi hydration used bounded summaries for oversized session files"
+        );
     }
 
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
@@ -134,64 +195,102 @@ pub async fn list_all() -> Vec<PiSessionInfo> {
 /// Port of `buildSessionInfo`. Returns `None` if the file is unreadable, has no
 /// entries, or its first non-empty line isn't a session header.
 pub async fn build_session_info(path: &Path) -> Option<PiSessionInfo> {
-    let content = fs::read_to_string(path).await.ok()?;
-    let metadata = fs::metadata(path).await.ok()?;
-    build_session_info_from_content(path, &content, metadata.modified().ok())
+    let outcome = build_session_info_with_limit(path, MAX_SESSION_SCAN_BYTES).await;
+    if outcome.truncated {
+        tracing::warn!(
+            path = %path.display(),
+            scan_limit_bytes = MAX_SESSION_SCAN_BYTES,
+            "pi hydration retained a bounded summary for an oversized session file"
+        );
+    }
+    outcome.info
 }
 
-/// Parse one pi JSONL session file from already-loaded content.
-fn build_session_info_from_content(
-    path: &Path,
-    content: &str,
-    file_mtime: Option<std::time::SystemTime>,
-) -> Option<PiSessionInfo> {
-    let mut entries: Vec<serde_json::Value> = Vec::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+/// Stream a bounded prefix of one pi JSONL session file.
+///
+/// Oversized files remain discoverable: the header, first-message preview, and
+/// any other entries that fit in the prefix are retained. Their modified time
+/// is conservatively advanced to the file mtime, while message count, name, and
+/// search text are explicitly best-effort. A line cut by the byte boundary is
+/// ignored as malformed JSON.
+async fn build_session_info_with_limit(path: &Path, scan_limit_bytes: u64) -> SessionScanOutcome {
+    let metadata = match fs::metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return SessionScanOutcome {
+                info: None,
+                truncated: false,
+            };
         }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            entries.push(value);
+    };
+    let truncated = metadata.len() > scan_limit_bytes;
+    let file = match fs::File::open(path).await {
+        Ok(file) => file,
+        Err(_) => {
+            return SessionScanOutcome {
+                info: None,
+                truncated,
+            };
         }
-        // Malformed lines are silently skipped, matching pi.
-    }
+    };
+    let mut lines = BufReader::new(file.take(scan_limit_bytes)).lines();
 
-    if entries.is_empty() {
-        return None;
-    }
-
-    let header = entries.first()?;
-    if header.get("type").and_then(|v| v.as_str()) != Some("session") {
-        return None;
-    }
-
-    let id = header
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let cwd = header
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
-    let parent_session_path = header
-        .get("parentSession")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from);
-    let created = header
-        .get("timestamp")
-        .and_then(|v| v.as_str())
-        .and_then(parse_iso8601)
-        .unwrap_or_else(Utc::now);
-
+    let mut saw_entry = false;
+    let mut id = String::new();
+    let mut cwd = String::new();
+    let mut parent_session_path: Option<PathBuf> = None;
+    let mut created: Option<DateTime<Utc>> = None;
+    let mut last_activity: Option<DateTime<Utc>> = None;
     let mut message_count = 0usize;
     let mut first_message = String::new();
     let mut all_messages: Vec<String> = Vec::new();
     let mut name: Option<String> = None;
 
-    for entry in &entries {
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) | Err(_) => break,
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        // Malformed lines are silently skipped, matching pi.
+        if !saw_entry {
+            saw_entry = true;
+            if entry.get("type").and_then(|v| v.as_str()) != Some("session") {
+                return SessionScanOutcome {
+                    info: None,
+                    truncated,
+                };
+            }
+            id = entry
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            cwd = entry
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            parent_session_path = entry
+                .get("parentSession")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from);
+            created = Some(
+                entry
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .and_then(parse_iso8601)
+                    .unwrap_or_else(Utc::now),
+            );
+            continue;
+        }
+
         let entry_type = entry.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
         // session_info entries set/clear the user-defined name. Latest wins,
@@ -222,6 +321,9 @@ fn build_session_info_from_content(
             Some(r) if r == "user" || r == "assistant" => r,
             _ => continue,
         };
+        if let Some(activity) = message_activity_time(&entry, message) {
+            last_activity = Some(last_activity.map_or(activity, |previous| previous.max(activity)));
+        }
         let text = extract_text_content(message);
         if text.is_empty() {
             continue;
@@ -232,24 +334,38 @@ fn build_session_info_from_content(
         all_messages.push(text);
     }
 
-    let modified = session_modified_date(&entries, &created, file_mtime);
+    let Some(created) = created else {
+        return SessionScanOutcome {
+            info: None,
+            truncated,
+        };
+    };
+    let mut modified = last_activity.unwrap_or(created);
+    if truncated {
+        if let Some(file_modified) = metadata.modified().ok().and_then(system_time_to_utc) {
+            modified = modified.max(file_modified);
+        }
+    }
 
-    Some(PiSessionInfo {
-        path: path.to_path_buf(),
-        id,
-        cwd,
-        name,
-        parent_session_path,
-        created,
-        modified,
-        message_count,
-        first_message: if first_message.is_empty() {
-            "(no messages)".to_string()
-        } else {
-            first_message
-        },
-        all_messages_text: all_messages.join(" "),
-    })
+    SessionScanOutcome {
+        info: Some(PiSessionInfo {
+            path: path.to_path_buf(),
+            id,
+            cwd,
+            name,
+            parent_session_path,
+            created,
+            modified,
+            message_count,
+            first_message: if first_message.is_empty() {
+                "(no messages)".to_string()
+            } else {
+                first_message
+            },
+            all_messages_text: all_messages.join(" "),
+        }),
+        truncated,
+    }
 }
 
 /// Extracts text from a pi `Message.content` (string or array of content blocks).
@@ -277,61 +393,28 @@ fn extract_text_content(message: &serde_json::Value) -> String {
         .join(" ")
 }
 
-/// Mirrors `getSessionModifiedDate` + `getLastActivityTime` in session-manager.ts:511-547.
-/// Picks the latest user/assistant message timestamp; falls back to the header's
-/// timestamp; falls back to the file mtime.
-fn session_modified_date(
-    entries: &[serde_json::Value],
-    header_created: &DateTime<Utc>,
-    file_mtime: Option<std::time::SystemTime>,
-) -> DateTime<Utc> {
-    let mut last_activity: Option<i64> = None;
-
-    for entry in entries {
-        if entry.get("type").and_then(|v| v.as_str()) != Some("message") {
-            continue;
-        }
-        let Some(message) = entry.get("message") else {
-            continue;
-        };
-        let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        if role != "user" && role != "assistant" {
-            continue;
-        }
-
-        // Pi prefers a numeric `message.timestamp` (epoch millis), falling back
-        // to the entry-level ISO timestamp.
-        if let Some(ms) = message.get("timestamp").and_then(|v| v.as_i64()) {
-            last_activity = Some(last_activity.map_or(ms, |prev| prev.max(ms)));
-            continue;
-        }
-        if let Some(ts) = entry.get("timestamp").and_then(|v| v.as_str()) {
-            if let Some(dt) = parse_iso8601(ts) {
-                let ms = dt.timestamp_millis();
-                last_activity = Some(last_activity.map_or(ms, |prev| prev.max(ms)));
-            }
-        }
+fn message_activity_time(
+    entry: &serde_json::Value,
+    message: &serde_json::Value,
+) -> Option<DateTime<Utc>> {
+    if let Some(ms) = message.get("timestamp").and_then(|v| v.as_i64()) {
+        return (ms > 0)
+            .then(|| DateTime::<Utc>::from_timestamp_millis(ms))
+            .flatten();
     }
+    entry
+        .get("timestamp")
+        .and_then(|v| v.as_str())
+        .and_then(parse_iso8601)
+}
 
-    if let Some(ms) = last_activity {
-        if ms > 0 {
-            if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) {
-                return dt;
-            }
-        }
-    }
-
-    if header_created.timestamp_millis() > 0 {
-        return *header_created;
-    }
-
-    file_mtime
-        .and_then(|t| {
-            t.duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .and_then(|d| DateTime::<Utc>::from_timestamp_millis(d.as_millis() as i64))
+fn system_time_to_utc(value: std::time::SystemTime) -> Option<DateTime<Utc>> {
+    value
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| {
+            DateTime::<Utc>::from_timestamp_millis(duration.as_millis().try_into().ok()?)
         })
-        .unwrap_or_else(Utc::now)
 }
 
 fn parse_iso8601(input: &str) -> Option<DateTime<Utc>> {
@@ -470,5 +553,62 @@ mod tests {
             info.parent_session_path,
             Some(PathBuf::from("/some/parent.jsonl"))
         );
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_retains_summary_and_ignores_entries_past_limit() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oversized.jsonl");
+        let scan_limit = 512usize;
+        let prefix = concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"large\",",
+            "\"timestamp\":\"2020-01-01T00:00:00Z\",\"cwd\":\"/large\"}\n",
+            "{\"type\":\"message\",\"timestamp\":\"2020-01-01T00:00:01Z\",",
+            "\"message\":{\"role\":\"user\",\"content\":\"preview survives\"}}\n"
+        );
+        assert!(prefix.len() < scan_limit);
+
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(prefix.as_bytes()).unwrap();
+        file.write_all(&vec![b' '; scan_limit - prefix.len()])
+            .unwrap();
+        file.write_all(
+            br#"{"type":"session_info","name":"must not be parsed past the budget"}
+"#,
+        )
+        .unwrap();
+        drop(file);
+
+        let outcome = build_session_info_with_limit(&path, scan_limit as u64).await;
+        assert!(outcome.truncated);
+        let info = outcome.info.expect("bounded summary");
+        assert_eq!(info.id, "large");
+        assert_eq!(info.cwd, "/large");
+        assert_eq!(info.first_message, "preview survives");
+        assert_eq!(info.name, None);
+        assert!(info.modified >= info.created);
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_is_independent_of_sparse_file_logical_size() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sparse.jsonl");
+        let header = concat!(
+            "{\"type\":\"session\",\"version\":3,\"id\":\"sparse\",",
+            "\"timestamp\":\"2020-01-01T00:00:00Z\",\"cwd\":\"/sparse\"}\n"
+        );
+        std::fs::write(&path, header).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(512 * 1024 * 1024).unwrap();
+        drop(file);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            build_session_info_with_limit(&path, 4 * 1024),
+        )
+        .await
+        .expect("bounded scan must not traverse the logical file size");
+        assert!(outcome.truncated);
+        assert_eq!(outcome.info.expect("summary").id, "sparse");
     }
 }
