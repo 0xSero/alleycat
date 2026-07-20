@@ -749,6 +749,7 @@ async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, F
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 
+    use alleycat_bridge_core::{SessionRegistry, SessionRegistryConfig};
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -796,6 +797,11 @@ mod tests {
 
     fn error_code(value: &Value) -> &str {
         value["error"]["code"].as_str().unwrap()
+    }
+
+    fn bridge_conn(node: &EndpointId) -> Conn {
+        let registry = SessionRegistry::new(SessionRegistryConfig::default());
+        Conn::from_session(registry.get_or_create(node.to_string(), AGENT_NAME))
     }
 
     fn controller_request(node: &EndpointId) -> Value {
@@ -1269,9 +1275,20 @@ mod tests {
         .await;
         write_metadata(&metadata, &url);
         let bridge = LocalStudioBridge::new(node);
+        let conn = bridge_conn(&node);
         let signed_request = session_request(&node);
 
-        let response = bridge.session_read(signed_request.clone()).await;
+        let initialized = bridge.initialize(&conn, json!({})).await.unwrap();
+        assert!(
+            initialized["capabilities"]["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("localStudio/session/read"))
+        );
+        let response = bridge
+            .dispatch(&conn, "localStudio/session/read", signed_request.clone())
+            .await
+            .unwrap();
         assert_eq!(response["type"], "session_page");
         assert_eq!(
             response["canonicalSession"]["sessionId"],
@@ -1290,7 +1307,10 @@ mod tests {
                 .unwrap()
         );
         store.save().unwrap();
-        let denied = bridge.session_read(session_request(&node)).await;
+        let denied = bridge
+            .dispatch(&conn, "localStudio/session/read", session_request(&node))
+            .await
+            .unwrap();
         assert_eq!(error_code(&denied), "capability_denied");
     }
 
