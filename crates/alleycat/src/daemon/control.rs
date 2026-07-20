@@ -22,6 +22,16 @@ pub enum Request {
     Stop,
     /// Agent introspection.
     AgentsList,
+    /// List host-owned Local Studio paired-node grants.
+    LocalStudioGrantsList,
+    /// Grant only protocol-v1 `stats.read` to one authenticated endpoint ID.
+    LocalStudioGrantStatsRead {
+        endpoint_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<String>,
+    },
+    /// Revoke protocol-v1 `stats.read` for one authenticated endpoint ID.
+    LocalStudioRevokeStatsRead { endpoint_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +115,29 @@ mod tests {
         let s = serde_json::to_string(&Request::Rotate).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, Request::Rotate));
+    }
+
+    #[test]
+    fn local_studio_grant_requests_are_closed_host_operations() {
+        let endpoint = "a".repeat(64);
+        let request = Request::LocalStudioGrantStatsRead {
+            endpoint_id: endpoint.clone(),
+            expires_at: Some("2026-07-21T12:00:00Z".into()),
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["op"], "local_studio_grant_stats_read");
+        assert_eq!(encoded["endpoint_id"], endpoint);
+        assert!(matches!(
+            serde_json::from_value::<Request>(encoded).unwrap(),
+            Request::LocalStudioGrantStatsRead { .. }
+        ));
+        assert_eq!(
+            serde_json::to_value(Request::LocalStudioRevokeStatsRead {
+                endpoint_id: "b".repeat(64)
+            })
+            .unwrap()["op"],
+            "local_studio_revoke_stats_read"
+        );
     }
 
     #[test]

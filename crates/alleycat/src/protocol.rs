@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use alleycat_local_studio_proto::LocalStudioAdvertisement;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const ALLEYCAT_ALPN: &[u8] = b"alleycat/1";
 
@@ -46,6 +48,8 @@ pub struct AgentInfo {
     /// allowlist, transport eligibility) without hardcoding agent names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<AgentCapabilities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_studio: Option<LocalStudioAdvertisement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -231,5 +235,56 @@ impl Response {
             session: None,
             error: Some(error.into()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alleycat_local_studio_proto::{Capability, ControllerActionKind, ProtocolVersion};
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn legacy_agent_info_without_local_studio_still_deserializes() {
+        let legacy = json!({
+            "name": "pi",
+            "display_name": "Pi",
+            "wire": "jsonl",
+            "available": true
+        });
+        let parsed: AgentInfo = serde_json::from_value(legacy).unwrap();
+        assert_eq!(parsed.name, "pi");
+        assert!(parsed.local_studio.is_none());
+
+        let encoded = serde_json::to_value(parsed).unwrap();
+        assert!(encoded.get("local_studio").is_none());
+    }
+
+    #[test]
+    fn local_studio_advertisement_is_additive_and_round_trips() {
+        let agent = AgentInfo {
+            name: "local-studio".into(),
+            display_name: "Local Studio".into(),
+            wire: AgentWire::Jsonl,
+            available: true,
+            presentation: None,
+            capabilities: None,
+            local_studio: Some(LocalStudioAdvertisement {
+                protocol_version: ProtocolVersion,
+                bridge_id: "bridge-1".into(),
+                controller_id: "controller-1".into(),
+                issued_at: "2026-07-20T12:00:00Z".into(),
+                capabilities: vec![Capability::StatsRead],
+                actions: vec![ControllerActionKind::StartRecipe],
+            }),
+        };
+        let encoded = serde_json::to_value(&agent).unwrap();
+        assert_eq!(encoded["local_studio"]["protocolVersion"], 1);
+        assert_eq!(
+            encoded["local_studio"]["capabilities"],
+            json!(["stats.read"])
+        );
+        assert_eq!(serde_json::from_value::<AgentInfo>(encoded).unwrap(), agent);
     }
 }

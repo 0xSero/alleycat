@@ -23,6 +23,7 @@ use alleycat_pi_bridge::PiBridge;
 use alleycat_shell_bridge::ShellBridge;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
+use iroh::EndpointId;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
@@ -34,6 +35,7 @@ use tracing::{info, warn};
 
 use crate::agent_manifest::{MANIFESTS, manifest_for};
 use crate::config::HostConfig;
+use crate::local_studio::{self, LocalStudioBridge};
 use crate::protocol::{AgentInfo, AgentWire};
 use crate::stream::IrohStream;
 
@@ -330,10 +332,21 @@ impl AgentManager {
     }
 
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
+        self.list_agents_for_node(None).await
+    }
+
+    pub async fn list_agents_for(&self, authenticated_node: &EndpointId) -> Vec<AgentInfo> {
+        self.list_agents_for_node(Some(authenticated_node)).await
+    }
+
+    async fn list_agents_for_node(
+        &self,
+        authenticated_node: Option<&EndpointId>,
+    ) -> Vec<AgentInfo> {
         // Availability is computed per-agent (some are async, some not),
         // then each manifest is rendered to the wire `AgentInfo` shape.
         let launch_env = self.daemon_launch_env().await;
-        let mut out = Vec::with_capacity(MANIFESTS.len());
+        let mut out = Vec::with_capacity(MANIFESTS.len() + 1);
         for manifest in MANIFESTS {
             let available = match manifest.name {
                 "codex" => self.codex_available(),
@@ -365,8 +378,10 @@ impl AgentManager {
                 available,
                 presentation: Some(manifest.presentation()),
                 capabilities: Some(manifest.capabilities()),
+                local_studio: None,
             });
         }
+        out.push(local_studio::local_studio_agent_info(authenticated_node));
         out
     }
 
@@ -386,6 +401,7 @@ impl AgentManager {
         stream: IrohStream,
         session: Arc<Session>,
         last_seen: Option<u64>,
+        authenticated_node: EndpointId,
     ) -> anyhow::Result<()> {
         match agent {
             // Codex doesn't participate in the JSON-RPC replay scheme —
@@ -396,6 +412,12 @@ impl AgentManager {
             "codex" => {
                 let _ = (session, last_seen);
                 self.serve_codex(stream).await
+            }
+            "local-studio" => {
+                let bridge = Arc::new(LocalStudioBridge::new(authenticated_node));
+                alleycat_bridge_core::serve_stream_with_session(bridge, stream, session, last_seen)
+                    .await
+                    .context("serving `local-studio` bridge stream")
             }
             other => {
                 let kind =
@@ -450,8 +472,13 @@ impl AgentManager {
             "devin" => Some("devin"),
             "grok" => Some("grok"),
             "shell" => Some("shell"),
+            "local-studio" => Some("local-studio"),
             _ => None,
         }
+    }
+
+    pub fn local_studio_gateway_available(&self) -> bool {
+        local_studio::gateway_available()
     }
 
     pub fn agent_enabled(&self, agent: &str) -> bool {

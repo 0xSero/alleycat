@@ -30,6 +30,35 @@ async fn framing_round_trips_jsonrpc_message() {
     assert_eq!(got["params"]["threadId"], "t1");
 }
 
+#[tokio::test]
+async fn framing_rejects_oversized_jsonl_before_deserialization() {
+    use alleycat_bridge_core::framing::{MAX_JSONL_FRAME_BYTES, ReadJsonLineError};
+
+    let oversized = vec![b'x'; MAX_JSONL_FRAME_BYTES + 1];
+    let mut reader = BufReader::new(oversized.as_slice());
+    let error = read_json_line::<Value, _>(&mut reader).await.unwrap_err();
+    assert!(matches!(
+        error,
+        ReadJsonLineError::Oversized {
+            limit: MAX_JSONL_FRAME_BYTES
+        }
+    ));
+}
+
+#[tokio::test]
+async fn framing_preserves_blank_line_and_eof_behavior_under_the_limit() {
+    let bytes = b"\n  \r\n{\"ok\":true}";
+    let mut reader = BufReader::new(bytes.as_slice());
+    let value: Value = read_json_line(&mut reader).await.unwrap().unwrap();
+    assert_eq!(value, json!({"ok": true}));
+    assert!(
+        read_json_line::<Value, _>(&mut reader)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[test]
 fn inbound_routes_request_response_notification() {
     assert!(matches!(
