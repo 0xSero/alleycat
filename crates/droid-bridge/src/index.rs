@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -9,12 +10,87 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::fs;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, BufReader, SeekFrom};
 
 pub use alleycat_bridge_core::{
     IndexEntry as CoreIndexEntry, ListFilter, ListPage, ListSort, ThreadIndex as CoreThreadIndex,
 };
 
 pub const CLI_VERSION: &str = concat!("alleycat-droid-bridge/", env!("CARGO_PKG_VERSION"));
+
+const MAX_SESSION_SUMMARY_SCAN_BYTES: u64 = 128 * 1024;
+const MAX_SESSION_SUMMARY_TEXT_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Default)]
+struct SessionScanDiagnostics {
+    bytes_read: u64,
+    truncated: bool,
+    malformed_lines: usize,
+    boundary_fragments: usize,
+    text_truncations: usize,
+}
+
+#[derive(Debug)]
+struct SessionScanOutcome {
+    info: DroidSessionInfo,
+    diagnostics: SessionScanDiagnostics,
+}
+
+#[derive(Debug, Default)]
+struct HydrationDiagnostics {
+    scanned_sessions: usize,
+    truncated_sessions: usize,
+    malformed_lines: usize,
+    boundary_fragments: usize,
+    text_truncations: usize,
+    unreadable_sessions: usize,
+    bytes_read: u64,
+}
+
+impl HydrationDiagnostics {
+    fn record(&mut self, diagnostics: &SessionScanDiagnostics) {
+        self.scanned_sessions += 1;
+        self.truncated_sessions += usize::from(diagnostics.truncated);
+        self.malformed_lines += diagnostics.malformed_lines;
+        self.boundary_fragments += diagnostics.boundary_fragments;
+        self.text_truncations += diagnostics.text_truncations;
+        self.bytes_read += diagnostics.bytes_read;
+    }
+
+    fn record_unreadable(&mut self) {
+        self.unreadable_sessions += 1;
+    }
+
+    fn log_if_degraded(&self, root: &Path) {
+        if self.truncated_sessions == 0
+            && self.malformed_lines == 0
+            && self.boundary_fragments == 0
+            && self.text_truncations == 0
+            && self.unreadable_sessions == 0
+        {
+            return;
+        }
+        tracing::warn!(
+            root = %root.display(),
+            scanned_sessions = self.scanned_sessions,
+            truncated_sessions = self.truncated_sessions,
+            malformed_lines = self.malformed_lines,
+            boundary_fragments = self.boundary_fragments,
+            text_truncations = self.text_truncations,
+            unreadable_sessions = self.unreadable_sessions,
+            bytes_read = self.bytes_read,
+            scan_limit_bytes = MAX_SESSION_SUMMARY_SCAN_BYTES,
+            "droid hydration retained bounded best-effort summaries"
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScanSegment {
+    Full,
+    Head,
+    Tail,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,10 +193,14 @@ pub async fn list_all() -> Vec<DroidSessionInfo> {
 }
 
 pub async fn list_all_from_root(root: &Path) -> Vec<DroidSessionInfo> {
-    let mut sessions = list_sessions_from_dir(root).await;
+    let mut diagnostics = HydrationDiagnostics::default();
+    let mut sessions = list_sessions_from_dir_with_diagnostics(root, &mut diagnostics).await;
     let mut read_dir = match fs::read_dir(root).await {
         Ok(rd) => rd,
-        Err(_) => return sessions,
+        Err(_) => {
+            diagnostics.log_if_degraded(root);
+            return sessions;
+        }
     };
     while let Ok(Some(entry)) = read_dir.next_entry().await {
         if entry
@@ -129,14 +209,27 @@ pub async fn list_all_from_root(root: &Path) -> Vec<DroidSessionInfo> {
             .map(|ft| ft.is_dir())
             .unwrap_or(false)
         {
-            sessions.extend(list_sessions_from_dir(&entry.path()).await);
+            sessions.extend(
+                list_sessions_from_dir_with_diagnostics(&entry.path(), &mut diagnostics).await,
+            );
         }
     }
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    diagnostics.log_if_degraded(root);
     sessions
 }
 
 pub async fn list_sessions_from_dir(dir: &Path) -> Vec<DroidSessionInfo> {
+    let mut diagnostics = HydrationDiagnostics::default();
+    let sessions = list_sessions_from_dir_with_diagnostics(dir, &mut diagnostics).await;
+    diagnostics.log_if_degraded(dir);
+    sessions
+}
+
+async fn list_sessions_from_dir_with_diagnostics(
+    dir: &Path,
+    diagnostics: &mut HydrationDiagnostics,
+) -> Vec<DroidSessionInfo> {
     let mut sessions = Vec::new();
     let mut read_dir = match fs::read_dir(dir).await {
         Ok(rd) => rd,
@@ -147,17 +240,46 @@ pub async fn list_sessions_from_dir(dir: &Path) -> Vec<DroidSessionInfo> {
         if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
             continue;
         }
-        if let Some(info) = build_session_info(&path).await {
-            sessions.push(info);
+        match build_session_info_bounded(&path, MAX_SESSION_SUMMARY_SCAN_BYTES).await {
+            Ok(outcome) => {
+                diagnostics.record(&outcome.diagnostics);
+                sessions.push(outcome.info);
+            }
+            Err(_) => {
+                diagnostics.record_unreadable();
+            }
         }
     }
     sessions
 }
 
 pub async fn build_session_info(path: &Path) -> Option<DroidSessionInfo> {
-    let text = fs::read_to_string(path).await.ok()?;
-    let metadata = fs::metadata(path).await.ok();
-    build_session_info_from_text(path, &text, metadata.as_ref())
+    match build_session_info_bounded(path, MAX_SESSION_SUMMARY_SCAN_BYTES).await {
+        Ok(outcome) => {
+            let diagnostics = &outcome.diagnostics;
+            if diagnostics.truncated
+                || diagnostics.malformed_lines > 0
+                || diagnostics.boundary_fragments > 0
+                || diagnostics.text_truncations > 0
+            {
+                tracing::warn!(
+                    path = %path.display(),
+                    truncated = diagnostics.truncated,
+                    malformed_lines = diagnostics.malformed_lines,
+                    boundary_fragments = diagnostics.boundary_fragments,
+                    text_truncations = diagnostics.text_truncations,
+                    bytes_read = diagnostics.bytes_read,
+                    scan_limit_bytes = MAX_SESSION_SUMMARY_SCAN_BYTES,
+                    "droid hydration retained a bounded best-effort summary"
+                );
+            }
+            Some(outcome.info)
+        }
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "failed to summarize droid session");
+            None
+        }
+    }
 }
 
 pub fn entry_from_droid(info: &DroidSessionInfo) -> IndexEntry {
@@ -767,101 +889,323 @@ pub async fn session_path_for(
         })
 }
 
-fn build_session_info_from_text(
-    path: &Path,
-    text: &str,
-    metadata: Option<&std::fs::Metadata>,
-) -> Option<DroidSessionInfo> {
-    let mut session_id = path.file_stem()?.to_string_lossy().to_string();
-    let mut cwd = String::new();
-    let mut title = None;
-    let mut session_title = None;
-    let mut first_message = String::new();
-    let mut latest_message = String::new();
-    let mut first_timestamp: Option<DateTime<Utc>> = None;
-    let mut last_timestamp: Option<DateTime<Utc>> = None;
+#[derive(Debug)]
+struct DroidSessionSummary {
+    path: PathBuf,
+    session_id: String,
+    cwd: String,
+    title: Option<String>,
+    session_title: Option<String>,
+    first_message: String,
+    latest_message: String,
+    first_timestamp: Option<DateTime<Utc>>,
+    last_timestamp: Option<DateTime<Utc>>,
+    tail_timestamp: Option<DateTime<Utc>>,
+}
 
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            continue;
-        };
+impl DroidSessionSummary {
+    fn new(path: &Path) -> io::Result<Self> {
+        let session_id = path
+            .file_stem()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing session id"))?
+            .to_string_lossy()
+            .to_string();
+        Ok(Self {
+            path: path.to_path_buf(),
+            session_id,
+            cwd: String::new(),
+            title: None,
+            session_title: None,
+            first_message: String::new(),
+            latest_message: String::new(),
+            first_timestamp: None,
+            last_timestamp: None,
+            tail_timestamp: None,
+        })
+    }
+
+    fn observe(
+        &mut self,
+        value: &Value,
+        segment: ScanSegment,
+        diagnostics: &mut SessionScanDiagnostics,
+    ) {
         match value.get("type").and_then(Value::as_str) {
-            Some("session_start") => {
+            Some("session_start") if segment != ScanSegment::Tail => {
                 if let Some(id) = value
                     .get("id")
                     .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
+                    .filter(|id| !id.is_empty())
                 {
-                    session_id = id.to_string();
+                    self.session_id = id.to_string();
                 }
-                if cwd.is_empty()
-                    && let Some(value) = value.get("cwd").and_then(Value::as_str)
+                if self.cwd.is_empty()
+                    && let Some(cwd) = value.get("cwd").and_then(Value::as_str)
                 {
-                    cwd = value.to_string();
+                    self.cwd = cwd.to_string();
                 }
-                title = clean_title(value.get("title").and_then(Value::as_str)).or(title);
-                session_title = clean_title(value.get("sessionTitle").and_then(Value::as_str))
-                    .or(session_title);
+                self.title = clean_title(value.get("title").and_then(Value::as_str))
+                    .or_else(|| self.title.take());
+                self.session_title = clean_title(value.get("sessionTitle").and_then(Value::as_str))
+                    .or_else(|| self.session_title.take());
             }
             Some("message") => {
                 let Some(message) = value.get("message") else {
-                    continue;
+                    return;
                 };
-                if cwd.is_empty()
-                    && let Some(value) = value.get("cwd").and_then(Value::as_str)
+                if self.cwd.is_empty()
+                    && let Some(cwd) = value.get("cwd").and_then(Value::as_str)
                 {
-                    cwd = value.to_string();
+                    self.cwd = cwd.to_string();
                 }
                 let role = message.get("role").and_then(Value::as_str).unwrap_or("");
                 if role != "user" && role != "assistant" {
-                    continue;
+                    return;
                 }
-                let text = extract_text_content(message.get("content").unwrap_or(&Value::Null));
+                let (text, text_truncated) =
+                    extract_summary_text_content(message.get("content").unwrap_or(&Value::Null));
+                diagnostics.text_truncations += usize::from(text_truncated);
                 if text.is_empty() {
-                    continue;
+                    return;
                 }
                 let is_displayable_user = role == "user" && !is_system_reminder_text(&text);
-                if first_message.is_empty() && is_displayable_user {
-                    first_message = text.clone();
+                if segment != ScanSegment::Tail
+                    && self.first_message.is_empty()
+                    && is_displayable_user
+                {
+                    self.first_message = text.clone();
                 }
                 if role == "assistant" || is_displayable_user {
-                    latest_message = text;
+                    self.latest_message = text;
                 }
-                if let Some(ts) = value
+                if let Some(timestamp) = value
                     .get("timestamp")
                     .and_then(Value::as_str)
                     .and_then(parse_iso8601)
                 {
-                    first_timestamp = Some(first_timestamp.unwrap_or(ts));
-                    last_timestamp = Some(last_timestamp.map_or(ts, |last| last.max(ts)));
+                    if segment != ScanSegment::Tail && self.first_timestamp.is_none() {
+                        self.first_timestamp = Some(timestamp);
+                    }
+                    self.last_timestamp = Some(
+                        self.last_timestamp
+                            .map_or(timestamp, |last| last.max(timestamp)),
+                    );
+                    if segment == ScanSegment::Tail {
+                        self.tail_timestamp = Some(
+                            self.tail_timestamp
+                                .map_or(timestamp, |last| last.max(timestamp)),
+                        );
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    let modified = last_timestamp
-        .or_else(|| metadata.and_then(system_time_modified))
+    fn finish(self, metadata: &std::fs::Metadata, truncated: bool) -> DroidSessionInfo {
+        let metadata_modified = system_time_modified(metadata);
+        let modified = if truncated {
+            self.tail_timestamp
+                .or(metadata_modified)
+                .or(self.last_timestamp)
+        } else {
+            self.last_timestamp.or(metadata_modified)
+        }
         .unwrap_or_else(Utc::now);
-    let created = first_timestamp
-        .or_else(|| metadata.and_then(system_time_created))
-        .unwrap_or(modified);
+        let created = self
+            .first_timestamp
+            .or_else(|| system_time_created(metadata))
+            .unwrap_or(modified);
 
-    Some(DroidSessionInfo {
-        path: path.to_path_buf(),
-        session_id,
-        cwd,
-        title,
-        session_title,
-        created,
-        modified,
-        first_message,
-        latest_message,
+        DroidSessionInfo {
+            path: self.path,
+            session_id: self.session_id,
+            cwd: self.cwd,
+            title: self.title,
+            session_title: self.session_title,
+            created,
+            modified,
+            first_message: self.first_message,
+            latest_message: self.latest_message,
+        }
+    }
+}
+
+async fn build_session_info_bounded(
+    path: &Path,
+    scan_limit_bytes: u64,
+) -> io::Result<SessionScanOutcome> {
+    let mut file = fs::File::open(path).await?;
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "session path is not a regular file",
+        ));
+    }
+
+    let file_len = metadata.len();
+    let scan_limit_bytes = scan_limit_bytes.max(2);
+    let truncated = file_len > scan_limit_bytes;
+    let mut diagnostics = SessionScanDiagnostics {
+        truncated,
+        ..SessionScanDiagnostics::default()
+    };
+    let mut summary = DroidSessionSummary::new(path)?;
+
+    if truncated {
+        let head_bytes = scan_limit_bytes / 2;
+        let tail_bytes = scan_limit_bytes - head_bytes;
+        scan_summary_segment(
+            &mut file,
+            0,
+            head_bytes,
+            false,
+            ScanSegment::Head,
+            &mut summary,
+            &mut diagnostics,
+        )
+        .await?;
+        scan_summary_segment(
+            &mut file,
+            file_len - tail_bytes,
+            tail_bytes,
+            true,
+            ScanSegment::Tail,
+            &mut summary,
+            &mut diagnostics,
+        )
+        .await?;
+    } else {
+        scan_summary_segment(
+            &mut file,
+            0,
+            file_len,
+            true,
+            ScanSegment::Full,
+            &mut summary,
+            &mut diagnostics,
+        )
+        .await?;
+    }
+
+    Ok(SessionScanOutcome {
+        info: summary.finish(&metadata, truncated),
+        diagnostics,
     })
+}
+
+async fn scan_summary_segment(
+    file: &mut fs::File,
+    start: u64,
+    length: u64,
+    reaches_eof: bool,
+    segment: ScanSegment,
+    summary: &mut DroidSessionSummary,
+    diagnostics: &mut SessionScanDiagnostics,
+) -> io::Result<()> {
+    if length == 0 {
+        return Ok(());
+    }
+
+    let starts_at_line_boundary = if start == 0 {
+        true
+    } else {
+        file.seek(SeekFrom::Start(start - 1)).await?;
+        let mut previous = [0u8; 1];
+        file.read_exact(&mut previous).await?;
+        previous[0] == b'\n'
+    };
+    file.seek(SeekFrom::Start(start)).await?;
+    let mut reader = BufReader::new(file.take(length));
+    let mut line = Vec::new();
+
+    if !starts_at_line_boundary {
+        let bytes = reader.read_until(b'\n', &mut line).await?;
+        diagnostics.bytes_read += bytes as u64;
+        diagnostics.boundary_fragments += usize::from(bytes > 0);
+        line.clear();
+    }
+
+    loop {
+        let bytes = reader.read_until(b'\n', &mut line).await?;
+        if bytes == 0 {
+            break;
+        }
+        diagnostics.bytes_read += bytes as u64;
+        let complete_line = line.last() == Some(&b'\n') || reaches_eof;
+        if !complete_line {
+            diagnostics.boundary_fragments += 1;
+            break;
+        }
+        let trimmed = trim_ascii_whitespace(&line);
+        if !trimmed.is_empty() {
+            match std::str::from_utf8(trimmed)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            {
+                Some(value) => summary.observe(&value, segment, diagnostics),
+                None => diagnostics.malformed_lines += 1,
+            }
+        }
+        line.clear();
+    }
+    Ok(())
+}
+
+fn trim_ascii_whitespace(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn extract_summary_text_content(content: &Value) -> (String, bool) {
+    let mut output = String::new();
+    let mut truncated = false;
+    match content {
+        Value::String(text) => {
+            append_summary_text(&mut output, text, &mut truncated);
+        }
+        Value::Array(parts) => {
+            for text in parts.iter().filter_map(|part| {
+                (part.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| part.get("text").and_then(Value::as_str))
+                    .flatten()
+            }) {
+                if !output.is_empty() {
+                    append_summary_text(&mut output, "\n", &mut truncated);
+                }
+                append_summary_text(&mut output, text, &mut truncated);
+                if truncated {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+    (output, truncated)
+}
+
+fn append_summary_text(output: &mut String, text: &str, truncated: &mut bool) {
+    let remaining = MAX_SESSION_SUMMARY_TEXT_BYTES.saturating_sub(output.len());
+    if remaining == 0 {
+        *truncated |= !text.is_empty();
+        return;
+    }
+    if text.len() <= remaining {
+        output.push_str(text);
+        return;
+    }
+    let mut end = remaining;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.push_str(&text[..end]);
+    *truncated = true;
 }
 
 fn push_turn(
@@ -972,26 +1316,6 @@ fn inputs_are_system_reminders(inputs: &[p::UserInput]) -> bool {
 fn is_system_reminder_text(text: &str) -> bool {
     let trimmed = text.trim_start();
     trimmed.starts_with("<system-reminder>")
-}
-
-fn extract_text_content(content: &Value) -> String {
-    if let Some(text) = content.as_str() {
-        return text.to_string();
-    }
-    let Some(parts) = content.as_array() else {
-        return String::new();
-    };
-    parts
-        .iter()
-        .filter_map(|part| {
-            if part.get("type").and_then(Value::as_str) == Some("text") {
-                part.get("text").and_then(Value::as_str)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn display_name(info: &DroidSessionInfo) -> Option<String> {
@@ -1118,6 +1442,123 @@ mod tests {
         assert_eq!(entry.thread_id, "abc");
         assert_eq!(entry.name.as_deref(), Some("Greeting"));
         assert_eq!(entry.preview, "hello droid");
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_preserves_header_first_latest_and_timestamps() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("large.jsonl");
+        let scan_limit = 1024u64;
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session_start","id":"canonical-id","title":"Header title","sessionTitle":"Session title","cwd":"/work"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{{"role":"user","content":"first request"}}}}"#
+        )
+        .unwrap();
+        file.write_all(&vec![b'x'; scan_limit as usize * 4])
+            .unwrap();
+        file.write_all(b"\n").unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"message","timestamp":"2026-01-01T00:00:09Z","message":{{"role":"assistant","content":"latest response"}}}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let outcome = build_session_info_bounded(&path, scan_limit).await.unwrap();
+        assert!(outcome.diagnostics.truncated);
+        assert!(outcome.diagnostics.bytes_read <= scan_limit);
+        assert!(outcome.diagnostics.boundary_fragments > 0);
+        assert_eq!(outcome.info.session_id, "canonical-id");
+        assert_eq!(outcome.info.cwd, "/work");
+        assert_eq!(outcome.info.title.as_deref(), Some("Header title"));
+        assert_eq!(outcome.info.session_title.as_deref(), Some("Session title"));
+        assert_eq!(outcome.info.first_message, "first request");
+        assert_eq!(outcome.info.latest_message, "latest response");
+        assert_eq!(
+            outcome.info.created,
+            parse_iso8601("2026-01-01T00:00:01Z").unwrap()
+        );
+        assert_eq!(
+            outcome.info.modified,
+            parse_iso8601("2026-01-01T00:00:09Z").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_falls_back_to_file_mtime_when_tail_has_no_timestamp() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("mtime.jsonl");
+        let scan_limit = 512u64;
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session_start","id":"mtime","cwd":"/work"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"message","timestamp":"2020-01-01T00:00:01Z","message":{{"role":"user","content":"first"}}}}"#
+        )
+        .unwrap();
+        file.write_all(&vec![b'x'; scan_limit as usize * 4])
+            .unwrap();
+        drop(file);
+        let expected_mtime = system_time_modified(&std::fs::metadata(&path).unwrap()).unwrap();
+
+        let outcome = build_session_info_bounded(&path, scan_limit).await.unwrap();
+        assert!(outcome.diagnostics.truncated);
+        assert_eq!(outcome.info.first_message, "first");
+        assert_eq!(outcome.info.latest_message, "first");
+        assert_eq!(outcome.info.modified, expected_mtime);
+    }
+
+    #[tokio::test]
+    async fn bounded_scan_handles_one_huge_malformed_line_without_amplification() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("fallback-id.jsonl");
+        let scan_limit = 512u64;
+        std::fs::write(&path, vec![b'x'; 8 * 1024 * 1024]).unwrap();
+
+        let outcome = build_session_info_bounded(&path, scan_limit).await.unwrap();
+        assert!(outcome.diagnostics.truncated);
+        assert!(outcome.diagnostics.bytes_read <= scan_limit);
+        assert!(outcome.diagnostics.boundary_fragments > 0);
+        assert_eq!(outcome.info.session_id, "fallback-id");
+        assert_eq!(outcome.info.cwd, "");
+        assert_eq!(outcome.info.first_message, "");
+        assert_eq!(outcome.info.latest_message, "");
+    }
+
+    #[tokio::test]
+    async fn malformed_line_is_reported_without_poisoning_valid_summary() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("malformed.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "not-json").unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session_start","id":"valid","cwd":"/work"}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"message","timestamp":"2026-01-01T00:00:01Z","message":{{"role":"user","content":"survives"}}}}"#
+        )
+        .unwrap();
+        drop(file);
+
+        let outcome = build_session_info_bounded(&path, 4096).await.unwrap();
+        assert!(!outcome.diagnostics.truncated);
+        assert_eq!(outcome.diagnostics.malformed_lines, 1);
+        assert_eq!(outcome.info.session_id, "valid");
+        assert_eq!(outcome.info.first_message, "survives");
+        assert_eq!(outcome.info.latest_message, "survives");
     }
 
     #[test]
