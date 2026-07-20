@@ -35,6 +35,8 @@ const MAX_METADATA_BYTES: u64 = 1 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(20);
+const SESSION_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SESSION_PAGE_ITEMS: usize = 200;
 const IMPLEMENTED_CAPABILITIES: [Capability; 2] = [Capability::StatsRead, Capability::SessionsRead];
 
@@ -651,7 +653,7 @@ async fn forward_controller_read(
     request: &ControllerSnapshotRequest,
     body: Vec<u8>,
 ) -> Result<Value, ForwardError> {
-    let response = forward_gateway(metadata, body).await?;
+    let response = forward_gateway(metadata, body, READ_TIMEOUT, TOTAL_TIMEOUT).await?;
     if response.status.is_success() {
         let snapshot: ControllerSnapshot = serde_json::from_value(response.value.clone())
             .map_err(|_| ForwardError::unavailable())?;
@@ -676,7 +678,8 @@ async fn forward_session_list(
     request: &SessionListRequest,
     body: Vec<u8>,
 ) -> Result<Value, ForwardError> {
-    let response = forward_gateway(metadata, body).await?;
+    let response =
+        forward_gateway(metadata, body, SESSION_READ_TIMEOUT, SESSION_TOTAL_TIMEOUT).await?;
     if response.status.is_success() {
         let page: SessionListPage = serde_json::from_value(response.value.clone())
             .map_err(|_| ForwardError::unavailable())?;
@@ -712,7 +715,8 @@ async fn forward_session_read(
     request: &SessionReadRequest,
     body: Vec<u8>,
 ) -> Result<Value, ForwardError> {
-    let response = forward_gateway(metadata, body).await?;
+    let response =
+        forward_gateway(metadata, body, SESSION_READ_TIMEOUT, SESSION_TOTAL_TIMEOUT).await?;
     if response.status.is_success() {
         let page: SessionPage = serde_json::from_value(response.value.clone())
             .map_err(|_| ForwardError::unavailable())?;
@@ -770,13 +774,15 @@ struct GatewayResponse {
 async fn forward_gateway(
     metadata: &GatewayMetadata,
     body: Vec<u8>,
+    read_timeout: Duration,
+    total_timeout: Duration,
 ) -> Result<GatewayResponse, ForwardError> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_TIMEOUT)
-        .timeout(TOTAL_TIMEOUT)
+        .read_timeout(read_timeout)
+        .timeout(total_timeout)
         .no_gzip()
         .no_brotli()
         .no_deflate()
@@ -784,7 +790,7 @@ async fn forward_gateway(
         .build()
         .map_err(|_| ForwardError::unavailable())?;
     let secret_header = HeaderName::from_static(GATEWAY_SECRET_HEADER);
-    let deadline = tokio::time::Instant::now() + TOTAL_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + total_timeout;
     let response = tokio::time::timeout_at(
         deadline,
         client
@@ -820,17 +826,20 @@ async fn forward_gateway(
         return Err(ForwardError::unavailable());
     }
     let status = response.status();
-    let bytes = tokio::time::timeout_at(deadline, read_bounded_response(response))
+    let bytes = tokio::time::timeout_at(deadline, read_bounded_response(response, read_timeout))
         .await
         .map_err(|_| ForwardError::unavailable())??;
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| ForwardError::unavailable())?;
     Ok(GatewayResponse { status, value })
 }
 
-async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, ForwardError> {
+async fn read_bounded_response(
+    response: reqwest::Response,
+    read_timeout: Duration,
+) -> Result<Vec<u8>, ForwardError> {
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
-    while let Some(chunk) = tokio::time::timeout(READ_TIMEOUT, stream.next())
+    while let Some(chunk) = tokio::time::timeout(read_timeout, stream.next())
         .await
         .map_err(|_| ForwardError::unavailable())?
     {
