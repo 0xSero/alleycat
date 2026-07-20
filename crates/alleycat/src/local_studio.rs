@@ -8,7 +8,7 @@ use alleycat_bridge_core::{Bridge, Conn, JsonRpcError};
 use alleycat_local_studio_proto::{
     BridgeError, CapabilitiesManifest, CapabilitiesManifestKind, Capability, ControllerSnapshot,
     ControllerSnapshotRequest, ErrorCode, ErrorResult, ErrorResultKind, LocalStudioAdvertisement,
-    ProtocolVersion,
+    ProtocolVersion, SessionAuthority, SessionPage, SessionReadRequest,
 };
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use url::Host;
 
-use crate::grants::GrantStore;
+use crate::grants::{EffectiveGrant, GrantStore};
 use crate::protocol::{AgentInfo, AgentPresentation, AgentWire};
 
 const AGENT_NAME: &str = "local-studio";
@@ -33,6 +33,8 @@ const MAX_METADATA_BYTES: u64 = 1 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(750);
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SESSION_PAGE_ITEMS: usize = 200;
+const IMPLEMENTED_CAPABILITIES: [Capability; 2] = [Capability::StatsRead, Capability::SessionsRead];
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -61,6 +63,14 @@ impl GatewayMetadata {
 
 struct AuthorizedGateway {
     metadata: GatewayMetadata,
+    grant: EffectiveGrant,
+}
+
+fn implemented_capabilities(grant: &EffectiveGrant) -> Vec<Capability> {
+    IMPLEMENTED_CAPABILITIES
+        .into_iter()
+        .filter(|capability| grant.allows_capability(*capability))
+        .collect()
 }
 
 pub(crate) fn local_studio_agent_info(authenticated_node: Option<&EndpointId>) -> AgentInfo {
@@ -77,13 +87,11 @@ pub(crate) fn local_studio_agent_info(authenticated_node: Option<&EndpointId>) -
         let effective = GrantStore::load()
             .ok()
             .and_then(|store| store.effective(node, Utc::now()));
-        // Protocol-v1 currently implements only read-only controller stats.
         // Intersect durable grants with live methods so a hand-edited future
-        // grant cannot make an unimplemented session/control path appear live.
+        // grant cannot make an unimplemented write/control path appear live.
         let capabilities = effective
             .as_ref()
-            .filter(|grant| grant.allows_capability(Capability::StatsRead))
-            .map(|_| vec![Capability::StatsRead])
+            .map(implemented_capabilities)
             .unwrap_or_default();
         let actions = Vec::new();
         Some(LocalStudioAdvertisement {
@@ -121,11 +129,11 @@ fn authorized_gateway(authenticated_node: &EndpointId) -> anyhow::Result<Authori
     let grant = store
         .effective(authenticated_node, Utc::now())
         .ok_or_else(|| anyhow!("paired node has no active Local Studio grant"))?;
-    if !grant.allows_capability(Capability::StatsRead) {
-        bail!("paired node lacks stats.read");
+    if grant.grants.is_empty() {
+        bail!("paired node has no active Local Studio capability");
     }
     let metadata = load_gateway_metadata().context("loading Local Studio gateway metadata")?;
-    Ok(AuthorizedGateway { metadata })
+    Ok(AuthorizedGateway { metadata, grant })
 }
 
 fn resolve_gateway_metadata_path() -> anyhow::Result<PathBuf> {
@@ -340,8 +348,12 @@ impl LocalStudioBridge {
         Self { authenticated_node }
     }
 
-    fn authorize(&self) -> anyhow::Result<AuthorizedGateway> {
-        authorized_gateway(&self.authenticated_node)
+    fn authorize(&self, capability: Capability) -> anyhow::Result<AuthorizedGateway> {
+        let gateway = authorized_gateway(&self.authenticated_node)?;
+        if !gateway.grant.allows_capability(capability) {
+            bail!("paired node lacks {capability}");
+        }
+        Ok(gateway)
     }
 
     async fn capabilities(&self, params: Value) -> Value {
@@ -353,7 +365,7 @@ impl LocalStudioBridge {
                 false,
             );
         }
-        let context = match self.authorize() {
+        let context = match authorized_gateway(&self.authenticated_node) {
             Ok(context) => context,
             Err(_) => {
                 return typed_error(
@@ -370,7 +382,7 @@ impl LocalStudioBridge {
             bridge_id: context.metadata.bridge_id(),
             controller_id: context.metadata.controller_id,
             issued_at: now_timestamp(),
-            capabilities: vec![Capability::StatsRead],
+            capabilities: implemented_capabilities(&context.grant),
         })
         .expect("capabilities manifest must serialize")
     }
@@ -405,7 +417,7 @@ impl LocalStudioBridge {
                 false,
             );
         }
-        let context = match self.authorize() {
+        let context = match self.authorize(Capability::StatsRead) {
             Ok(context) => context,
             Err(_) => {
                 return typed_error(
@@ -445,6 +457,61 @@ impl LocalStudioBridge {
             ),
         }
     }
+
+    async fn session_read(&self, params: Value) -> Value {
+        let request_id = request_id_from(&params);
+        let request: SessionReadRequest = match serde_json::from_value(params) {
+            Ok(request) => request,
+            Err(_) => {
+                return typed_error(
+                    ErrorCode::InvalidRequest,
+                    "Session read request is invalid",
+                    request_id,
+                    false,
+                );
+            }
+        };
+        let node_id = self.authenticated_node.to_string();
+        if request.auth.device.device_id != node_id || request.auth.device.key_id != node_id {
+            return typed_error(
+                ErrorCode::Unauthorized,
+                "Request identity does not match the authenticated connection",
+                request.auth.request_id,
+                false,
+            );
+        }
+        let context = match self.authorize(Capability::SessionsRead) {
+            Ok(context) => context,
+            Err(_) => {
+                return typed_error(
+                    ErrorCode::CapabilityDenied,
+                    "sessions.read is not granted",
+                    request.auth.request_id,
+                    false,
+                );
+            }
+        };
+        let body = match serde_json::to_vec(&request) {
+            Ok(body) if body.len() <= MAX_HTTP_BODY_BYTES => body,
+            _ => {
+                return typed_error(
+                    ErrorCode::PayloadTooLarge,
+                    "Session read request exceeds the size limit",
+                    request.auth.request_id,
+                    false,
+                );
+            }
+        };
+        match forward_session_read(&context.metadata, &request, body).await {
+            Ok(value) => value,
+            Err(error) => typed_error(
+                error.code,
+                error.message,
+                request.auth.request_id,
+                error.retriable,
+            ),
+        }
+    }
 }
 
 #[async_trait]
@@ -453,7 +520,11 @@ impl Bridge for LocalStudioBridge {
         Ok(json!({
             "userAgent": format!("alleycat-local-studio/{}", env!("CARGO_PKG_VERSION")),
             "capabilities": {
-                "methods": ["localStudio/capabilities", "localStudio/controller/read"]
+                "methods": [
+                    "localStudio/capabilities",
+                    "localStudio/controller/read",
+                    "localStudio/session/read"
+                ]
             }
         }))
     }
@@ -467,6 +538,7 @@ impl Bridge for LocalStudioBridge {
         match method {
             "localStudio/capabilities" => Ok(self.capabilities(params).await),
             "localStudio/controller/read" => Ok(self.controller_read(params).await),
+            "localStudio/session/read" => Ok(self.session_read(params).await),
             other => Err(JsonRpcError::method_not_found(other)),
         }
     }
@@ -517,6 +589,90 @@ async fn forward_controller_read(
     request: &ControllerSnapshotRequest,
     body: Vec<u8>,
 ) -> Result<Value, ForwardError> {
+    let response = forward_gateway(metadata, body).await?;
+    if response.status.is_success() {
+        let snapshot: ControllerSnapshot = serde_json::from_value(response.value.clone())
+            .map_err(|_| ForwardError::unavailable())?;
+        if snapshot.controller_id != metadata.controller_id
+            || !snapshot.capabilities.contains(&Capability::StatsRead)
+            || snapshot
+                .capabilities
+                .iter()
+                .any(|capability| !IMPLEMENTED_CAPABILITIES.contains(capability))
+        {
+            return Err(ForwardError::unavailable());
+        }
+        return Ok(response.value);
+    }
+
+    validate_gateway_error(&response.value, &request.auth.request_id)?;
+    Ok(response.value)
+}
+
+async fn forward_session_read(
+    metadata: &GatewayMetadata,
+    request: &SessionReadRequest,
+    body: Vec<u8>,
+) -> Result<Value, ForwardError> {
+    let response = forward_gateway(metadata, body).await?;
+    if response.status.is_success() {
+        let page: SessionPage = serde_json::from_value(response.value.clone())
+            .map_err(|_| ForwardError::unavailable())?;
+        if page.request_id != request.auth.request_id
+            || page.canonical_session.authority != SessionAuthority::LocalStudio
+            || page.canonical_session.installation_id != metadata.controller_id
+            || page.origin.application != SessionAuthority::LocalStudio
+            || page.origin.installation_id != metadata.controller_id
+            || request
+                .session
+                .as_ref()
+                .is_some_and(|requested| requested != &page.canonical_session)
+            || request
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.revision != page.revision)
+            || page.messages.len() > usize::from(request.limit)
+            || page.messages.len() > MAX_SESSION_PAGE_ITEMS
+            || page.tools.len() > MAX_SESSION_PAGE_ITEMS
+            || page.attachments.len() > MAX_SESSION_PAGE_ITEMS
+            || page
+                .cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.revision != page.revision)
+        {
+            return Err(ForwardError::unavailable());
+        }
+        return Ok(response.value);
+    }
+
+    validate_gateway_error(&response.value, &request.auth.request_id)?;
+    Ok(response.value)
+}
+
+fn validate_gateway_error(value: &Value, request_id: &str) -> Result<(), ForwardError> {
+    let error: ErrorResult =
+        serde_json::from_value(value.clone()).map_err(|_| ForwardError::unavailable())?;
+    if error.request_id != request_id
+        || error
+            .error
+            .request_id
+            .as_deref()
+            .is_some_and(|nested| nested != request_id)
+    {
+        return Err(ForwardError::unavailable());
+    }
+    Ok(())
+}
+
+struct GatewayResponse {
+    status: reqwest::StatusCode,
+    value: Value,
+}
+
+async fn forward_gateway(
+    metadata: &GatewayMetadata,
+    body: Vec<u8>,
+) -> Result<GatewayResponse, ForwardError> {
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
@@ -570,26 +726,7 @@ async fn forward_controller_read(
         .await
         .map_err(|_| ForwardError::unavailable())??;
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| ForwardError::unavailable())?;
-
-    if status.is_success() {
-        let snapshot: ControllerSnapshot =
-            serde_json::from_value(value.clone()).map_err(|_| ForwardError::unavailable())?;
-        if snapshot.controller_id != metadata.controller_id
-            || snapshot.capabilities != vec![Capability::StatsRead]
-        {
-            return Err(ForwardError::unavailable());
-        }
-        return Ok(value);
-    }
-
-    let error: ErrorResult =
-        serde_json::from_value(value.clone()).map_err(|_| ForwardError::unavailable())?;
-    if error.request_id != request.auth.request_id
-        || error.error.request_id.as_deref() != Some(request.auth.request_id.as_str())
-    {
-        return Err(ForwardError::unavailable());
-    }
-    Ok(value)
+    Ok(GatewayResponse { status, value })
 }
 
 async fn read_bounded_response(response: reqwest::Response) -> Result<Vec<u8>, ForwardError> {
@@ -648,8 +785,12 @@ mod tests {
     }
 
     fn grant_stats(node: EndpointId) {
+        grant_capabilities(node, &[Capability::StatsRead]);
+    }
+
+    fn grant_capabilities(node: EndpointId, capabilities: &[Capability]) {
         let mut store = GrantStore::empty();
-        store.grant_stats_read(node, None).unwrap();
+        store.grant_capabilities(node, capabilities, None).unwrap();
         store.save().unwrap();
     }
 
@@ -677,6 +818,78 @@ mod tests {
             },
             "controllerId": CONTROLLER_ID
         })
+    }
+
+    fn session_request(node: &EndpointId) -> Value {
+        json!({
+            "type": "session_read_request",
+            "protocolVersion": 1,
+            "auth": {
+                "device": {
+                    "deviceId": node.to_string(),
+                    "keyId": node.to_string(),
+                    "algorithm": "ed25519"
+                },
+                "requestId": "request-session-1",
+                "issuedAt": "2026-07-20T18:29:50.000Z",
+                "expiresAt": "2026-07-20T18:30:20.000Z",
+                "nonce": "session-nonce-1234",
+                "bodyHash": "b".repeat(64),
+                "signature": "B".repeat(86),
+                "capability": "sessions.read"
+            },
+            "session": {
+                "kind": "external_session",
+                "authority": "local-studio",
+                "installationId": CONTROLLER_ID,
+                "sessionId": "019f7ca0-1f06-78a3-b4f2-58b6672994af"
+            },
+            "cursor": null,
+            "limit": 50
+        })
+    }
+
+    fn session_page_body() -> Vec<u8> {
+        let hash = "c".repeat(64);
+        serde_json::to_vec(&json!({
+            "type": "session_page",
+            "protocolVersion": 1,
+            "requestId": "request-session-1",
+            "pageId": "page-1",
+            "canonicalSession": {
+                "kind": "external_session",
+                "authority": "local-studio",
+                "installationId": CONTROLLER_ID,
+                "sessionId": "019f7ca0-1f06-78a3-b4f2-58b6672994af"
+            },
+            "origin": {
+                "application": "local-studio",
+                "installationId": CONTROLLER_ID,
+                "deviceId": null,
+                "exportedAt": "2026-07-20T18:30:00.000Z"
+            },
+            "metadata": {
+                "title": "Acceptance session",
+                "cwd": null,
+                "createdAt": "2026-07-20T18:00:00.000Z",
+                "updatedAt": "2026-07-20T18:30:00.000Z",
+                "modelId": null,
+                "providerId": null
+            },
+            "revision": 1,
+            "messages": [],
+            "tools": [],
+            "attachments": [],
+            "contentHashes": {
+                "algorithm": "sha256",
+                "session": hash,
+                "messages": [],
+                "tools": [],
+                "attachments": []
+            },
+            "cursor": null
+        }))
+        .unwrap()
     }
 
     fn failed_section(request_id: &str) -> Value {
@@ -841,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_suppresses_granted_but_unimplemented_authority() {
+    fn advertisement_includes_sessions_read_and_suppresses_unimplemented_authority() {
         let mut home = TempHome::new();
         let metadata = configure_metadata_path(&mut home);
         write_metadata(&metadata, "http://127.0.0.1:54321/api/litter-bridge/v1");
@@ -866,7 +1079,10 @@ mod tests {
         store.save().unwrap();
 
         let advertisement = local_studio_agent_info(Some(&node)).local_studio.unwrap();
-        assert_eq!(advertisement.capabilities, vec![Capability::StatsRead]);
+        assert_eq!(
+            advertisement.capabilities,
+            vec![Capability::StatsRead, Capability::SessionsRead]
+        );
         assert!(advertisement.actions.is_empty());
     }
 
@@ -950,12 +1166,25 @@ mod tests {
         let metadata = configure_metadata_path(&mut home);
         write_metadata(&metadata, "http://127.0.0.1:54321/api/litter-bridge/v1");
         let node = iroh::SecretKey::generate().public();
-        grant_stats(node);
+        grant_capabilities(node, &[Capability::StatsRead, Capability::SessionsRead]);
         let bridge = LocalStudioBridge::new(node);
 
         let manifest = bridge.capabilities(json!({"protocolVersion": 1})).await;
         assert_eq!(manifest["type"], "capabilities");
-        assert_eq!(manifest["capabilities"], json!(["stats.read"]));
+        assert_eq!(
+            manifest["capabilities"],
+            json!(["stats.read", "sessions.read"])
+        );
+
+        let mut store = GrantStore::load().unwrap();
+        assert!(
+            store
+                .revoke_capabilities(&node, &[Capability::SessionsRead])
+                .unwrap()
+        );
+        store.save().unwrap();
+        let narrowed = bridge.capabilities(Value::Null).await;
+        assert_eq!(narrowed["capabilities"], json!(["stats.read"]));
 
         let mut store = GrantStore::load().unwrap();
         assert!(store.revoke(&node, Utc::now()));
@@ -1006,6 +1235,116 @@ mod tests {
             gateway_secret_header = GATEWAY_SECRET_HEADER,
             test_secret = TEST_SECRET.to_ascii_lowercase()
         )));
+    }
+
+    #[tokio::test]
+    async fn session_read_requires_connection_identity_before_gateway_io() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        write_metadata(&metadata, "http://127.0.0.1:9/api/litter-bridge/v1");
+        let node = iroh::SecretKey::generate().public();
+        let other = iroh::SecretKey::generate().public();
+        grant_capabilities(node, &[Capability::SessionsRead]);
+        let bridge = LocalStudioBridge::new(node);
+
+        let denied = bridge.session_read(session_request(&other)).await;
+        assert_eq!(error_code(&denied), "unauthorized");
+    }
+
+    #[tokio::test]
+    async fn session_read_forwards_only_the_signed_request_and_live_revoke_denies_open_bridge() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        let node = iroh::SecretKey::generate().public();
+        grant_capabilities(node, &[Capability::SessionsRead]);
+        let body = session_page_body();
+        let (url, server) = spawn_http_response(
+            "200 OK",
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Content-Length".into(), body.len().to_string()),
+            ],
+            body,
+        )
+        .await;
+        write_metadata(&metadata, &url);
+        let bridge = LocalStudioBridge::new(node);
+        let signed_request = session_request(&node);
+
+        let response = bridge.session_read(signed_request.clone()).await;
+        assert_eq!(response["type"], "session_page");
+        assert_eq!(
+            response["canonicalSession"]["sessionId"],
+            "019f7ca0-1f06-78a3-b4f2-58b6672994af"
+        );
+        let received = server.await.unwrap();
+        let forwarded_body = received.split("\r\n\r\n").nth(1).unwrap();
+        let forwarded: Value = serde_json::from_str(forwarded_body).unwrap();
+        assert_eq!(forwarded, signed_request);
+        assert!(forwarded.get("method").is_none());
+
+        let mut store = GrantStore::load().unwrap();
+        assert!(
+            store
+                .revoke_capabilities(&node, &[Capability::SessionsRead])
+                .unwrap()
+        );
+        store.save().unwrap();
+        let denied = bridge.session_read(session_request(&node)).await;
+        assert_eq!(error_code(&denied), "capability_denied");
+    }
+
+    #[tokio::test]
+    async fn session_read_accepts_only_strict_pages_or_matching_typed_errors() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        let node = iroh::SecretKey::generate().public();
+        grant_capabilities(node, &[Capability::SessionsRead]);
+        let bridge = LocalStudioBridge::new(node);
+
+        let mut wrong_page: Value = serde_json::from_slice(&session_page_body()).unwrap();
+        wrong_page["requestId"] = json!("request-other");
+        let wrong_body = serde_json::to_vec(&wrong_page).unwrap();
+        let (wrong_url, wrong_server) = spawn_http_response(
+            "200 OK",
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Content-Length".into(), wrong_body.len().to_string()),
+            ],
+            wrong_body,
+        )
+        .await;
+        write_metadata(&metadata, &wrong_url);
+        let unavailable = bridge.session_read(session_request(&node)).await;
+        assert_eq!(error_code(&unavailable), "controller_unavailable");
+        wrong_server.await.unwrap();
+
+        let error_body = serde_json::to_vec(&json!({
+            "type": "error",
+            "protocolVersion": 1,
+            "requestId": "request-session-1",
+            "error": {
+                "code": "not_found",
+                "message": "session not found",
+                "retriable": false,
+                "requestId": "request-session-1",
+                "details": null
+            }
+        }))
+        .unwrap();
+        let (error_url, error_server) = spawn_http_response(
+            "404 Not Found",
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Content-Length".into(), error_body.len().to_string()),
+            ],
+            error_body,
+        )
+        .await;
+        write_metadata(&metadata, &error_url);
+        let not_found = bridge.session_read(session_request(&node)).await;
+        assert_eq!(error_code(&not_found), "not_found");
+        error_server.await.unwrap();
     }
 
     #[tokio::test]

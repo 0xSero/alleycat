@@ -290,13 +290,13 @@ pub struct ErrorDetails {
     pub field: Option<String>,
     #[serde(deserialize_with = "deserialize_required_option")]
     pub section: Option<SectionName>,
-    #[serde(deserialize_with = "deserialize_required_option")]
+    #[serde(deserialize_with = "deserialize_optional_safe_u64")]
     pub expected_revision: Option<u64>,
-    #[serde(deserialize_with = "deserialize_required_option")]
+    #[serde(deserialize_with = "deserialize_optional_safe_u64")]
     pub current_revision: Option<u64>,
-    #[serde(deserialize_with = "deserialize_required_option")]
+    #[serde(deserialize_with = "deserialize_optional_safe_u64")]
     pub retry_after_ms: Option<u64>,
-    #[serde(deserialize_with = "deserialize_required_option")]
+    #[serde(deserialize_with = "deserialize_optional_safe_u64")]
     pub limit_bytes: Option<u64>,
 }
 
@@ -501,6 +501,305 @@ pub enum ControllerSnapshotKind {
     ControllerSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionAuthority {
+    #[serde(rename = "local-studio")]
+    LocalStudio,
+    #[serde(rename = "litter")]
+    Litter,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExternalSessionIdentityKind {
+    #[serde(rename = "external_session")]
+    ExternalSession,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExternalSessionIdentity {
+    pub kind: ExternalSessionIdentityKind,
+    pub authority: SessionAuthority,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub installation_id: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionOrigin {
+    pub application: SessionAuthority,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub installation_id: String,
+    #[serde(deserialize_with = "deserialize_optional_identifier")]
+    pub device_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_timestamp")]
+    pub exported_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionMetadata {
+    #[serde(deserialize_with = "deserialize_optional_short_text")]
+    pub title: Option<String>,
+    #[serde(deserialize_with = "deserialize_optional_identifier")]
+    pub cwd: Option<String>,
+    #[serde(deserialize_with = "deserialize_timestamp")]
+    pub created_at: String,
+    #[serde(deserialize_with = "deserialize_timestamp")]
+    pub updated_at: String,
+    #[serde(deserialize_with = "deserialize_optional_identifier")]
+    pub model_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_optional_identifier")]
+    pub provider_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MessagePart {
+    Text {
+        #[serde(deserialize_with = "deserialize_wire_text")]
+        text: String,
+    },
+    Reasoning {
+        #[serde(deserialize_with = "deserialize_wire_text")]
+        text: String,
+    },
+    ToolRef {
+        #[serde(rename = "toolCallId", deserialize_with = "deserialize_identifier")]
+        tool_call_id: String,
+    },
+    AttachmentRef {
+        #[serde(rename = "attachmentId", deserialize_with = "deserialize_identifier")]
+        attachment_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MessageDescriptor {
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub message_id: String,
+    #[serde(deserialize_with = "deserialize_optional_identifier")]
+    pub parent_message_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    pub sequence: u64,
+    pub role: MessageRole,
+    #[serde(deserialize_with = "deserialize_timestamp")]
+    pub created_at: String,
+    #[serde(deserialize_with = "deserialize_optional_timestamp")]
+    pub edited_at: Option<String>,
+    pub parts: Vec<MessagePart>,
+    #[serde(deserialize_with = "deserialize_sha256")]
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolState {
+    Requested,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolDescriptor {
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub tool_call_id: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub message_id: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub name: String,
+    pub state: ToolState,
+    #[serde(deserialize_with = "deserialize_json_text")]
+    pub arguments_json: String,
+    #[serde(deserialize_with = "deserialize_sha256")]
+    pub arguments_hash: String,
+    #[serde(deserialize_with = "deserialize_optional_json_text")]
+    pub result_json: Option<String>,
+    #[serde(deserialize_with = "deserialize_optional_sha256")]
+    pub result_hash: Option<String>,
+    #[serde(deserialize_with = "deserialize_optional_timestamp")]
+    pub started_at: Option<String>,
+    #[serde(deserialize_with = "deserialize_optional_timestamp")]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachmentAvailability {
+    MetadataOnly,
+    Available,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttachmentDescriptor {
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub attachment_id: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub message_id: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub file_name: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub media_type: String,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    pub byte_length: u64,
+    #[serde(deserialize_with = "deserialize_sha256")]
+    pub content_hash: String,
+    #[serde(deserialize_with = "deserialize_optional_identifier")]
+    pub blob_id: Option<String>,
+    pub availability: AttachmentAvailability,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HashReference {
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub id: String,
+    #[serde(deserialize_with = "deserialize_sha256")]
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ContentHashAlgorithm {
+    #[serde(rename = "sha256")]
+    Sha256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ContentHashes {
+    pub algorithm: ContentHashAlgorithm,
+    #[serde(deserialize_with = "deserialize_sha256")]
+    pub session: String,
+    pub messages: Vec<HashReference>,
+    pub tools: Vec<HashReference>,
+    pub attachments: Vec<HashReference>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TransferCursorKind {
+    #[serde(rename = "session_transfer_cursor")]
+    SessionTransferCursor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TransferCursor {
+    #[serde(rename = "type")]
+    pub kind: TransferCursorKind,
+    #[serde(deserialize_with = "deserialize_opaque_token")]
+    pub token: String,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    pub revision: u64,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    pub after_sequence: u64,
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionReadRequestKind {
+    #[serde(rename = "session_read_request")]
+    SessionReadRequest,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionReadRequest {
+    #[serde(rename = "type")]
+    pub kind: SessionReadRequestKind,
+    pub protocol_version: ProtocolVersion,
+    pub auth: RequestAuth,
+    pub session: Option<ExternalSessionIdentity>,
+    pub cursor: Option<TransferCursor>,
+    pub limit: u16,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionReadRequestWire {
+    #[serde(rename = "type")]
+    kind: SessionReadRequestKind,
+    protocol_version: ProtocolVersion,
+    auth: RequestAuth,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    session: Option<ExternalSessionIdentity>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    cursor: Option<TransferCursor>,
+    #[serde(deserialize_with = "deserialize_session_limit")]
+    limit: u16,
+}
+
+impl<'de> Deserialize<'de> for SessionReadRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let request = SessionReadRequestWire::deserialize(deserializer)?;
+        if request.auth.capability != Capability::SessionsRead {
+            return Err(D::Error::custom(
+                "session read auth must require sessions.read",
+            ));
+        }
+        if request.session.is_some() == request.cursor.is_some() {
+            return Err(D::Error::custom(
+                "provide a session for the first page or a cursor for continuation",
+            ));
+        }
+        Ok(Self {
+            kind: request.kind,
+            protocol_version: request.protocol_version,
+            auth: request.auth,
+            session: request.session,
+            cursor: request.cursor,
+            limit: request.limit,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SessionPageKind {
+    #[serde(rename = "session_page")]
+    SessionPage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionPage {
+    #[serde(rename = "type")]
+    pub kind: SessionPageKind,
+    pub protocol_version: ProtocolVersion,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub request_id: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub page_id: String,
+    pub canonical_session: ExternalSessionIdentity,
+    pub origin: SessionOrigin,
+    pub metadata: SessionMetadata,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    pub revision: u64,
+    pub messages: Vec<MessageDescriptor>,
+    pub tools: Vec<ToolDescriptor>,
+    pub attachments: Vec<AttachmentDescriptor>,
+    pub content_hashes: ContentHashes,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub cursor: Option<TransferCursor>,
+}
+
 fn deserialize_identifier<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -544,8 +843,77 @@ where
     D: Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
+    validate_short_text(&value).map_err(D::Error::custom)?;
+    Ok(value)
+}
+
+fn deserialize_optional_short_text<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        validate_short_text(value).map_err(D::Error::custom)?;
+    }
+    Ok(value)
+}
+
+fn validate_short_text(value: &str) -> Result<(), &'static str> {
     if value.len() > 4_096 {
-        return Err(D::Error::custom("text exceeds 4096 byte limit"));
+        return Err("text exceeds 4096 byte limit");
+    }
+    Ok(())
+}
+
+fn deserialize_wire_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() > 4_000_000 {
+        return Err(D::Error::custom("wire text exceeds 4000000 byte limit"));
+    }
+    Ok(value)
+}
+
+fn deserialize_json_text<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    validate_json_text(&value).map_err(D::Error::custom)?;
+    Ok(value)
+}
+
+fn deserialize_optional_json_text<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        validate_json_text(value).map_err(D::Error::custom)?;
+    }
+    Ok(value)
+}
+
+fn validate_json_text(value: &str) -> Result<(), &'static str> {
+    if value.len() > 1_000_000 {
+        return Err("JSON text exceeds 1000000 byte limit");
+    }
+    serde_json::from_str::<Value>(value)
+        .map(|_| ())
+        .map_err(|_| "invalid JSON text")
+}
+
+fn deserialize_opaque_token<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() || value.trim() != value || value.len() > 2_048 {
+        return Err(D::Error::custom(
+            "opaque token must be non-empty, trimmed, and at most 2048 bytes",
+        ));
     }
     Ok(value)
 }
@@ -644,16 +1012,69 @@ where
     D: Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
+    validate_sha256(&value).map_err(D::Error::custom)?;
+    Ok(value)
+}
+
+fn deserialize_optional_sha256<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    if let Some(value) = &value {
+        validate_sha256(value).map_err(D::Error::custom)?;
+    }
+    Ok(value)
+}
+
+fn validate_sha256(value: &str) -> Result<(), &'static str> {
     if value.len() != 64
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
+        return Err("SHA-256 must be 64 lowercase hexadecimal digits");
+    }
+    Ok(())
+}
+
+fn deserialize_safe_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if value > MAX_SAFE_JSON_INTEGER {
         return Err(D::Error::custom(
-            "SHA-256 must be 64 lowercase hexadecimal digits",
+            "integer exceeds the JSON safe-integer range",
         ));
     }
     Ok(value)
+}
+
+fn deserialize_optional_safe_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<u64>::deserialize(deserializer)?;
+    if value.is_some_and(|value| value > MAX_SAFE_JSON_INTEGER) {
+        return Err(D::Error::custom(
+            "integer exceeds the JSON safe-integer range",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_session_limit<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u64::deserialize(deserializer)?;
+    if !(1..=200).contains(&value) {
+        return Err(D::Error::custom(
+            "session page limit must be between 1 and 200",
+        ));
+    }
+    Ok(value as u16)
 }
 
 fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
@@ -1022,7 +1443,193 @@ mod tests {
                 "details": null
             }
         });
-        assert!(serde_json::from_value::<ErrorResult>(error).is_ok());
+        assert!(serde_json::from_value::<ErrorResult>(error.clone()).is_ok());
+
+        let mut unsafe_detail = error;
+        unsafe_detail["error"]["details"] = json!({
+            "field": null,
+            "section": null,
+            "expectedRevision": MAX_SAFE_JSON_INTEGER + 1,
+            "currentRevision": null,
+            "retryAfterMs": null,
+            "limitBytes": null
+        });
+        assert!(serde_json::from_value::<ErrorResult>(unsafe_detail).is_err());
+    }
+
+    #[test]
+    fn session_read_request_is_strict_bounded_and_requires_one_selector() {
+        let auth = json!({
+            "device": {
+                "deviceId": "a".repeat(64),
+                "keyId": "a".repeat(64),
+                "algorithm": "ed25519"
+            },
+            "requestId": "request-read-1",
+            "issuedAt": "2026-07-20T12:00:00Z",
+            "expiresAt": "2026-07-20T12:00:30Z",
+            "nonce": "nonce_read_1234567890",
+            "bodyHash": "b".repeat(64),
+            "signature": "A".repeat(86),
+            "capability": "sessions.read"
+        });
+        let session = json!({
+            "kind": "external_session",
+            "authority": "local-studio",
+            "installationId": "controller-1",
+            "sessionId": "session-1"
+        });
+        let cursor = json!({
+            "type": "session_transfer_cursor",
+            "token": "cursor-token-1",
+            "revision": 4,
+            "afterSequence": 8,
+            "hasMore": true
+        });
+        let first = json!({
+            "type": "session_read_request",
+            "protocolVersion": 1,
+            "auth": auth,
+            "session": session,
+            "cursor": null,
+            "limit": 50
+        });
+        let parsed = serde_json::from_value::<SessionReadRequest>(first.clone()).unwrap();
+        assert_eq!(parsed.limit, 50);
+        assert!(parsed.session.is_some());
+
+        let mut continuation = first.clone();
+        continuation["session"] = Value::Null;
+        continuation["cursor"] = cursor.clone();
+        assert!(serde_json::from_value::<SessionReadRequest>(continuation).is_ok());
+
+        let mut neither = first.clone();
+        neither["session"] = Value::Null;
+        assert!(serde_json::from_value::<SessionReadRequest>(neither).is_err());
+
+        let mut both = first.clone();
+        both["cursor"] = cursor.clone();
+        assert!(serde_json::from_value::<SessionReadRequest>(both).is_err());
+
+        for invalid_limit in [0, 201] {
+            let mut invalid = first.clone();
+            invalid["limit"] = json!(invalid_limit);
+            assert!(serde_json::from_value::<SessionReadRequest>(invalid).is_err());
+        }
+
+        let mut wrong_capability = first.clone();
+        wrong_capability["auth"]["capability"] = json!("stats.read");
+        assert!(serde_json::from_value::<SessionReadRequest>(wrong_capability).is_err());
+
+        let mut unknown = first.clone();
+        unknown["path"] = json!("/private/session.jsonl");
+        assert!(serde_json::from_value::<SessionReadRequest>(unknown).is_err());
+
+        let mut unsafe_cursor = first;
+        unsafe_cursor["session"] = Value::Null;
+        unsafe_cursor["cursor"] = cursor;
+        unsafe_cursor["cursor"]["revision"] = json!(MAX_SAFE_JSON_INTEGER + 1);
+        assert!(serde_json::from_value::<SessionReadRequest>(unsafe_cursor).is_err());
+    }
+
+    #[test]
+    fn session_page_mirrors_bounded_identity_message_tool_and_attachment_wire() {
+        let hash = "a".repeat(64);
+        let page = json!({
+            "type": "session_page",
+            "protocolVersion": 1,
+            "requestId": "request-read-1",
+            "pageId": "page-1",
+            "canonicalSession": {
+                "kind": "external_session",
+                "authority": "local-studio",
+                "installationId": "controller-1",
+                "sessionId": "session-1"
+            },
+            "origin": {
+                "application": "local-studio",
+                "installationId": "controller-1",
+                "deviceId": null,
+                "exportedAt": "2026-07-20T12:00:00Z"
+            },
+            "metadata": {
+                "title": "A session",
+                "cwd": "/tmp/project",
+                "createdAt": "2026-07-20T11:00:00Z",
+                "updatedAt": "2026-07-20T12:00:00Z",
+                "modelId": "model-1",
+                "providerId": null
+            },
+            "revision": 4,
+            "messages": [{
+                "messageId": "message-1",
+                "parentMessageId": null,
+                "sequence": 0,
+                "role": "assistant",
+                "createdAt": "2026-07-20T11:30:00Z",
+                "editedAt": null,
+                "parts": [
+                    {"type": "reasoning", "text": "checking"},
+                    {"type": "text", "text": "done"},
+                    {"type": "tool_ref", "toolCallId": "tool-1"},
+                    {"type": "attachment_ref", "attachmentId": "attachment-1"}
+                ],
+                "contentHash": hash
+            }],
+            "tools": [{
+                "toolCallId": "tool-1",
+                "messageId": "message-1",
+                "name": "read",
+                "state": "completed",
+                "argumentsJson": "{\"path\":\"README.md\"}",
+                "argumentsHash": hash,
+                "resultJson": "{\"ok\":true}",
+                "resultHash": hash,
+                "startedAt": "2026-07-20T11:30:01Z",
+                "completedAt": "2026-07-20T11:30:02Z"
+            }],
+            "attachments": [{
+                "attachmentId": "attachment-1",
+                "messageId": "message-1",
+                "fileName": "result.txt",
+                "mediaType": "text/plain",
+                "byteLength": 4,
+                "contentHash": hash,
+                "blobId": null,
+                "availability": "metadata_only"
+            }],
+            "contentHashes": {
+                "algorithm": "sha256",
+                "session": hash,
+                "messages": [{"id": "message-1", "sha256": hash}],
+                "tools": [{"id": "tool-1", "sha256": hash}],
+                "attachments": [{"id": "attachment-1", "sha256": hash}]
+            },
+            "cursor": null
+        });
+        let parsed = serde_json::from_value::<SessionPage>(page.clone()).unwrap();
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.tools.len(), 1);
+        assert_eq!(parsed.attachments.len(), 1);
+
+        let mut invalid_json = page.clone();
+        invalid_json["tools"][0]["argumentsJson"] = json!("not-json");
+        assert!(serde_json::from_value::<SessionPage>(invalid_json).is_err());
+
+        let mut unsafe_length = page.clone();
+        unsafe_length["attachments"][0]["byteLength"] = json!(MAX_SAFE_JSON_INTEGER + 1);
+        assert!(serde_json::from_value::<SessionPage>(unsafe_length).is_err());
+
+        let mut leaked_path = page.clone();
+        leaked_path["messages"][0]["sourcePath"] = json!("/private/session.jsonl");
+        assert!(serde_json::from_value::<SessionPage>(leaked_path).is_err());
+
+        let mut missing_required_null = page;
+        missing_required_null["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove("providerId");
+        assert!(serde_json::from_value::<SessionPage>(missing_required_null).is_err());
     }
 
     #[test]
