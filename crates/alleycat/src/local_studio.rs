@@ -376,9 +376,18 @@ impl LocalStudioBridge {
         let context = match authorized_gateway(&self.authenticated_node) {
             Ok(context) => context,
             Err(_) => {
+                // The endpoint id is the caller's public Iroh identity, not a
+                // credential. Returning it here gives a newly paired phone a
+                // concrete enrollment handle that the host operator can pass
+                // to `kittylitter local-studio grant` without weakening the
+                // fail-closed capability check.
+                let message = format!(
+                    "Local Studio capability is not granted for endpoint {}",
+                    self.authenticated_node
+                );
                 return typed_error(
                     ErrorCode::CapabilityDenied,
-                    "Local Studio capability is not granted",
+                    &message,
                     generated_request_id(),
                     false,
                 );
@@ -1634,6 +1643,10 @@ mod tests {
         store.save().unwrap();
         let denied = bridge.capabilities(Value::Null).await;
         assert_eq!(error_code(&denied), "capability_denied");
+        assert_eq!(
+            denied["error"]["message"],
+            format!("Local Studio capability is not granted for endpoint {node}")
+        );
     }
 
     #[tokio::test]
