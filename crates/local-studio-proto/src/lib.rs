@@ -10,6 +10,7 @@ use thiserror::Error;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const SIGNATURE_DOMAIN: &[u8] = b"litter-bridge-request-v1";
 pub const MAX_SAFE_JSON_INTEGER: u64 = 9_007_199_254_740_991;
+pub const MAX_AGENT_TURN_CONTENT_LENGTH: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ProtocolVersion;
@@ -963,6 +964,163 @@ pub struct SessionPage {
     pub cursor: Option<TransferCursor>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentTurnRequestKind {
+    #[serde(rename = "agent_turn_request")]
+    AgentTurnRequest,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentTurnRequest {
+    #[serde(rename = "type")]
+    pub kind: AgentTurnRequestKind,
+    pub protocol_version: ProtocolVersion,
+    pub auth: MutationAuth,
+    pub session: ExternalSessionIdentity,
+    pub expected_revision: u64,
+    pub message_id: String,
+    pub model_id: Option<String>,
+    pub content: String,
+    pub content_hash: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AgentTurnRequestWire {
+    #[serde(rename = "type")]
+    kind: AgentTurnRequestKind,
+    protocol_version: ProtocolVersion,
+    auth: MutationAuth,
+    session: ExternalSessionIdentity,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    expected_revision: u64,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    message_id: String,
+    #[serde(deserialize_with = "deserialize_optional_identifier")]
+    model_id: Option<String>,
+    #[serde(deserialize_with = "deserialize_agent_turn_content")]
+    content: String,
+    #[serde(deserialize_with = "deserialize_sha256")]
+    content_hash: String,
+}
+
+impl<'de> Deserialize<'de> for AgentTurnRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let request = AgentTurnRequestWire::deserialize(deserializer)?;
+        if request.auth.capability != Capability::AgentTurn {
+            return Err(D::Error::custom("agent turn auth must require agent.turn"));
+        }
+        Ok(Self {
+            kind: request.kind,
+            protocol_version: request.protocol_version,
+            auth: request.auth,
+            session: request.session,
+            expected_revision: request.expected_revision,
+            message_id: request.message_id,
+            model_id: request.model_id,
+            content: request.content,
+            content_hash: request.content_hash,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentTurnAckKind {
+    #[serde(rename = "agent_turn_ack")]
+    AgentTurnAck,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentTurnOutcome {
+    #[serde(rename = "accepted")]
+    Accepted,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentTurnAck {
+    #[serde(rename = "type")]
+    pub kind: AgentTurnAckKind,
+    pub protocol_version: ProtocolVersion,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub request_id: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub idempotency_key: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub dispatch_id: String,
+    pub canonical_session: ExternalSessionIdentity,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub message_id: String,
+    #[serde(deserialize_with = "deserialize_sha256")]
+    pub content_hash: String,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    pub base_revision: u64,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub runtime_session_id: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub pi_session_id: String,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub model_id: String,
+    pub outcome: AgentTurnOutcome,
+    #[serde(deserialize_with = "deserialize_timestamp")]
+    pub accepted_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConflictResultKind {
+    #[serde(rename = "conflict")]
+    Conflict,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictOperation {
+    ControllerAction,
+    SessionTransfer,
+    AgentTurn,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictResolution {
+    Retry,
+    ForkRequired,
+    Manual,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConflictResult {
+    #[serde(rename = "type")]
+    pub kind: ConflictResultKind,
+    pub protocol_version: ProtocolVersion,
+    #[serde(deserialize_with = "deserialize_identifier")]
+    pub request_id: String,
+    pub operation: ConflictOperation,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    pub expected_revision: u64,
+    #[serde(deserialize_with = "deserialize_safe_u64")]
+    pub current_revision: u64,
+    pub resolution: ConflictResolution,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub canonical_session: Option<ExternalSessionIdentity>,
+    #[serde(deserialize_with = "deserialize_required_option")]
+    pub cursor: Option<TransferCursor>,
+    pub error: BridgeError,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum AgentTurnResult {
+    Ack(AgentTurnAck),
+    Conflict(ConflictResult),
+    Error(ErrorResult),
+}
+
 fn deserialize_identifier<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: Deserializer<'de>,
@@ -1026,6 +1184,29 @@ fn validate_short_text(value: &str) -> Result<(), &'static str> {
         return Err("text exceeds 4096 byte limit");
     }
     Ok(())
+}
+
+fn deserialize_agent_turn_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(D::Error::custom("agent turn content must not be empty"));
+    }
+    // Effect's String max-length check follows JavaScript String.length, so
+    // count UTF-16 code units here rather than UTF-8 bytes or Unicode scalars.
+    if value
+        .encode_utf16()
+        .take(MAX_AGENT_TURN_CONTENT_LENGTH + 1)
+        .count()
+        > MAX_AGENT_TURN_CONTENT_LENGTH
+    {
+        return Err(D::Error::custom(
+            "agent turn content exceeds the 100000 character limit",
+        ));
+    }
+    Ok(value)
 }
 
 fn deserialize_wire_text<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -1470,6 +1651,39 @@ mod tests {
 
     use super::*;
 
+    fn golden_agent_turn_request() -> Value {
+        json!({
+            "type": "agent_turn_request",
+            "protocolVersion": 1,
+            "auth": {
+                "device": {
+                    "deviceId": "a".repeat(64),
+                    "keyId": "a".repeat(64),
+                    "algorithm": "ed25519"
+                },
+                "requestId": "request-turn-golden",
+                "issuedAt": "2026-07-20T18:29:50.000Z",
+                "expiresAt": "2026-07-20T18:30:20.000Z",
+                "nonce": "agent-turn-nonce-1234",
+                "bodyHash": "6aa1290ac6b0e8cd86e0d4791f0f5c5ff69cac4a299a29d5ba06381bf8345ab5",
+                "signature": "S".repeat(86),
+                "capability": "agent.turn",
+                "idempotencyKey": "idempotency-turn-golden"
+            },
+            "session": {
+                "kind": "external_session",
+                "authority": "local-studio",
+                "installationId": "controller-test",
+                "sessionId": "session-test"
+            },
+            "expectedRevision": 7,
+            "messageId": "message-test",
+            "modelId": "model-test",
+            "content": "Continue from the phone",
+            "contentHash": "32f130f835f3486ce0a366936d5cc5c32752f92084795766fee6278b7e5643d4"
+        })
+    }
+
     #[test]
     fn capabilities_and_actions_are_closed_and_strict() {
         assert!(serde_json::from_str::<Capability>(r#""stats.read""#).is_ok());
@@ -1896,6 +2110,151 @@ mod tests {
             .unwrap()
             .remove("providerId");
         assert!(serde_json::from_value::<SessionPage>(missing_required_null).is_err());
+    }
+
+    #[test]
+    fn agent_turn_request_matches_local_studio_serde_and_signature_golden() {
+        // These hashes were generated by Local Studio d2114ea4 using
+        // litterBridgeSha256Utf8, litterBridgeBodyHash, and
+        // litterBridgeSignaturePreimage.
+        let golden = golden_agent_turn_request();
+        let request = serde_json::from_value::<AgentTurnRequest>(golden.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), golden);
+        assert_eq!(request.auth.capability, Capability::AgentTurn);
+        assert_eq!(
+            hex::encode(Sha256::digest(request.content.as_bytes())),
+            request.content_hash
+        );
+        assert_eq!(
+            canonical_request_body_sha256(&golden).unwrap(),
+            "6aa1290ac6b0e8cd86e0d4791f0f5c5ff69cac4a299a29d5ba06381bf8345ab5"
+        );
+        let preimage =
+            ed25519_signature_preimage(SignaturePreimage::from_mutation(&request.auth)).unwrap();
+        assert_eq!(
+            hex::encode(Sha256::digest(preimage)),
+            "ec98f0280915153819b6b3697c37ced34e58aa65e34e5fbb3cd067331107be5b"
+        );
+    }
+
+    #[test]
+    fn agent_turn_request_is_closed_capability_bound_and_uses_js_length_limit() {
+        let golden = golden_agent_turn_request();
+
+        let mut wrong_capability = golden.clone();
+        wrong_capability["auth"]["capability"] = json!("sessions.write");
+        assert!(serde_json::from_value::<AgentTurnRequest>(wrong_capability).is_err());
+
+        let mut unknown = golden.clone();
+        unknown["operation"] = json!("steer");
+        assert!(serde_json::from_value::<AgentTurnRequest>(unknown).is_err());
+
+        let mut missing_model = golden.clone();
+        missing_model.as_object_mut().unwrap().remove("modelId");
+        assert!(serde_json::from_value::<AgentTurnRequest>(missing_model).is_err());
+
+        let mut empty = golden.clone();
+        empty["content"] = json!("");
+        assert!(serde_json::from_value::<AgentTurnRequest>(empty).is_err());
+
+        let mut exact_ascii = golden.clone();
+        exact_ascii["content"] = json!("x".repeat(MAX_AGENT_TURN_CONTENT_LENGTH));
+        assert!(serde_json::from_value::<AgentTurnRequest>(exact_ascii).is_ok());
+
+        let mut over_ascii = golden.clone();
+        over_ascii["content"] = json!("x".repeat(MAX_AGENT_TURN_CONTENT_LENGTH + 1));
+        assert!(serde_json::from_value::<AgentTurnRequest>(over_ascii).is_err());
+
+        let mut exact_utf16 = golden.clone();
+        exact_utf16["content"] = json!("😀".repeat(MAX_AGENT_TURN_CONTENT_LENGTH / 2));
+        assert!(serde_json::from_value::<AgentTurnRequest>(exact_utf16).is_ok());
+        let mut over_utf16 = golden;
+        over_utf16["content"] = json!("😀".repeat(MAX_AGENT_TURN_CONTENT_LENGTH / 2 + 1));
+        assert!(serde_json::from_value::<AgentTurnRequest>(over_utf16).is_err());
+    }
+
+    #[test]
+    fn agent_turn_result_strictly_distinguishes_ack_conflict_and_error() {
+        let hash = "3".repeat(64);
+        let session = json!({
+            "kind": "external_session",
+            "authority": "local-studio",
+            "installationId": "controller-test",
+            "sessionId": "session-test"
+        });
+        let ack = json!({
+            "type": "agent_turn_ack",
+            "protocolVersion": 1,
+            "requestId": "request-turn-1",
+            "idempotencyKey": "idempotency-turn-1",
+            "dispatchId": "dispatch-turn-1",
+            "canonicalSession": session,
+            "messageId": "message-turn-1",
+            "contentHash": hash,
+            "baseRevision": 7,
+            "runtimeSessionId": "runtime-turn-1",
+            "piSessionId": "session-test",
+            "modelId": "model-test",
+            "outcome": "accepted",
+            "acceptedAt": "2026-07-20T18:30:00.000Z"
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentTurnResult>(ack.clone()).unwrap(),
+            AgentTurnResult::Ack(_)
+        ));
+        let mut extra_ack = ack;
+        extra_ack["steerable"] = json!(true);
+        assert!(serde_json::from_value::<AgentTurnResult>(extra_ack).is_err());
+
+        let conflict = json!({
+            "type": "conflict",
+            "protocolVersion": 1,
+            "requestId": "request-turn-1",
+            "operation": "agent_turn",
+            "expectedRevision": 7,
+            "currentRevision": 8,
+            "resolution": "retry",
+            "canonicalSession": session,
+            "cursor": null,
+            "error": {
+                "code": "revision_conflict",
+                "message": "Session changed before the prompt was accepted",
+                "retriable": true,
+                "requestId": "request-turn-1",
+                "details": {
+                    "field": null,
+                    "section": null,
+                    "expectedRevision": 7,
+                    "currentRevision": 8,
+                    "retryAfterMs": null,
+                    "limitBytes": null
+                }
+            }
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentTurnResult>(conflict.clone()).unwrap(),
+            AgentTurnResult::Conflict(_)
+        ));
+        let mut invalid_conflict = conflict;
+        invalid_conflict["operation"] = json!("agent_steer");
+        assert!(serde_json::from_value::<AgentTurnResult>(invalid_conflict).is_err());
+
+        let error = json!({
+            "type": "error",
+            "protocolVersion": 1,
+            "requestId": "request-turn-1",
+            "error": {
+                "code": "agent_runtime_unavailable",
+                "message": "Prompt preflight was rejected",
+                "retriable": true,
+                "requestId": "request-turn-1",
+                "details": null
+            }
+        });
+        assert!(matches!(
+            serde_json::from_value::<AgentTurnResult>(error).unwrap(),
+            AgentTurnResult::Error(_)
+        ));
     }
 
     #[test]
