@@ -7,10 +7,10 @@ use std::time::Duration;
 
 use alleycat_bridge_core::{Bridge, Conn, JsonRpcError};
 use alleycat_local_studio_proto::{
-    BridgeError, CapabilitiesManifest, CapabilitiesManifestKind, Capability, ControllerSnapshot,
-    ControllerSnapshotRequest, ErrorCode, ErrorResult, ErrorResultKind, LocalStudioAdvertisement,
-    ProtocolVersion, SessionAuthority, SessionListPage, SessionListRequest, SessionPage,
-    SessionReadRequest,
+    AgentTurnRequest, AgentTurnResult, BridgeError, CapabilitiesManifest, CapabilitiesManifestKind,
+    Capability, ConflictOperation, ControllerSnapshot, ControllerSnapshotRequest, ErrorCode,
+    ErrorResult, ErrorResultKind, LocalStudioAdvertisement, ProtocolVersion, SessionAuthority,
+    SessionListPage, SessionListRequest, SessionPage, SessionReadRequest,
 };
 use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
@@ -38,7 +38,11 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const SESSION_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SESSION_PAGE_ITEMS: usize = 200;
-const IMPLEMENTED_CAPABILITIES: [Capability; 2] = [Capability::StatsRead, Capability::SessionsRead];
+const IMPLEMENTED_CAPABILITIES: [Capability; 3] = [
+    Capability::StatsRead,
+    Capability::SessionsRead,
+    Capability::AgentTurn,
+];
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -571,6 +575,71 @@ impl LocalStudioBridge {
             ),
         }
     }
+
+    async fn agent_turn(&self, params: Value) -> Value {
+        let request_id = request_id_from(&params);
+        let request: AgentTurnRequest = match serde_json::from_value(params) {
+            Ok(request) => request,
+            Err(_) => {
+                return typed_error(
+                    ErrorCode::InvalidRequest,
+                    "Agent turn request is invalid",
+                    request_id,
+                    false,
+                );
+            }
+        };
+        let node_id = self.authenticated_node.to_string();
+        if request.auth.device.device_id != node_id || request.auth.device.key_id != node_id {
+            return typed_error(
+                ErrorCode::Unauthorized,
+                "Request identity does not match the authenticated connection",
+                request.auth.request_id,
+                false,
+            );
+        }
+        let context = match self.authorize(Capability::AgentTurn) {
+            Ok(context) => context,
+            Err(_) => {
+                return typed_error(
+                    ErrorCode::CapabilityDenied,
+                    "agent.turn is not granted",
+                    request.auth.request_id,
+                    false,
+                );
+            }
+        };
+        if request.session.authority != SessionAuthority::LocalStudio
+            || request.session.installation_id != context.metadata.controller_id
+        {
+            return typed_error(
+                ErrorCode::NotFound,
+                "Session identity was not found",
+                request.auth.request_id,
+                false,
+            );
+        }
+        let body = match serde_json::to_vec(&request) {
+            Ok(body) if body.len() <= MAX_HTTP_BODY_BYTES => body,
+            _ => {
+                return typed_error(
+                    ErrorCode::PayloadTooLarge,
+                    "Agent turn request exceeds the size limit",
+                    request.auth.request_id,
+                    false,
+                );
+            }
+        };
+        match forward_agent_turn(&context.metadata, &request, body).await {
+            Ok(value) => value,
+            Err(error) => typed_error(
+                error.code,
+                error.message,
+                request.auth.request_id,
+                error.retriable,
+            ),
+        }
+    }
 }
 
 #[async_trait]
@@ -583,6 +652,9 @@ impl Bridge for LocalStudioBridge {
         ];
         if self.authorize(Capability::SessionsRead).is_ok() {
             methods.push("localStudio/session/list");
+        }
+        if self.authorize(Capability::AgentTurn).is_ok() {
+            methods.push("localStudio/agent/turn");
         }
         Ok(json!({
             "userAgent": format!("alleycat-local-studio/{}", env!("CARGO_PKG_VERSION")),
@@ -603,6 +675,7 @@ impl Bridge for LocalStudioBridge {
             "localStudio/controller/read" => Ok(self.controller_read(params).await),
             "localStudio/session/list" => Ok(self.session_list(params).await),
             "localStudio/session/read" => Ok(self.session_read(params).await),
+            "localStudio/agent/turn" => Ok(self.agent_turn(params).await),
             other => Err(JsonRpcError::method_not_found(other)),
         }
     }
@@ -751,19 +824,84 @@ async fn forward_session_read(
     Ok(response.value)
 }
 
+async fn forward_agent_turn(
+    metadata: &GatewayMetadata,
+    request: &AgentTurnRequest,
+    body: Vec<u8>,
+) -> Result<Value, ForwardError> {
+    let response =
+        forward_gateway(metadata, body, SESSION_READ_TIMEOUT, SESSION_TOTAL_TIMEOUT).await?;
+    let result: AgentTurnResult =
+        serde_json::from_value(response.value.clone()).map_err(|_| ForwardError::unavailable())?;
+    match &result {
+        AgentTurnResult::Ack(ack) => {
+            if !response.status.is_success()
+                || ack.request_id != request.auth.request_id
+                || ack.idempotency_key != request.auth.idempotency_key
+                || ack.canonical_session != request.session
+                || ack.message_id != request.message_id
+                || ack.content_hash != request.content_hash
+                || ack.base_revision != request.expected_revision
+                || ack.pi_session_id != request.session.session_id
+                || request
+                    .model_id
+                    .as_ref()
+                    .is_some_and(|model_id| model_id != &ack.model_id)
+            {
+                return Err(ForwardError::unavailable());
+            }
+        }
+        AgentTurnResult::Conflict(conflict) => {
+            if response.status != reqwest::StatusCode::CONFLICT
+                || conflict.request_id != request.auth.request_id
+                || conflict.operation != ConflictOperation::AgentTurn
+                || conflict.expected_revision != request.expected_revision
+                || conflict.canonical_session.as_ref() != Some(&request.session)
+                || conflict.cursor.is_some()
+                || conflict.error.code != ErrorCode::RevisionConflict
+                || conflict.error.request_id.as_deref() != Some(request.auth.request_id.as_str())
+                || conflict.error.details.as_ref().is_some_and(|details| {
+                    details
+                        .expected_revision
+                        .is_some_and(|revision| revision != conflict.expected_revision)
+                        || details
+                            .current_revision
+                            .is_some_and(|revision| revision != conflict.current_revision)
+                })
+            {
+                return Err(ForwardError::unavailable());
+            }
+        }
+        AgentTurnResult::Error(error) => {
+            if response.status.is_success()
+                || !gateway_error_matches_request(error, &request.auth.request_id)
+                || error.error.request_id.as_deref() != Some(request.auth.request_id.as_str())
+            {
+                return Err(ForwardError::unavailable());
+            }
+        }
+    }
+    Ok(response.value)
+}
+
 fn validate_gateway_error(value: &Value, request_id: &str) -> Result<(), ForwardError> {
     let error: ErrorResult =
         serde_json::from_value(value.clone()).map_err(|_| ForwardError::unavailable())?;
-    if error.request_id != request_id
-        || error
-            .error
-            .request_id
-            .as_deref()
-            .is_some_and(|nested| nested != request_id)
-    {
+    if !gateway_error_matches_request(&error, request_id) {
         return Err(ForwardError::unavailable());
     }
     Ok(())
+}
+
+fn gateway_error_matches_request(error: &ErrorResult, request_id: &str) -> bool {
+    error.request_id == request_id && bridge_error_matches_request(&error.error, request_id)
+}
+
+fn bridge_error_matches_request(error: &BridgeError, request_id: &str) -> bool {
+    error
+        .request_id
+        .as_deref()
+        .is_none_or(|nested| nested == request_id)
 }
 
 struct GatewayResponse {
@@ -985,6 +1123,111 @@ mod tests {
         })
     }
 
+    fn agent_turn_request(node: &EndpointId) -> Value {
+        json!({
+            "type": "agent_turn_request",
+            "protocolVersion": 1,
+            "auth": {
+                "device": {
+                    "deviceId": node.to_string(),
+                    "keyId": node.to_string(),
+                    "algorithm": "ed25519"
+                },
+                "requestId": "request-turn-1",
+                "issuedAt": "2026-07-20T18:29:50.000Z",
+                "expiresAt": "2026-07-20T18:30:20.000Z",
+                "nonce": "agent-turn-nonce-1234",
+                "bodyHash": "e".repeat(64),
+                "signature": "E".repeat(86),
+                "capability": "agent.turn",
+                "idempotencyKey": "idempotency-turn-1"
+            },
+            "session": {
+                "kind": "external_session",
+                "authority": "local-studio",
+                "installationId": CONTROLLER_ID,
+                "sessionId": "session-turn-1"
+            },
+            "expectedRevision": 7,
+            "messageId": "message-turn-1",
+            "modelId": "model-test",
+            "content": "Continue from the phone",
+            "contentHash": "32f130f835f3486ce0a366936d5cc5c32752f92084795766fee6278b7e5643d4"
+        })
+    }
+
+    fn agent_turn_ack() -> Value {
+        json!({
+            "type": "agent_turn_ack",
+            "protocolVersion": 1,
+            "requestId": "request-turn-1",
+            "idempotencyKey": "idempotency-turn-1",
+            "dispatchId": "dispatch-turn-1",
+            "canonicalSession": {
+                "kind": "external_session",
+                "authority": "local-studio",
+                "installationId": CONTROLLER_ID,
+                "sessionId": "session-turn-1"
+            },
+            "messageId": "message-turn-1",
+            "contentHash": "32f130f835f3486ce0a366936d5cc5c32752f92084795766fee6278b7e5643d4",
+            "baseRevision": 7,
+            "runtimeSessionId": "runtime-turn-1",
+            "piSessionId": "session-turn-1",
+            "modelId": "model-test",
+            "outcome": "accepted",
+            "acceptedAt": "2026-07-20T18:30:00.000Z"
+        })
+    }
+
+    fn agent_turn_conflict() -> Value {
+        json!({
+            "type": "conflict",
+            "protocolVersion": 1,
+            "requestId": "request-turn-1",
+            "operation": "agent_turn",
+            "expectedRevision": 7,
+            "currentRevision": 8,
+            "resolution": "retry",
+            "canonicalSession": {
+                "kind": "external_session",
+                "authority": "local-studio",
+                "installationId": CONTROLLER_ID,
+                "sessionId": "session-turn-1"
+            },
+            "cursor": null,
+            "error": {
+                "code": "revision_conflict",
+                "message": "Session changed before the prompt was accepted",
+                "retriable": true,
+                "requestId": "request-turn-1",
+                "details": {
+                    "field": null,
+                    "section": null,
+                    "expectedRevision": 7,
+                    "currentRevision": 8,
+                    "retryAfterMs": null,
+                    "limitBytes": null
+                }
+            }
+        })
+    }
+
+    fn agent_turn_error() -> Value {
+        json!({
+            "type": "error",
+            "protocolVersion": 1,
+            "requestId": "request-turn-1",
+            "error": {
+                "code": "agent_runtime_unavailable",
+                "message": "Prompt preflight was rejected",
+                "retriable": true,
+                "requestId": "request-turn-1",
+                "details": null
+            }
+        })
+    }
+
     fn session_list_page_body() -> Vec<u8> {
         serde_json::to_vec(&json!({
             "type": "session_list_page",
@@ -1173,6 +1416,29 @@ mod tests {
         )
     }
 
+    async fn forward_agent_turn_fixture(
+        metadata: &Path,
+        bridge: &LocalStudioBridge,
+        node: &EndpointId,
+        status: &str,
+        value: Value,
+    ) -> Value {
+        let body = serde_json::to_vec(&value).unwrap();
+        let (url, server) = spawn_http_response(
+            status,
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Content-Length".into(), body.len().to_string()),
+            ],
+            body,
+        )
+        .await;
+        write_metadata(metadata, &url);
+        let response = bridge.agent_turn(agent_turn_request(node)).await;
+        server.await.unwrap();
+        response
+    }
+
     #[test]
     fn advertisement_reports_per_caller_authority_without_hiding_gateway() {
         let mut home = TempHome::new();
@@ -1226,7 +1492,7 @@ mod tests {
     }
 
     #[test]
-    fn advertisement_includes_sessions_read_and_suppresses_unimplemented_authority() {
+    fn advertisement_includes_implemented_authority_and_suppresses_future_grants() {
         let mut home = TempHome::new();
         let metadata = configure_metadata_path(&mut home);
         write_metadata(&metadata, "http://127.0.0.1:54321/api/litter-bridge/v1");
@@ -1240,6 +1506,8 @@ mod tests {
                     Capability::SessionsRead,
                     Capability::ModelsControl,
                     Capability::StatsRead,
+                    Capability::AgentTurn,
+                    Capability::SessionsWrite,
                 ],
                 expires_at: None,
                 revoked_at: None,
@@ -1253,7 +1521,11 @@ mod tests {
         let advertisement = local_studio_agent_info(Some(&node)).local_studio.unwrap();
         assert_eq!(
             advertisement.capabilities,
-            vec![Capability::StatsRead, Capability::SessionsRead]
+            vec![
+                Capability::StatsRead,
+                Capability::SessionsRead,
+                Capability::AgentTurn
+            ]
         );
         assert!(advertisement.actions.is_empty());
     }
@@ -1736,6 +2008,257 @@ mod tests {
         let not_found = bridge.session_read(session_request(&node)).await;
         assert_eq!(error_code(&not_found), "not_found");
         error_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn agent_turn_is_advertised_only_for_an_exact_grant_and_denied_otherwise() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        write_metadata(&metadata, "http://127.0.0.1:9/api/litter-bridge/v1");
+        let node = iroh::SecretKey::generate().public();
+        let bridge = LocalStudioBridge::new(node);
+        let conn = bridge_conn(&node);
+
+        grant_capabilities(node, &[Capability::SessionsWrite]);
+        let ungranted = bridge.initialize(&conn, json!({})).await.unwrap();
+        assert!(
+            !ungranted["capabilities"]["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("localStudio/agent/turn"))
+        );
+        let denied = bridge.agent_turn(agent_turn_request(&node)).await;
+        assert_eq!(error_code(&denied), "capability_denied");
+
+        grant_capabilities(node, &[Capability::AgentTurn]);
+        let granted = bridge.initialize(&conn, json!({})).await.unwrap();
+        assert!(
+            granted["capabilities"]["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("localStudio/agent/turn"))
+        );
+        let manifest = bridge.capabilities(Value::Null).await;
+        assert_eq!(manifest["capabilities"], json!(["agent.turn"]));
+    }
+
+    #[tokio::test]
+    async fn agent_turn_requires_connection_and_controller_identity_before_gateway_io() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        write_metadata(&metadata, "http://127.0.0.1:9/api/litter-bridge/v1");
+        let node = iroh::SecretKey::generate().public();
+        let other = iroh::SecretKey::generate().public();
+        grant_capabilities(node, &[Capability::AgentTurn]);
+        let bridge = LocalStudioBridge::new(node);
+
+        let denied = bridge.agent_turn(agent_turn_request(&other)).await;
+        assert_eq!(error_code(&denied), "unauthorized");
+
+        let mut wrong_controller = agent_turn_request(&node);
+        wrong_controller["session"]["installationId"] = json!("controller-other");
+        let denied = bridge.agent_turn(wrong_controller).await;
+        assert_eq!(error_code(&denied), "not_found");
+
+        let mut wrong_authority = agent_turn_request(&node);
+        wrong_authority["session"]["authority"] = json!("litter");
+        let denied = bridge.agent_turn(wrong_authority).await;
+        assert_eq!(error_code(&denied), "not_found");
+    }
+
+    #[tokio::test]
+    async fn agent_turn_forwards_exact_signed_prompt_with_secret_and_live_grant() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        let node = iroh::SecretKey::generate().public();
+        grant_capabilities(node, &[Capability::AgentTurn]);
+        let body = serde_json::to_vec(&agent_turn_ack()).unwrap();
+        let (url, server) = spawn_http_response(
+            "200 OK",
+            vec![
+                ("Content-Type".into(), "application/json".into()),
+                ("Content-Length".into(), body.len().to_string()),
+            ],
+            body,
+        )
+        .await;
+        write_metadata(&metadata, &url);
+        let bridge = LocalStudioBridge::new(node);
+        let conn = bridge_conn(&node);
+        let signed_request = agent_turn_request(&node);
+
+        let response = bridge
+            .dispatch(&conn, "localStudio/agent/turn", signed_request.clone())
+            .await
+            .unwrap();
+        assert_eq!(response["type"], "agent_turn_ack");
+        assert_eq!(response["dispatchId"], "dispatch-turn-1");
+        let received = server.await.unwrap();
+        let received_lower = received.to_ascii_lowercase();
+        assert!(received_lower.contains(&format!(
+            "{gateway_secret_header}: {test_secret}",
+            gateway_secret_header = GATEWAY_SECRET_HEADER,
+            test_secret = TEST_SECRET.to_ascii_lowercase()
+        )));
+        let forwarded_body = received.split("\r\n\r\n").nth(1).unwrap();
+        let forwarded: Value = serde_json::from_str(forwarded_body).unwrap();
+        assert_eq!(forwarded, signed_request);
+        assert!(forwarded.get("method").is_none());
+
+        let mut store = GrantStore::load().unwrap();
+        assert!(
+            store
+                .revoke_capabilities(&node, &[Capability::AgentTurn])
+                .unwrap()
+        );
+        store.save().unwrap();
+        let methods = bridge.initialize(&conn, json!({})).await.unwrap();
+        assert!(
+            !methods["capabilities"]["methods"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("localStudio/agent/turn"))
+        );
+        let denied = bridge.agent_turn(agent_turn_request(&node)).await;
+        assert_eq!(error_code(&denied), "capability_denied");
+    }
+
+    #[tokio::test]
+    async fn agent_turn_accepts_bound_conflict_and_error_results() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        let node = iroh::SecretKey::generate().public();
+        grant_capabilities(node, &[Capability::AgentTurn]);
+        let bridge = LocalStudioBridge::new(node);
+
+        let conflict = forward_agent_turn_fixture(
+            &metadata,
+            &bridge,
+            &node,
+            "409 Conflict",
+            agent_turn_conflict(),
+        )
+        .await;
+        assert_eq!(conflict["type"], "conflict");
+        assert_eq!(error_code(&conflict), "revision_conflict");
+
+        let error = forward_agent_turn_fixture(
+            &metadata,
+            &bridge,
+            &node,
+            "503 Service Unavailable",
+            agent_turn_error(),
+        )
+        .await;
+        assert_eq!(error["type"], "error");
+        assert_eq!(error_code(&error), "agent_runtime_unavailable");
+    }
+
+    #[tokio::test]
+    async fn agent_turn_rejects_malformed_ack_conflict_and_error_results() {
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+        let node = iroh::SecretKey::generate().public();
+        grant_capabilities(node, &[Capability::AgentTurn]);
+        let bridge = LocalStudioBridge::new(node);
+
+        let mut invalid_acks = Vec::new();
+        let mut invalid = agent_turn_ack();
+        invalid["requestId"] = json!("request-other");
+        invalid_acks.push(invalid);
+        let mut invalid = agent_turn_ack();
+        invalid["idempotencyKey"] = json!("idempotency-other");
+        invalid_acks.push(invalid);
+        let mut invalid = agent_turn_ack();
+        invalid["canonicalSession"]["sessionId"] = json!("session-other");
+        invalid_acks.push(invalid);
+        let mut invalid = agent_turn_ack();
+        invalid["messageId"] = json!("message-other");
+        invalid_acks.push(invalid);
+        let mut invalid = agent_turn_ack();
+        invalid["contentHash"] = json!("f".repeat(64));
+        invalid_acks.push(invalid);
+        let mut invalid = agent_turn_ack();
+        invalid["baseRevision"] = json!(8);
+        invalid_acks.push(invalid);
+        let mut invalid = agent_turn_ack();
+        invalid["piSessionId"] = json!("session-other");
+        invalid_acks.push(invalid);
+        let mut invalid = agent_turn_ack();
+        invalid["modelId"] = json!("model-other");
+        invalid_acks.push(invalid);
+        let mut invalid = agent_turn_ack();
+        invalid["steerable"] = json!(true);
+        invalid_acks.push(invalid);
+        for invalid in invalid_acks {
+            let unavailable =
+                forward_agent_turn_fixture(&metadata, &bridge, &node, "200 OK", invalid).await;
+            assert_eq!(error_code(&unavailable), "controller_unavailable");
+        }
+
+        let mut invalid_conflicts = Vec::new();
+        let mut invalid = agent_turn_conflict();
+        invalid["requestId"] = json!("request-other");
+        invalid_conflicts.push(invalid);
+        let mut invalid = agent_turn_conflict();
+        invalid["operation"] = json!("session_transfer");
+        invalid_conflicts.push(invalid);
+        let mut invalid = agent_turn_conflict();
+        invalid["expectedRevision"] = json!(8);
+        invalid_conflicts.push(invalid);
+        let mut invalid = agent_turn_conflict();
+        invalid["canonicalSession"] = Value::Null;
+        invalid_conflicts.push(invalid);
+        let mut invalid = agent_turn_conflict();
+        invalid["cursor"] = json!({
+            "type": "session_transfer_cursor",
+            "token": "cursor-turn-1",
+            "revision": 7,
+            "afterSequence": 0,
+            "hasMore": true
+        });
+        invalid_conflicts.push(invalid);
+        let mut invalid = agent_turn_conflict();
+        invalid["error"]["code"] = json!("internal");
+        invalid_conflicts.push(invalid);
+        let mut invalid = agent_turn_conflict();
+        invalid["error"]["requestId"] = json!("request-other");
+        invalid_conflicts.push(invalid);
+        let mut invalid = agent_turn_conflict();
+        invalid["error"]["requestId"] = Value::Null;
+        invalid_conflicts.push(invalid);
+        let mut invalid = agent_turn_conflict();
+        invalid["error"]["details"]["currentRevision"] = json!(9);
+        invalid_conflicts.push(invalid);
+        let mut invalid = agent_turn_conflict();
+        invalid["command"] = json!("steer");
+        invalid_conflicts.push(invalid);
+        for invalid in invalid_conflicts {
+            let unavailable =
+                forward_agent_turn_fixture(&metadata, &bridge, &node, "409 Conflict", invalid)
+                    .await;
+            assert_eq!(error_code(&unavailable), "controller_unavailable");
+        }
+
+        let mut invalid_errors = Vec::new();
+        let mut invalid = agent_turn_error();
+        invalid["requestId"] = json!("request-other");
+        invalid_errors.push(("503 Service Unavailable", invalid));
+        let mut invalid = agent_turn_error();
+        invalid["error"]["requestId"] = json!("request-other");
+        invalid_errors.push(("503 Service Unavailable", invalid));
+        let mut invalid = agent_turn_error();
+        invalid["error"]["requestId"] = Value::Null;
+        invalid_errors.push(("503 Service Unavailable", invalid));
+        let mut invalid = agent_turn_error();
+        invalid["error"]["detailsExtra"] = Value::Null;
+        invalid_errors.push(("503 Service Unavailable", invalid));
+        invalid_errors.push(("200 OK", agent_turn_error()));
+        for (status, invalid) in invalid_errors {
+            let unavailable =
+                forward_agent_turn_fixture(&metadata, &bridge, &node, status, invalid).await;
+            assert_eq!(error_code(&unavailable), "controller_unavailable");
+        }
     }
 
     #[tokio::test]
