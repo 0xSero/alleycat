@@ -20,6 +20,7 @@ use alleycat_grok_bridge::GrokBridge;
 use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig};
 use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
+use alleycat_pi_bridge::index::PiHydrator;
 use alleycat_shell_bridge::ShellBridge;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
@@ -165,9 +166,33 @@ impl AgentManager {
                 .with_program_aliases(pi_program_aliases());
         let launcher: Arc<dyn ProcessLauncher> = Arc::new(user_launcher);
 
+        // Local Studio already owns controller discovery and writes the exact
+        // Pi provider catalog it uses itself. When that catalog exists, point
+        // KittyLitter's Pi bridge at it instead of constructing a second,
+        // inevitably divergent controller/model configuration.
+        let pi_agent_dir =
+            env_path(&daemon_env, "PI_CODING_AGENT_DIR").or_else(local_studio::pi_agent_dir);
+        let pi_launcher: Arc<dyn ProcessLauncher> = match pi_agent_dir.as_ref() {
+            Some(agent_dir) => {
+                info!(
+                    agent_dir = %agent_dir.display(),
+                    "pi bridge using Local Studio agent directory"
+                );
+                Arc::new(EnvironmentOverlayLauncher::new(
+                    Arc::clone(&launcher),
+                    "PI_CODING_AGENT_DIR",
+                    agent_dir.as_os_str(),
+                ))
+            }
+            None => Arc::clone(&launcher),
+        };
+
         let mut pi_builder = PiBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.pi.bin))
-            .launcher(Arc::clone(&launcher));
+            .launcher(pi_launcher);
+        if let Some(agent_dir) = pi_agent_dir {
+            pi_builder = pi_builder.hydrator(PiHydrator::with_override(agent_dir.join("sessions")));
+        }
         if let Some(ref home) = codex_home {
             pi_builder = pi_builder.codex_home(home.clone());
         }
@@ -1023,6 +1048,43 @@ impl AgentManager {
             )
         };
         enabled && (program_available(env, &bin) || hermes_api_available(&api_base).await)
+    }
+}
+
+/// Adds one explicit variable before delegating to the normal user-environment
+/// launcher. `ProcessSpec` overrides win inside that launcher, so this remains
+/// compatible with future Pi per-process configuration.
+#[derive(Clone)]
+struct EnvironmentOverlayLauncher {
+    inner: Arc<dyn ProcessLauncher>,
+    key: OsString,
+    value: OsString,
+}
+
+impl EnvironmentOverlayLauncher {
+    fn new(inner: Arc<dyn ProcessLauncher>, key: &str, value: &std::ffi::OsStr) -> Self {
+        Self {
+            inner,
+            key: OsString::from(key),
+            value: value.to_os_string(),
+        }
+    }
+}
+
+impl ProcessLauncher for EnvironmentOverlayLauncher {
+    fn launch(
+        &self,
+        mut spec: alleycat_bridge_core::ProcessSpec,
+    ) -> futures::future::BoxFuture<'_, std::io::Result<Box<dyn alleycat_bridge_core::ChildProcess>>>
+    {
+        let key = self.key.clone();
+        let value = self.value.clone();
+        Box::pin(async move {
+            if !spec.env.iter().any(|(candidate, _)| candidate == &key) {
+                spec.env.push((key, value));
+            }
+            self.inner.launch(spec).await
+        })
     }
 }
 

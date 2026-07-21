@@ -20,6 +20,7 @@ pub mod reload;
 pub mod rotate;
 pub mod status;
 pub mod stop;
+pub mod studio;
 pub mod upgrade;
 
 /// Send a single request to the daemon and read back the response.

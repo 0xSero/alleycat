@@ -138,6 +138,8 @@ enum Command {
     Agents(cli::agents::AgentsArgs),
     /// Manage caller-scoped Local Studio access on this computer.
     LocalStudio(cli::local_studio::LocalStudioArgs),
+    /// Install or update the exact Local Studio controller on this computer.
+    Studio(cli::studio::StudioArgs),
     /// Connect to the daemon over iroh like a phone client and run JSON-RPC
     /// methods directly. Defaults to invoking `thread/list` on the chosen agent.
     Probe(cli::probe::ProbeArgs),
@@ -205,6 +207,10 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::LocalStudio(args)) => {
             init_cli_logging();
             cli::local_studio::run(args).await
+        }
+        Some(Command::Studio(args)) => {
+            init_cli_logging();
+            cli::studio::run(args).await
         }
         Some(Command::Probe(args)) => {
             init_cli_logging();
