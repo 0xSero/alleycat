@@ -1172,7 +1172,6 @@ mod tests {
             "messageId": "message-turn-1",
             "contentHash": "32f130f835f3486ce0a366936d5cc5c32752f92084795766fee6278b7e5643d4",
             "baseRevision": 7,
-            "runtimeSessionId": "runtime-turn-1",
             "piSessionId": "session-turn-1",
             "modelId": "model-test",
             "outcome": "accepted",

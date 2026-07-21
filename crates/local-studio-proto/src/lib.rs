@@ -1060,8 +1060,6 @@ pub struct AgentTurnAck {
     #[serde(deserialize_with = "deserialize_safe_u64")]
     pub base_revision: u64,
     #[serde(deserialize_with = "deserialize_identifier")]
-    pub runtime_session_id: String,
-    #[serde(deserialize_with = "deserialize_identifier")]
     pub pi_session_id: String,
     #[serde(deserialize_with = "deserialize_identifier")]
     pub model_id: String,
@@ -2192,7 +2190,6 @@ mod tests {
             "messageId": "message-turn-1",
             "contentHash": hash,
             "baseRevision": 7,
-            "runtimeSessionId": "runtime-turn-1",
             "piSessionId": "session-test",
             "modelId": "model-test",
             "outcome": "accepted",
