@@ -148,7 +148,7 @@ enum Command {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    let matches = Cli::command().name(binary_name()).get_matches();
+    let matches = command_for(app()).get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
     match cli.command {
         None => {
@@ -217,6 +217,10 @@ async fn async_main() -> anyhow::Result<()> {
     }
 }
 
+fn command_for(app: &App) -> clap::Command {
+    Cli::command().name(app.binary_name).version(app.version)
+}
+
 fn init_cli_logging() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -224,4 +228,25 @@ fn init_cli_logging() {
         }))
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod cli_version_tests {
+    use super::*;
+
+    #[test]
+    fn wrapper_version_overrides_library_package_version() {
+        let wrapper = App {
+            binary_name: "kittylitter",
+            qualifier: "com",
+            organization: "sigkitten",
+            application: "kittylitter",
+            label: "com.sigkitten.kittylitter",
+            version: "9.8.7",
+        };
+        assert_eq!(
+            command_for(&wrapper).render_version(),
+            "kittylitter 9.8.7\n"
+        );
+    }
 }
