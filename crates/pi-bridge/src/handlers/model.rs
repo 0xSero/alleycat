@@ -135,6 +135,16 @@ fn filter_models_by_enabled_models(models: Vec<PiAvailableModel>) -> Vec<PiAvail
     let Some(patterns) = enabled_model_patterns_from_settings() else {
         return models;
     };
+    filter_models_with_patterns(models, &patterns)
+}
+
+fn filter_models_with_patterns(
+    models: Vec<PiAvailableModel>,
+    patterns: &[String],
+) -> Vec<PiAvailableModel> {
+    if patterns.is_empty() {
+        return models;
+    }
     let filtered: Vec<PiAvailableModel> = models
         .iter()
         .filter(|model| model_matches_enabled_patterns(model, &patterns))
@@ -166,14 +176,9 @@ fn enabled_model_patterns_from_settings() -> Option<Vec<String>> {
 }
 
 fn pi_settings_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(PI_SETTINGS_PATH_ENV) {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".pi/agent/settings.json"))
+    let path = std::env::var(PI_SETTINGS_PATH_ENV).ok()?;
+    let trimmed = path.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
 fn strip_thinking_suffix(pattern: &str) -> String {
@@ -455,6 +460,17 @@ mod tests {
     fn parse_pi_models_response_empty_on_missing_field() {
         let raw = json!({ "other": [] });
         assert!(parse_pi_models_response(&raw).is_empty());
+    }
+
+    #[test]
+    fn empty_enabled_models_keeps_the_full_catalog() {
+        let models = vec![PiAvailableModel {
+            provider: Some("local-studio".into()),
+            model_id: Some("glm-5.2".into()),
+            ..Default::default()
+        }];
+        let filtered = filter_models_with_patterns(models, &[]);
+        assert_eq!(filtered.len(), 1);
     }
 
     #[tokio::test]
