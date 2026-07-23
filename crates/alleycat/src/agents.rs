@@ -204,14 +204,12 @@ impl AgentManager {
                     "PI_CODING_AGENT_DIR",
                     agent_dir.as_os_str(),
                 ));
-            let mut builder = PiBridge::builder()
+            let builder = PiBridge::builder()
                 .agent_bin(PathBuf::from(&snapshot.agents.pi.bin))
                 .launcher(studio_launcher)
                 .hydrator(PiHydrator::with_override(agent_dir.join("sessions")))
-                .model_provider_prefix("local-studio");
-            if let Some(ref home) = codex_home {
-                builder = builder.codex_home(home.clone());
-            }
+                .model_provider_prefix("local-studio")
+                .codex_home(agent_dir.join("bridge-index"));
             Some(
                 builder
                     .build()
