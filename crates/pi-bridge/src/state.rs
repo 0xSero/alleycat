@@ -57,6 +57,9 @@ pub struct ConnectionState {
     /// existence. Embedders that run the agent somewhere else, like Litter's
     /// SSH launcher, need the cwd to be validated by that remote process.
     trust_persisted_cwd: bool,
+
+    /// Optional provider scope for this bridge's model catalog.
+    model_provider_prefixes: Arc<Vec<String>>,
 }
 
 /// Negotiated client capabilities. Defaults to "no opt-outs, no experimental
@@ -123,6 +126,7 @@ impl ConnectionState {
         defaults: Arc<Mutex<ThreadDefaults>>,
         launcher: Arc<dyn ProcessLauncher>,
         trust_persisted_cwd: bool,
+        model_provider_prefixes: Arc<Vec<String>>,
     ) -> Self {
         Self {
             defaults,
@@ -131,7 +135,12 @@ impl ConnectionState {
             thread_index,
             launcher,
             trust_persisted_cwd,
+            model_provider_prefixes,
         }
+    }
+
+    pub fn model_provider_prefixes(&self) -> &[String] {
+        self.model_provider_prefixes.as_slice()
     }
 
     /// Underlying session — exposed for callers that need session-scoped
@@ -297,6 +306,7 @@ impl ConnectionState {
             Arc::new(Mutex::new(defaults)),
             launcher,
             false,
+            Arc::new(Vec::new()),
         ));
         (state, attach.live_rx)
     }

@@ -58,12 +58,33 @@ async fn fetch_models_via_pool(state: &Arc<ConnectionState>) -> Vec<PiAvailableM
         }
     };
     match fetch_models_from_handle(&handle).await {
-        Ok(models) => filter_models_by_enabled_models(models),
+        Ok(models) => filter_models_by_enabled_models(filter_models_by_provider(
+            models,
+            state.model_provider_prefixes(),
+        )),
         Err(err) => {
             tracing::warn!(%err, "model/list: get_available_models RPC failed");
             Vec::new()
         }
     }
+}
+
+fn filter_models_by_provider(
+    models: Vec<PiAvailableModel>,
+    prefixes: &[String],
+) -> Vec<PiAvailableModel> {
+    if prefixes.is_empty() {
+        return models;
+    }
+    models
+        .into_iter()
+        .filter(|model| {
+            let provider = model.provider.as_deref().unwrap_or_default();
+            prefixes
+                .iter()
+                .any(|prefix| provider == prefix || provider.starts_with(&format!("{prefix}-")))
+        })
+        .collect()
 }
 
 /// Translate one pi `Model<any>` into codex `Model`. Pi's catalog is loose
@@ -471,6 +492,31 @@ mod tests {
         }];
         let filtered = filter_models_with_patterns(models, &[]);
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn provider_filter_keeps_only_controller_variants() {
+        let models = [
+            "local-studio",
+            "local-studio-spark",
+            "openrouter",
+            "user-pi-local",
+        ]
+        .into_iter()
+        .map(|provider| PiAvailableModel {
+            provider: Some(provider.into()),
+            model_id: Some("model".into()),
+            ..Default::default()
+        })
+        .collect();
+        let filtered = filter_models_by_provider(models, &["local-studio".into()]);
+        assert_eq!(
+            filtered
+                .iter()
+                .filter_map(|model| model.provider.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["local-studio", "local-studio-spark"]
+        );
     }
 
     #[tokio::test]

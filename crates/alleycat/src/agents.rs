@@ -207,7 +207,8 @@ impl AgentManager {
             let mut builder = PiBridge::builder()
                 .agent_bin(PathBuf::from(&snapshot.agents.pi.bin))
                 .launcher(studio_launcher)
-                .hydrator(PiHydrator::with_override(agent_dir.join("sessions")));
+                .hydrator(PiHydrator::with_override(agent_dir.join("sessions")))
+                .model_provider_prefix("local-studio");
             if let Some(ref home) = codex_home {
                 builder = builder.codex_home(home.clone());
             }

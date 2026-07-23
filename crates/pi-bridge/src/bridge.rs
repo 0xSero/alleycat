@@ -50,6 +50,7 @@ pub struct PiBridge {
     /// underlying registry session expires.
     per_conn: DashMap<String, Arc<Mutex<ThreadDefaults>>>,
     trust_persisted_cwd: bool,
+    model_provider_prefixes: Arc<Vec<String>>,
 }
 
 impl PiBridge {
@@ -103,6 +104,7 @@ impl PiBridge {
             defaults,
             Arc::clone(&self.launcher),
             self.trust_persisted_cwd,
+            Arc::clone(&self.model_provider_prefixes),
         ))
     }
 }
@@ -118,6 +120,7 @@ pub struct PiBridgeBuilder {
     trust_persisted_cwd: bool,
     hydrator: Option<PiHydrator>,
     rpc_session_listing_only: bool,
+    model_provider_prefixes: Vec<String>,
 }
 
 impl PiBridgeBuilder {
@@ -162,6 +165,13 @@ impl PiBridgeBuilder {
     /// launchers use this so session discovery stays on the remote machine.
     pub fn rpc_session_listing_only(mut self, enabled: bool) -> Self {
         self.rpc_session_listing_only = enabled;
+        self
+    }
+
+    /// Restrict `model/list` to exact provider ids or their `prefix-*`
+    /// controller variants. Empty means the runtime's complete catalog.
+    pub fn model_provider_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.model_provider_prefixes.push(prefix.into());
         self
     }
 
@@ -230,6 +240,7 @@ impl PiBridgeBuilder {
             launcher,
             per_conn: DashMap::new(),
             trust_persisted_cwd: self.trust_persisted_cwd,
+            model_provider_prefixes: Arc::new(self.model_provider_prefixes),
         }))
     }
 }
