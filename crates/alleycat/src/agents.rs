@@ -36,8 +36,8 @@ use tracing::{info, warn};
 
 use crate::agent_manifest::{MANIFESTS, manifest_for};
 use crate::config::HostConfig;
-use crate::local_studio::{self, LocalStudioBridge};
-use crate::protocol::{AgentInfo, AgentWire};
+use crate::local_studio;
+use crate::protocol::{AgentInfo, AgentPresentation, AgentWire};
 use crate::stream::IrohStream;
 
 /// Stable identifier for a JSON-RPC bridge agent. Codex is intentionally
@@ -120,6 +120,7 @@ impl CodexUnixEndpoint {
 pub struct AgentManager {
     config: Arc<ArcSwap<HostConfig>>,
     bridges: HashMap<AgentKind, Arc<dyn Bridge>>,
+    local_studio_bridge: Option<Arc<PiBridge>>,
     /// Opencode is built lazily because constructing it spawns the opencode
     /// child + opens an SSE subscription; we don't want to pay that cost on
     /// daemon startup if no client ever asks for opencode.
@@ -166,17 +167,12 @@ impl AgentManager {
                 .with_program_aliases(pi_program_aliases());
         let launcher: Arc<dyn ProcessLauncher> = Arc::new(user_launcher);
 
-        // Local Studio already owns controller discovery and writes the exact
-        // Pi provider catalog it uses itself. When that catalog exists, point
-        // KittyLitter's Pi bridge at it instead of constructing a second,
-        // inevitably divergent controller/model configuration.
-        let pi_agent_dir =
-            env_path(&daemon_env, "PI_CODING_AGENT_DIR").or_else(local_studio::pi_agent_dir);
+        let pi_agent_dir = env_path(&daemon_env, "PI_CODING_AGENT_DIR");
         let pi_launcher: Arc<dyn ProcessLauncher> = match pi_agent_dir.as_ref() {
             Some(agent_dir) => {
                 info!(
                     agent_dir = %agent_dir.display(),
-                    "pi bridge using Local Studio agent directory"
+                    "pi bridge using configured agent directory"
                 );
                 Arc::new(EnvironmentOverlayLauncher::new(
                     Arc::clone(&launcher),
@@ -197,6 +193,33 @@ impl AgentManager {
             pi_builder = pi_builder.codex_home(home.clone());
         }
         let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
+
+        // Local Studio owns a separate Pi home containing its controller
+        // catalog and sessions. Expose it as its own standard app-server
+        // runtime instead of redirecting the user's standalone `pi` runtime.
+        let local_studio_bridge = if let Some(agent_dir) = local_studio::pi_agent_dir() {
+            let studio_launcher: Arc<dyn ProcessLauncher> =
+                Arc::new(EnvironmentOverlayLauncher::new(
+                    Arc::clone(&launcher),
+                    "PI_CODING_AGENT_DIR",
+                    agent_dir.as_os_str(),
+                ));
+            let mut builder = PiBridge::builder()
+                .agent_bin(PathBuf::from(&snapshot.agents.pi.bin))
+                .launcher(studio_launcher)
+                .hydrator(PiHydrator::with_override(agent_dir.join("sessions")));
+            if let Some(ref home) = codex_home {
+                builder = builder.codex_home(home.clone());
+            }
+            Some(
+                builder
+                    .build()
+                    .await
+                    .context("building Local Studio Pi bridge")?,
+            )
+        } else {
+            None
+        };
 
         let mut amp_builder = AmpBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.amp.bin))
@@ -323,6 +346,7 @@ impl AgentManager {
         Ok(Self {
             config,
             bridges,
+            local_studio_bridge,
             opencode_bridge: Arc::new(OnceCell::new()),
             codex_child: Arc::new(Mutex::new(None)),
             codex_mode: codex_detection.mode,
@@ -350,6 +374,9 @@ impl AgentManager {
             info!(agent = agent_kind_str(*kind), "shutting down bridge");
             bridge.shutdown().await;
         }
+        if let Some(bridge) = &self.local_studio_bridge {
+            bridge.shutdown().await;
+        }
         if let Some(opencode) = self.opencode_bridge.get() {
             opencode.shutdown().await;
         }
@@ -366,7 +393,7 @@ impl AgentManager {
 
     async fn list_agents_for_node(
         &self,
-        authenticated_node: Option<&EndpointId>,
+        _authenticated_node: Option<&EndpointId>,
     ) -> Vec<AgentInfo> {
         // Availability is computed per-agent (some are async, some not),
         // then each manifest is rendered to the wire `AgentInfo` shape.
@@ -406,7 +433,24 @@ impl AgentManager {
                 local_studio: None,
             });
         }
-        out.push(local_studio::local_studio_agent_info(authenticated_node));
+        if self.local_studio_bridge.is_some() {
+            let pi_manifest = manifest_for("pi").expect("Pi manifest must exist");
+            out.push(AgentInfo {
+                name: "local-studio".to_owned(),
+                display_name: "Local Studio".to_owned(),
+                wire: AgentWire::Jsonl,
+                available: true,
+                presentation: Some(AgentPresentation {
+                    title: Some("Local Studio".into()),
+                    is_beta: true,
+                    sort_order: 1,
+                    description: Some("Local Studio controller models and sessions".into()),
+                    aliases: Vec::new(),
+                }),
+                capabilities: Some(pi_manifest.capabilities()),
+                local_studio: None,
+            });
+        }
         out
     }
 
@@ -439,7 +483,11 @@ impl AgentManager {
                 self.serve_codex(stream).await
             }
             "local-studio" => {
-                let bridge = Arc::new(LocalStudioBridge::new(authenticated_node));
+                let _ = authenticated_node;
+                let bridge = self
+                    .local_studio_bridge
+                    .clone()
+                    .ok_or_else(|| anyhow!("Local Studio runtime is unavailable"))?;
                 alleycat_bridge_core::serve_stream_with_session(bridge, stream, session, last_seen)
                     .await
                     .context("serving `local-studio` bridge stream")
@@ -503,7 +551,7 @@ impl AgentManager {
     }
 
     pub fn local_studio_gateway_available(&self) -> bool {
-        local_studio::gateway_available()
+        self.local_studio_bridge.is_some()
     }
 
     pub fn agent_enabled(&self, agent: &str) -> bool {
