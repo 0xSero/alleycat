@@ -61,6 +61,8 @@ struct OpenItem {
     item_id: String,
     started: bool,
     saw_delta: bool,
+    needs_separator: bool,
+    accumulated: String,
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +103,11 @@ impl EventTranslatorState {
         &self.thread_id
     }
 
+    /// Complete any items still open when the Pi event stream closes.
+    pub fn finish(&mut self) -> Vec<ServerNotification> {
+        self.translate_agent_end(&[])
+    }
+
     pub fn turn_id(&self) -> &str {
         &self.turn_id
     }
@@ -110,7 +117,7 @@ impl EventTranslatorState {
         match event {
             PiEvent::AgentStart => Vec::new(),
             PiEvent::TurnStart => Vec::new(),
-            PiEvent::AgentEnd { .. } => self.translate_agent_end(),
+            PiEvent::AgentEnd { messages } => self.translate_agent_end(&messages),
             PiEvent::AgentSettled => Vec::new(),
             PiEvent::TurnEnd { .. } => Vec::new(),
             PiEvent::ThinkingLevelChanged { .. } => Vec::new(),
@@ -147,6 +154,7 @@ impl EventTranslatorState {
             } => self.translate_tool_end(tool_call_id, tool_name, result, is_error),
 
             PiEvent::QueueUpdate { .. } => Vec::new(),
+            PiEvent::EntryAppended { .. } => Vec::new(),
 
             PiEvent::CompactionStart { reason: _ } => self.translate_compaction_start(),
             PiEvent::CompactionEnd {
@@ -196,13 +204,21 @@ impl EventTranslatorState {
     // ---- message lifecycle -------------------------------------------------
 
     fn translate_message_start(&mut self, message: AssistantMessage) -> Vec<ServerNotification> {
-        let item_id = assistant_item_id(self.turn_index, message.timestamp);
         let text = extract_assistant_text(&message);
+        if let Some(item) = self.open_message_item.as_mut() {
+            item.saw_delta = false;
+            item.needs_separator = !item.accumulated.is_empty();
+            return self.ensure_agent_message_delta(text);
+        }
+
+        let item_id = assistant_item_id(self.turn_index, message.timestamp);
         let started = !text.is_empty();
         self.open_message_item = Some(OpenItem {
             item_id: item_id.clone(),
             started,
             saw_delta: false,
+            needs_separator: false,
+            accumulated: text.clone(),
         });
         if started {
             vec![self.item_started(ThreadItem::AgentMessage {
@@ -229,11 +245,13 @@ impl EventTranslatorState {
                         item_id,
                         started: false,
                         saw_delta: false,
+                        needs_separator: false,
+                        accumulated: String::new(),
                     });
                 }
 
                 let mut started_item = None;
-                let item_id = {
+                let (item_id, delta) = {
                     let item = self
                         .open_message_item
                         .as_mut()
@@ -248,7 +266,8 @@ impl EventTranslatorState {
                         });
                     }
                     item.saw_delta = true;
-                    item.item_id.clone()
+                    let delta = append_live_fragment(item, delta);
+                    (item.item_id.clone(), delta)
                 };
 
                 let mut out = Vec::new();
@@ -275,17 +294,26 @@ impl EventTranslatorState {
                         item_id,
                         started: false,
                         saw_delta: false,
+                        needs_separator: false,
+                        accumulated: String::new(),
                     });
                 }
                 self.ensure_agent_message_delta(content)
             }
 
             AssistantMessageEvent::ThinkingStart { partial, .. } => {
+                if let Some(item) = self.open_reasoning_item.as_mut() {
+                    item.saw_delta = false;
+                    item.needs_separator = !item.accumulated.is_empty();
+                    return Vec::new();
+                }
                 let item_id = reasoning_item_id(self.turn_index, partial.timestamp);
                 self.open_reasoning_item = Some(OpenItem {
                     item_id: item_id.clone(),
                     started: true,
                     saw_delta: false,
+                    needs_separator: false,
+                    accumulated: String::new(),
                 });
                 vec![self.item_started(ThreadItem::Reasoning {
                     id: item_id,
@@ -298,6 +326,7 @@ impl EventTranslatorState {
                     return Vec::new();
                 };
                 item.saw_delta = true;
+                let delta = append_live_fragment(item, delta);
                 vec![ServerNotification::ReasoningTextDelta(
                     ReasoningTextDeltaNotification {
                         thread_id: self.thread_id.clone(),
@@ -310,15 +339,7 @@ impl EventTranslatorState {
                 )]
             }
             AssistantMessageEvent::ThinkingEnd { content, .. } => {
-                if let Some(item) = self.open_reasoning_item.take() {
-                    vec![self.item_completed(ThreadItem::Reasoning {
-                        id: item.item_id,
-                        summary: Vec::new(),
-                        content: vec![content],
-                    })]
-                } else {
-                    Vec::new()
-                }
+                self.ensure_reasoning_delta(content)
             }
 
             AssistantMessageEvent::ToolcallStart { .. }
@@ -339,41 +360,8 @@ impl EventTranslatorState {
     }
 
     fn translate_message_end(&mut self, message: AssistantMessage) -> Vec<ServerNotification> {
-        let Some(item) = self.open_message_item.take() else {
-            return Vec::new();
-        };
         let text = extract_assistant_text(&message);
-        if !item.started && text.is_empty() {
-            return Vec::new();
-        }
-
-        let mut out = Vec::new();
-        if !item.started {
-            out.push(self.item_started(ThreadItem::AgentMessage {
-                id: item.item_id.clone(),
-                text: String::new(),
-                phase: Some(serde_json::Value::String("final_answer".into())),
-                memory_citation: None,
-            }));
-        }
-        if !item.saw_delta && !text.is_empty() {
-            out.push(ServerNotification::AgentMessageDelta(
-                AgentMessageDeltaNotification {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
-                    item_id: item.item_id.clone(),
-                    delta: text.clone(),
-                    parent_item_id: None,
-                },
-            ));
-        }
-        out.push(self.item_completed(ThreadItem::AgentMessage {
-            id: item.item_id,
-            text,
-            phase: Some(serde_json::Value::String("final_answer".into())),
-            memory_citation: None,
-        }));
-        out
+        self.ensure_agent_message_delta(text)
     }
 
     // ---- tool execution ----------------------------------------------------
@@ -646,23 +634,77 @@ impl EventTranslatorState {
         out
     }
 
-    fn translate_agent_end(&mut self) -> Vec<ServerNotification> {
+    fn translate_agent_end(&mut self, messages: &[AgentMessage]) -> Vec<ServerNotification> {
         let mut out = Vec::new();
+        let (final_text, final_reasoning) = aggregate_assistant_content(messages);
+        if let Some(item) = self.open_reasoning_item.take() {
+            let reasoning = if final_reasoning.is_empty() {
+                item.accumulated
+            } else {
+                final_reasoning
+            };
+            let content = if reasoning.is_empty() {
+                Vec::new()
+            } else {
+                vec![reasoning]
+            };
+            out.push(self.item_completed(ThreadItem::Reasoning {
+                id: item.item_id,
+                summary: Vec::new(),
+                content,
+            }));
+        } else if !final_reasoning.is_empty() {
+            let id = reasoning_item_id(self.turn_index, 0);
+            out.push(self.item_started(ThreadItem::Reasoning {
+                id: id.clone(),
+                summary: Vec::new(),
+                content: Vec::new(),
+            }));
+            out.push(self.item_completed(ThreadItem::Reasoning {
+                id,
+                summary: Vec::new(),
+                content: vec![final_reasoning],
+            }));
+        }
         if let Some(item) = self.open_message_item.take() {
             if item.started {
                 out.push(self.item_completed(ThreadItem::AgentMessage {
                     id: item.item_id,
+                    text: if final_text.is_empty() {
+                        item.accumulated
+                    } else {
+                        final_text
+                    },
+                    phase: Some(serde_json::Value::String("final_answer".into())),
+                    memory_citation: None,
+                }));
+            } else if !final_text.is_empty() {
+                out.push(self.item_started(ThreadItem::AgentMessage {
+                    id: item.item_id.clone(),
                     text: String::new(),
-                    phase: None,
+                    phase: Some(serde_json::Value::String("final_answer".into())),
+                    memory_citation: None,
+                }));
+                out.push(self.item_completed(ThreadItem::AgentMessage {
+                    id: item.item_id,
+                    text: final_text,
+                    phase: Some(serde_json::Value::String("final_answer".into())),
                     memory_citation: None,
                 }));
             }
-        }
-        if let Some(item) = self.open_reasoning_item.take() {
-            out.push(self.item_completed(ThreadItem::Reasoning {
-                id: item.item_id,
-                summary: Vec::new(),
-                content: Vec::new(),
+        } else if !final_text.is_empty() {
+            let id = assistant_item_id(self.turn_index, 0);
+            out.push(self.item_started(ThreadItem::AgentMessage {
+                id: id.clone(),
+                text: String::new(),
+                phase: Some(serde_json::Value::String("final_answer".into())),
+                memory_citation: None,
+            }));
+            out.push(self.item_completed(ThreadItem::AgentMessage {
+                id,
+                text: final_text,
+                phase: Some(serde_json::Value::String("final_answer".into())),
+                memory_citation: None,
             }));
         }
         out
@@ -691,6 +733,7 @@ impl EventTranslatorState {
         }
         item.saw_delta = true;
         let item_id = item.item_id.clone();
+        let text = append_live_fragment(item, text);
 
         let mut out = Vec::new();
         if let Some(item) = started_item {
@@ -706,6 +749,31 @@ impl EventTranslatorState {
             },
         ));
         out
+    }
+
+    fn ensure_reasoning_delta(&mut self, text: String) -> Vec<ServerNotification> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let Some(item) = self.open_reasoning_item.as_mut() else {
+            return Vec::new();
+        };
+        if item.saw_delta {
+            return Vec::new();
+        }
+        item.saw_delta = true;
+        let item_id = item.item_id.clone();
+        let delta = append_live_fragment(item, text);
+        vec![ServerNotification::ReasoningTextDelta(
+            ReasoningTextDeltaNotification {
+                thread_id: self.thread_id.clone(),
+                turn_id: self.turn_id.clone(),
+                item_id,
+                delta,
+                content_index: 0,
+                parent_item_id: None,
+            },
+        )]
     }
 
     // ---- helpers -----------------------------------------------------------
@@ -744,6 +812,44 @@ impl EventTranslatorState {
 
 fn new_item_id() -> String {
     Uuid::now_v7().to_string()
+}
+
+fn append_live_fragment(item: &mut OpenItem, fragment: String) -> String {
+    let separator = if item.needs_separator && !fragment.is_empty() {
+        "\n\n"
+    } else {
+        ""
+    };
+    item.needs_separator = false;
+    let emitted = format!("{separator}{fragment}");
+    item.accumulated.push_str(&emitted);
+    emitted
+}
+
+fn aggregate_assistant_content(messages: &[AgentMessage]) -> (String, String) {
+    let mut message_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
+    for message in messages {
+        let AgentMessage::Assistant(message) = message else {
+            continue;
+        };
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        for block in &message.content {
+            match block {
+                AssistantContentBlock::Text(content) => text.push_str(&content.text),
+                AssistantContentBlock::Thinking(content) => reasoning.push_str(&content.thinking),
+                AssistantContentBlock::ToolCall(_) => {}
+            }
+        }
+        if !text.is_empty() {
+            message_parts.push(text);
+        }
+        if !reasoning.is_empty() {
+            reasoning_parts.push(reasoning);
+        }
+    }
+    (message_parts.join("\n\n"), reasoning_parts.join("\n\n"))
 }
 
 fn extract_assistant_text(message: &AssistantMessage) -> String {
@@ -1093,8 +1199,8 @@ pub fn turn_status_from_agent_end(error_message: Option<&str>) -> (TurnStatus, O
 mod tests {
     use super::*;
     use crate::pool::pi_protocol::{
-        AssistantContentBlock, AssistantRole, CompactionReason, StopReason, TextContent, Usage,
-        UsageCost,
+        AssistantContentBlock, AssistantRole, CompactionReason, StopReason, TextContent,
+        ThinkingContent, Usage, UsageCost,
     };
 
     fn state() -> EventTranslatorState {
@@ -1143,6 +1249,24 @@ mod tests {
         }
     }
 
+    fn assistant_message_with_reasoning(
+        reasoning: &str,
+        text: &str,
+        timestamp: i64,
+    ) -> AssistantMessage {
+        let mut message = assistant_message(text);
+        message.content.insert(
+            0,
+            AssistantContentBlock::Thinking(ThinkingContent {
+                thinking: reasoning.into(),
+                thinking_signature: None,
+                redacted: None,
+            }),
+        );
+        message.timestamp = timestamp;
+        message
+    }
+
     #[test]
     fn agent_start_and_turn_start_are_silent() {
         let mut s = state();
@@ -1170,7 +1294,7 @@ mod tests {
         match &out[0] {
             ServerNotification::ItemStarted(n) => match &n.item {
                 ThreadItem::AgentMessage { id, text, .. } => {
-                    assert_eq!(id, "assistant_7_0");
+                    assert_eq!(id, "assistant_7");
                     assert_eq!(text, "hi");
                 }
                 other => panic!("expected AgentMessage, got {other:?}"),
@@ -1257,8 +1381,8 @@ mod tests {
             }),
             AgentMessage::Assistant(message),
         ]);
-        assert_eq!(item_id_from_started(&started[0]), replay[3].items[1].id());
-        assert_eq!(item_id_from_started(&thinking[0]), replay[3].items[2].id());
+        assert_eq!(item_id_from_started(&started[0]), replay[3].items[2].id());
+        assert_eq!(item_id_from_started(&thinking[0]), replay[3].items[1].id());
     }
 
     #[test]
@@ -1274,7 +1398,7 @@ mod tests {
         assert_eq!(started.len(), 1);
         match &started[0] {
             ServerNotification::ItemStarted(n) => match &n.item {
-                ThreadItem::Reasoning { id, .. } => assert_eq!(id, "reasoning_7_0"),
+                ThreadItem::Reasoning { id, .. } => assert_eq!(id, "reasoning_7"),
                 other => panic!("expected Reasoning, got {other:?}"),
             },
             other => panic!("unexpected {other:?}"),
@@ -1301,15 +1425,198 @@ mod tests {
                 partial: assistant_message(""),
             },
         });
-        match &ended[0] {
+        assert!(ended.is_empty());
+
+        let completed = s.translate(PiEvent::AgentEnd {
+            messages: Vec::new(),
+        });
+        match &completed[0] {
             ServerNotification::ItemCompleted(n) => match &n.item {
                 ThreadItem::Reasoning { content, .. } => {
-                    assert_eq!(content, &vec!["thinking done".to_string()]);
+                    assert_eq!(content, &vec!["thinking…".to_string()]);
                 }
                 other => panic!("expected Reasoning, got {other:?}"),
             },
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_cycles_stream_into_stable_reasoning_and_message_items() {
+        let mut s = EventTranslatorState::with_turn_index("th_1", "tu_1", 0);
+        let mut notifications = Vec::new();
+        let final_messages = vec![
+            AgentMessage::Assistant(assistant_message_with_reasoning(
+                "first thought",
+                "first update",
+                10,
+            )),
+            AgentMessage::Assistant(assistant_message_with_reasoning(
+                "second thought",
+                "final answer",
+                20,
+            )),
+        ];
+
+        for (index, (thinking, text)) in [
+            ("first thought", "first update"),
+            ("second thought", "final answer"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            notifications.extend(s.translate(PiEvent::MessageStart {
+                message: agent_msg(""),
+            }));
+            notifications.extend(s.translate(PiEvent::MessageUpdate {
+                message: agent_msg(""),
+                assistant_message_event: AssistantMessageEvent::ThinkingStart {
+                    content_index: 0,
+                    partial: assistant_message(""),
+                },
+            }));
+            notifications.extend(s.translate(PiEvent::MessageUpdate {
+                message: agent_msg(""),
+                assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                    content_index: 0,
+                    delta: thinking.into(),
+                    partial: assistant_message(""),
+                },
+            }));
+            notifications.extend(s.translate(PiEvent::MessageUpdate {
+                message: agent_msg(""),
+                assistant_message_event: AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: text.into(),
+                    partial: assistant_message(""),
+                },
+            }));
+            notifications.extend(s.translate(PiEvent::MessageEnd {
+                message: agent_msg(text),
+            }));
+            let tool_call_id = format!("tool-{index}");
+            notifications.extend(s.translate(PiEvent::ToolExecutionStart {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "bash".into(),
+                args: json!({"command": format!("echo {index}")}),
+            }));
+            notifications.extend(s.translate(PiEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name: "bash".into(),
+                result: json!({"content": [{"type": "text", "text": index.to_string()}]}),
+                is_error: false,
+            }));
+        }
+        notifications.extend(s.translate(PiEvent::AgentEnd {
+            messages: final_messages.clone(),
+        }));
+
+        let started_ids = notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemStarted(n)
+                    if matches!(
+                        n.item,
+                        ThreadItem::Reasoning { .. } | ThreadItem::AgentMessage { .. }
+                    ) =>
+                {
+                    Some(n.item.id())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(started_ids, ["reasoning_0", "assistant_0"]);
+
+        let completed = notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemCompleted(n)
+                    if matches!(
+                        n.item,
+                        ThreadItem::Reasoning { .. } | ThreadItem::AgentMessage { .. }
+                    ) =>
+                {
+                    Some(n.item.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let replay = crate::translate::items::translate_messages(&final_messages);
+        assert_eq!(completed, replay[0].items);
+    }
+
+    #[test]
+    fn agent_end_recovers_items_when_stream_events_were_lagged() {
+        let mut state = state();
+        let messages = vec![
+            AgentMessage::Assistant(assistant_message_with_reasoning(
+                "first thought",
+                "first update",
+                10,
+            )),
+            AgentMessage::Assistant(assistant_message_with_reasoning(
+                "second thought",
+                "final answer",
+                20,
+            )),
+        ];
+
+        let notifications = state.translate(PiEvent::AgentEnd { messages });
+        let started_ids = notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemStarted(notification) => Some(notification.item.id()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(started_ids, ["reasoning_7", "assistant_7"]);
+
+        let completed = notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemCompleted(notification) => Some(&notification.item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            completed[0],
+            ThreadItem::Reasoning { content, .. }
+                if content == &["first thought\n\nsecond thought"]
+        ));
+        assert!(matches!(
+            completed[1],
+            ThreadItem::AgentMessage { text, .. }
+                if text == "first update\n\nfinal answer"
+        ));
+    }
+
+    #[test]
+    fn agent_end_completes_message_started_without_a_delta() {
+        let mut state = state();
+        assert!(
+            state
+                .translate(PiEvent::MessageStart {
+                    message: agent_msg("")
+                })
+                .is_empty()
+        );
+
+        let notifications = state.translate(PiEvent::AgentEnd {
+            messages: vec![agent_msg("recovered answer")],
+        });
+        assert!(matches!(
+            &notifications[0],
+            ServerNotification::ItemStarted(notification)
+                if notification.item.id() == "assistant_7"
+        ));
+        assert!(matches!(
+            &notifications[1],
+            ServerNotification::ItemCompleted(notification)
+                if matches!(
+                    &notification.item,
+                    ThreadItem::AgentMessage { text, .. } if text == "recovered answer"
+                )
+        ));
     }
 
     #[test]

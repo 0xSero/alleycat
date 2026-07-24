@@ -623,6 +623,9 @@ pub enum PiEvent {
         #[serde(rename = "followUp")]
         follow_up: Vec<String>,
     },
+    EntryAppended {
+        entry: Value,
+    },
     CompactionStart {
         reason: CompactionReason,
     },
@@ -1351,6 +1354,25 @@ mod tests {
             _ => panic!("expected message_update"),
         }
         assert_eq!(serde_json::to_value(&event).unwrap(), body);
+    }
+
+    #[test]
+    fn pi_event_entry_appended_accepts_custom_session_entries() {
+        let body = json!({
+            "type": "entry_appended",
+            "entry": {
+                "type": "custom",
+                "customType": "goal",
+                "data": {"status": "complete"}
+            }
+        });
+        let event: PiOutboundMessage = serde_json::from_value(body.clone()).unwrap();
+        match event {
+            PiOutboundMessage::Event(PiEvent::EntryAppended { entry }) => {
+                assert_eq!(entry["customType"], "goal");
+            }
+            other => panic!("expected entry_appended event, got {other:?}"),
+        }
     }
 
     #[test]

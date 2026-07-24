@@ -554,6 +554,13 @@ async fn run_event_pump(mut args: EventPumpArgs) {
         }
     }
 
+    for notif in translator.finish() {
+        if state_should_emit(&args.state, &notif) {
+            let frame = notification_frame(notif);
+            let _ = args.state.send(frame);
+        }
+    }
+
     // Emit turn/completed unless a prior path already sent it.
     if !sent_completed {
         let (status, error) = turn_status_from_agent_end(error_message.as_deref());

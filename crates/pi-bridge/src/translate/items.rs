@@ -122,12 +122,12 @@ pub(crate) fn user_item_id(turn_index: usize) -> String {
     format!("user_{turn_index}")
 }
 
-pub(crate) fn assistant_item_id(turn_index: usize, timestamp: i64) -> String {
-    format!("assistant_{turn_index}_{timestamp}")
+pub(crate) fn assistant_item_id(turn_index: usize, _timestamp: i64) -> String {
+    format!("assistant_{turn_index}")
 }
 
-pub(crate) fn reasoning_item_id(turn_index: usize, timestamp: i64) -> String {
-    format!("reasoning_{turn_index}_{timestamp}")
+pub(crate) fn reasoning_item_id(turn_index: usize, _timestamp: i64) -> String {
+    format!("reasoning_{turn_index}")
 }
 
 fn user_message_to_item(message: &UserMessage, turn_index: usize) -> ThreadItem {
@@ -162,30 +162,54 @@ fn push_assistant_items(
     tool_results: &HashMap<&str, &ToolResultMessage>,
 ) {
     let mut text = String::new();
-    let mut thinking: Vec<String> = Vec::new();
+    let mut thinking = String::new();
     let mut tool_calls = Vec::new();
     for block in &message.content {
         match block {
             AssistantContentBlock::Text(t) => text.push_str(&t.text),
-            AssistantContentBlock::Thinking(t) => thinking.push(t.thinking.clone()),
+            AssistantContentBlock::Thinking(t) => thinking.push_str(&t.thinking),
             AssistantContentBlock::ToolCall(tc) => tool_calls.push(tc),
         }
     }
 
-    if !text.is_empty() {
-        out.push(ThreadItem::AgentMessage {
-            id: assistant_item_id(turn_index, message.timestamp),
-            text,
-            phase: Some(serde_json::Value::String("final_answer".into())),
-            memory_citation: None,
-        });
-    }
     if !thinking.is_empty() {
-        out.push(ThreadItem::Reasoning {
-            id: reasoning_item_id(turn_index, message.timestamp),
-            summary: Vec::new(),
-            content: thinking,
-        });
+        if let Some(ThreadItem::Reasoning { content, .. }) = out
+            .iter_mut()
+            .find(|item| matches!(item, ThreadItem::Reasoning { .. }))
+        {
+            if let Some(existing) = content.first_mut() {
+                if !existing.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(&thinking);
+            } else {
+                content.push(thinking);
+            }
+        } else {
+            out.push(ThreadItem::Reasoning {
+                id: reasoning_item_id(turn_index, message.timestamp),
+                summary: Vec::new(),
+                content: vec![thinking],
+            });
+        }
+    }
+    if !text.is_empty() {
+        if let Some(ThreadItem::AgentMessage { text: existing, .. }) = out
+            .iter_mut()
+            .find(|item| matches!(item, ThreadItem::AgentMessage { .. }))
+        {
+            if !existing.is_empty() {
+                existing.push_str("\n\n");
+            }
+            existing.push_str(&text);
+        } else {
+            out.push(ThreadItem::AgentMessage {
+                id: assistant_item_id(turn_index, message.timestamp),
+                text,
+                phase: Some(serde_json::Value::String("final_answer".into())),
+                memory_citation: None,
+            });
+        }
     }
     for tc in tool_calls {
         let kind = classify(&tc.name);
@@ -587,10 +611,59 @@ mod tests {
                 _ => "other",
             })
             .collect();
-        assert_eq!(kinds, vec!["user", "agent", "reasoning"]);
+        assert_eq!(kinds, vec!["user", "reasoning", "agent"]);
         assert_eq!(turns[0].items[0].id(), "user_0");
-        assert_eq!(turns[0].items[1].id(), "assistant_0_2");
-        assert_eq!(turns[0].items[2].id(), "reasoning_0_2");
+        assert_eq!(turns[0].items[1].id(), "reasoning_0");
+        assert_eq!(turns[0].items[2].id(), "assistant_0");
+    }
+
+    #[test]
+    fn assistant_tool_cycles_share_one_reasoning_and_message_item() {
+        let turns = translate_messages(&[
+            user(UserMessageContent::Text("q".into()), 1),
+            assistant_with_blocks(
+                vec![
+                    AssistantContentBlock::Thinking(ThinkingContent {
+                        thinking: "first thought".into(),
+                        thinking_signature: None,
+                        redacted: None,
+                    }),
+                    AssistantContentBlock::Text(TextContent {
+                        text: "first update".into(),
+                        text_signature: None,
+                    }),
+                ],
+                2,
+            ),
+            assistant_with_blocks(
+                vec![
+                    AssistantContentBlock::Thinking(ThinkingContent {
+                        thinking: "second thought".into(),
+                        thinking_signature: None,
+                        redacted: None,
+                    }),
+                    AssistantContentBlock::Text(TextContent {
+                        text: "final answer".into(),
+                        text_signature: None,
+                    }),
+                ],
+                3,
+            ),
+        ]);
+
+        assert_eq!(turns[0].items.len(), 3);
+        match &turns[0].items[1] {
+            ThreadItem::Reasoning { content, .. } => {
+                assert_eq!(content, &["first thought\n\nsecond thought"]);
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+        match &turns[0].items[2] {
+            ThreadItem::AgentMessage { text, .. } => {
+                assert_eq!(text, "first update\n\nfinal answer");
+            }
+            other => panic!("expected AgentMessage, got {other:?}"),
+        }
     }
 
     #[test]
