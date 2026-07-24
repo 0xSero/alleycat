@@ -225,7 +225,7 @@ impl AgentManager {
             .launcher(Arc::clone(&launcher))
             .dangerously_allow_all(snapshot.agents.amp.dangerously_allow_all);
         if let Some(ref home) = codex_home {
-            amp_builder = amp_builder.codex_home(home.clone());
+            amp_builder = amp_builder.codex_home(home.join("amp-bridge"));
         }
         let amp_bridge = amp_builder.build().await.context("building amp bridge")?;
 
@@ -234,7 +234,7 @@ impl AgentManager {
             .launcher(Arc::clone(&launcher))
             .bypass_permissions(snapshot.agents.claude.bypass_permissions);
         if let Some(ref home) = codex_home {
-            claude_builder = claude_builder.codex_home(home.clone());
+            claude_builder = claude_builder.codex_home(home.join("claude-bridge"));
         }
         let claude_bridge = claude_builder
             .build()
@@ -245,7 +245,7 @@ impl AgentManager {
             .agent_bin(PathBuf::from(&snapshot.agents.droid.bin))
             .launcher(Arc::clone(&launcher));
         if let Some(ref home) = codex_home {
-            droid_builder = droid_builder.codex_home(home.clone());
+            droid_builder = droid_builder.codex_home(home.join("droid-bridge"));
         }
         let droid_bridge = droid_builder
             .build()
