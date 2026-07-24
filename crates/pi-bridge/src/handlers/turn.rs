@@ -537,17 +537,7 @@ async fn run_event_pump(mut args: EventPumpArgs) {
         // translation; the translator emits item/completed for any open
         // items but does not emit turn/completed (that's our job).
         if let pi::PiEvent::AgentEnd { messages } = &event {
-            if let Some(pi::AgentMessage::Assistant(a)) = messages.last() {
-                if let Some(text) = a.content.iter().find_map(|b| match b {
-                    pi::AssistantContentBlock::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                }) {
-                    // No-op; this is just a hook for richer error
-                    // capture. Real failures show up via auto-retry
-                    // events upstream.
-                    let _ = text;
-                }
-            }
+            error_message = agent_end_error(messages);
         }
 
         let notifications = translator.translate(event.clone());
@@ -594,6 +584,18 @@ async fn run_event_pump(mut args: EventPumpArgs) {
 
     clear_active_turn(&args.thread_id);
     args.state.pi_pool().mark_idle(&args.thread_id).await;
+}
+
+fn agent_end_error(messages: &[pi::AgentMessage]) -> Option<String> {
+    let pi::AgentMessage::Assistant(message) = messages.last()? else {
+        return None;
+    };
+    message
+        .error_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
 }
 
 /// Map a `ServerNotification` to its `method` string and consult the
@@ -901,6 +903,40 @@ mod tests {
         assert_eq!(
             TurnError::PiRpc("oops".into()).rpc_code(),
             p::error_codes::INTERNAL_ERROR
+        );
+    }
+
+    #[test]
+    fn agent_end_carries_the_final_assistant_error() {
+        let messages: Vec<pi::AgentMessage> = serde_json::from_value(serde_json::json!([{
+            "role": "assistant",
+            "content": [],
+            "api": "openai-completions",
+            "provider": "local-studio",
+            "model": "offline-model",
+            "usage": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 0,
+                "cost": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "total": 0
+                }
+            },
+            "stopReason": "error",
+            "errorMessage": "  model is not running  ",
+            "timestamp": 1
+        }]))
+        .unwrap();
+
+        assert_eq!(
+            agent_end_error(&messages).as_deref(),
+            Some("model is not running")
         );
     }
 }
