@@ -125,6 +125,7 @@ async fn initialize_thread_start_turn_start_smoke() {
         &state,
         p::ThreadStartParams {
             cwd: Some(cwd.path().to_string_lossy().into_owned()),
+            approval_policy: Some(p::AskForApproval::Never),
             ..Default::default()
         },
     )
@@ -134,6 +135,12 @@ async fn initialize_thread_start_turn_start_smoke() {
     let thread_id = start_resp.thread.id.clone();
     assert!(!thread_id.is_empty(), "thread_id must be non-empty");
     assert_eq!(start_resp.cwd, cwd.path().to_string_lossy());
+    assert_eq!(start_resp.approval_policy, p::AskForApproval::Never);
+    assert_eq!(
+        state.defaults().approval_policy,
+        Some(p::AskForApproval::Never),
+        "turns must inherit the thread's full-access approval policy"
+    );
 
     // --- turn/start -------------------------------------------------------
     let started_at = Instant::now();

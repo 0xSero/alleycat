@@ -185,6 +185,12 @@ pub async fn handle_thread_start(
         .clone()
         .or_else(|| defaults.approval_policy.clone())
         .unwrap_or(p::AskForApproval::OnRequest);
+    // `turn/start` carries only per-turn overrides. Remember the policy
+    // selected for this thread so subsequent turns do not silently fall back
+    // to `on-request` and prompt a full-access client.
+    state.update_defaults(|defaults| {
+        defaults.approval_policy = Some(approval_policy.clone());
+    });
     let approvals_reviewer = params
         .approvals_reviewer
         .or(defaults.approvals_reviewer)
