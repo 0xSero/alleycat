@@ -12,6 +12,7 @@
 //! holds an `Arc<Session>` and delegates `send` / `register_pending_request` /
 //! `resolve_pending_request` / `cancel_all_pending_requests` to it.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -60,6 +61,9 @@ pub struct ConnectionState {
 
     /// Optional provider scope for this bridge's model catalog.
     model_provider_prefixes: Arc<Vec<String>>,
+
+    /// Optional Pi `models.json` owned by the embedding controller.
+    model_catalog_path: Option<PathBuf>,
 }
 
 /// Negotiated client capabilities. Defaults to "no opt-outs, no experimental
@@ -127,6 +131,7 @@ impl ConnectionState {
         launcher: Arc<dyn ProcessLauncher>,
         trust_persisted_cwd: bool,
         model_provider_prefixes: Arc<Vec<String>>,
+        model_catalog_path: Option<PathBuf>,
     ) -> Self {
         Self {
             defaults,
@@ -136,11 +141,16 @@ impl ConnectionState {
             launcher,
             trust_persisted_cwd,
             model_provider_prefixes,
+            model_catalog_path,
         }
     }
 
     pub fn model_provider_prefixes(&self) -> &[String] {
         self.model_provider_prefixes.as_slice()
+    }
+
+    pub fn model_catalog_path(&self) -> Option<&std::path::Path> {
+        self.model_catalog_path.as_deref()
     }
 
     /// Underlying session — exposed for callers that need session-scoped
@@ -307,6 +317,7 @@ impl ConnectionState {
             launcher,
             false,
             Arc::new(Vec::new()),
+            None,
         ));
         (state, attach.live_rx)
     }

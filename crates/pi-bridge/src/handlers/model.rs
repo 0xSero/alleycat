@@ -16,8 +16,10 @@
 //! `mock/experimentalMethod` are inlined in `main.rs`'s dispatcher; this
 //! module deliberately does not duplicate them.
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 use serde_json::json;
@@ -27,6 +29,8 @@ use crate::pool::pi_protocol as pi;
 use crate::state::ConnectionState;
 
 const PI_SETTINGS_PATH_ENV: &str = "PI_AGENT_SETTINGS_PATH";
+const MODEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_MODEL_CATALOG_BYTES: usize = 8 * 1024 * 1024;
 const THINKING_SUFFIXES: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 pub async fn handle_model_list(
@@ -50,23 +54,78 @@ pub async fn handle_model_list(
 /// picker today" and falls back to the thread's active model. Spawn
 /// failure is logged at WARN so it's visible in bridge logs.
 async fn fetch_models_via_pool(state: &Arc<ConnectionState>) -> Vec<PiAvailableModel> {
-    let handle = match state.pi_pool().acquire_utility(None).await {
-        Ok(h) => h,
-        Err(err) => {
-            tracing::warn!(%err, "model/list: failed to acquire utility pi handle");
-            return Vec::new();
+    if let Some(path) = state.model_catalog_path() {
+        match fetch_models_from_catalog(path, state.model_provider_prefixes()).await {
+            Ok(models) => return filter_models_by_enabled_models(models),
+            Err(err) => {
+                tracing::warn!(%err, path = %path.display(), "model/list: controller catalog unavailable; falling back to pi RPC");
+            }
         }
-    };
-    match fetch_models_from_handle(&handle).await {
-        Ok(models) => filter_models_by_enabled_models(filter_models_by_provider(
+    }
+
+    match tokio::time::timeout(MODEL_RPC_TIMEOUT, fetch_models_via_rpc(state)).await {
+        Ok(Ok(models)) => filter_models_by_enabled_models(filter_models_by_provider(
             models,
             state.model_provider_prefixes(),
         )),
-        Err(err) => {
-            tracing::warn!(%err, "model/list: get_available_models RPC failed");
+        Ok(Err(err)) => {
+            tracing::warn!(%err, "model/list: pi RPC failed");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("model/list: pi RPC timed out");
             Vec::new()
         }
     }
+}
+
+async fn fetch_models_via_rpc(
+    state: &Arc<ConnectionState>,
+) -> anyhow::Result<Vec<PiAvailableModel>> {
+    let handle = state.pi_pool().acquire_utility(None).await?;
+    Ok(fetch_models_from_handle(&handle).await?)
+}
+
+async fn fetch_models_from_catalog(
+    path: &Path,
+    prefixes: &[String],
+) -> anyhow::Result<Vec<PiAvailableModel>> {
+    let bytes = tokio::fs::read(path).await?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_MODEL_CATALOG_BYTES,
+        "controller model catalog exceeds size limit"
+    );
+    let value: Value = serde_json::from_slice(&bytes)?;
+    Ok(parse_pi_models_catalog(&value, prefixes))
+}
+
+fn parse_pi_models_catalog(value: &Value, prefixes: &[String]) -> Vec<PiAvailableModel> {
+    let Some(providers) = value.get("providers").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    providers
+        .iter()
+        .filter(|(provider, _)| {
+            prefixes.is_empty()
+                || prefixes.iter().any(|prefix| {
+                    provider.as_str() == prefix || provider.starts_with(&format!("{prefix}-"))
+                })
+        })
+        .flat_map(|(provider, config)| {
+            config
+                .get("models")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(move |model| {
+                    let mut model = model.clone();
+                    model
+                        .as_object_mut()?
+                        .insert("provider".to_string(), Value::String(provider.clone()));
+                    serde_json::from_value(model).ok()
+                })
+        })
+        .collect()
 }
 
 fn filter_models_by_provider(
@@ -344,6 +403,7 @@ struct PiAvailableModel {
     #[serde(default)]
     model_id: Option<String>,
     #[serde(default)]
+    #[serde(alias = "name")]
     display_name: Option<String>,
     #[serde(default)]
     label: Option<String>,
@@ -351,7 +411,7 @@ struct PiAvailableModel {
     description: Option<String>,
     /// Free-form modalities list pi exposes (`text`, `image`, etc.). We
     /// pass through verbatim and let codex pick what it understands.
-    #[serde(default)]
+    #[serde(default, alias = "input")]
     input_modalities: Option<Vec<Value>>,
 }
 
@@ -524,6 +584,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["local-studio", "local-studio-spark"]
         );
+    }
+
+    #[test]
+    fn controller_catalog_reads_only_scoped_provider() {
+        let catalog = json!({
+            "providers": {
+                "local-studio": {
+                    "models": [
+                        {"id": "glm-5.2", "name": "GLM 5.2"}
+                    ]
+                },
+                "openrouter": {
+                    "models": [
+                        {"id": "other", "name": "Other"}
+                    ]
+                }
+            }
+        });
+        let models = parse_pi_models_catalog(&catalog, &["local-studio".to_string()]);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].provider.as_deref(), Some("local-studio"));
+        assert_eq!(models[0].id.as_deref(), Some("glm-5.2"));
+        assert_eq!(models[0].display_name.as_deref(), Some("GLM 5.2"));
     }
 
     #[tokio::test]

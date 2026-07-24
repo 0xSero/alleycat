@@ -1,9 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alleycat_bridge_core::session::{
-    AttachKind as CoreAttachKind, ResolvedAttach, SessionRegistry,
-};
+use alleycat_bridge_core::session::{ResolvedAttach, SessionRegistry};
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use iroh::endpoint::QuicTransportConfig;
@@ -261,29 +259,7 @@ fn resolve_attach(
     agent: &'static str,
     last_seen: Option<u64>,
 ) -> ResolvedAttach {
-    if agent != "local-studio" {
-        return registry.resolve_attach(node_id, agent, last_seen);
-    }
-
-    // Controller snapshots are authorization-sensitive. A generic AlleyCat
-    // replay ring could otherwise redeliver a response produced before a
-    // stats.read grant was revoked. Local Studio requests are authoritative
-    // and idempotent, so each connection gets a fresh ephemeral session and
-    // every useful response must come from a newly authorized dispatch.
-    let config = registry.config();
-    let session = Arc::new(alleycat_bridge_core::Session::new(
-        agent,
-        node_id,
-        config.ring_max_msgs,
-        config.ring_max_bytes,
-    ));
-    ResolvedAttach {
-        session,
-        kind: CoreAttachKind::Fresh,
-        current_seq: 0,
-        floor_seq: 0,
-        effective_last_seen: None,
-    }
+    registry.resolve_attach(node_id, agent, last_seen)
 }
 
 pub fn pair_payload(
@@ -380,24 +356,25 @@ mod tests {
     }
 
     #[test]
-    fn local_studio_attach_never_replays_pre_revocation_history() {
+    fn local_studio_attach_resumes_from_client_cursor() {
         let registry = alleycat_bridge_core::SessionRegistry::new(Default::default());
         let node_id = iroh::SecretKey::generate().public().to_string();
         let prior = registry.get_or_create(node_id.clone(), "local-studio");
-        prior.enqueue(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "result": {"type": "controller_snapshot", "sensitive": true}
-        }));
+        prior.enqueue(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+        prior.enqueue(serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
 
-        let resolved = resolve_attach(registry.as_ref(), node_id, "local-studio", Some(0));
-        assert_eq!(resolved.kind, CoreAttachKind::Fresh);
-        assert_eq!(resolved.current_seq, 0);
-        assert_eq!(resolved.floor_seq, 0);
-        assert!(resolved.effective_last_seen.is_none());
-        assert!(!Arc::ptr_eq(&prior, &resolved.session));
-        let attachment = resolved.session.install_attachment(None);
-        assert!(attachment.backlog.is_empty());
+        let resolved = resolve_attach(registry.as_ref(), node_id, "local-studio", Some(1));
+        assert_eq!(
+            resolved.kind,
+            alleycat_bridge_core::session::AttachKind::Resumed
+        );
+        assert_eq!(resolved.current_seq, 2);
+        assert_eq!(resolved.floor_seq, 1);
+        assert_eq!(resolved.effective_last_seen, Some(1));
+        assert!(Arc::ptr_eq(&prior, &resolved.session));
+        let attachment = resolved.session.install_attachment(Some(1));
+        assert_eq!(attachment.backlog.len(), 1);
+        assert_eq!(attachment.backlog[0].seq, 2);
         assert!(attachment.replay_redelivery.is_none());
     }
 

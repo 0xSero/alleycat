@@ -85,7 +85,22 @@ fn searchable_entry(entry: &DirEntry) -> bool {
     }
     !matches!(
         entry.file_name().to_str(),
-        Some(".git" | ".hg" | ".svn" | "node_modules" | "target" | ".build")
+        Some(
+            ".git"
+                | ".hg"
+                | ".svn"
+                | "node_modules"
+                | "target"
+                | ".build"
+                | ".build-stamps"
+                | ".gradle"
+                | ".swiftpm"
+                | "build"
+                | "DerivedData"
+                | "Frameworks"
+                | "GeneratedRust"
+                | "zig-cache"
+        )
     )
 }
 
@@ -169,7 +184,16 @@ mod tests {
     #[test]
     fn search_skips_dependency_and_vcs_directories() {
         let temp = tempfile::tempdir().unwrap();
-        for directory in [".git", "node_modules", "target"] {
+        for directory in [
+            ".git",
+            "node_modules",
+            "target",
+            ".build-stamps",
+            "build",
+            "Frameworks",
+            "GeneratedRust",
+            "zig-cache",
+        ] {
             std::fs::create_dir_all(temp.path().join(directory)).unwrap();
             std::fs::write(temp.path().join(directory).join("needle.txt"), "hidden").unwrap();
         }

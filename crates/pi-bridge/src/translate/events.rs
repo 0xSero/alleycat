@@ -786,13 +786,7 @@ fn stringify_progress_message(value: &Value) -> String {
 }
 
 fn extract_bash_output(result: &Value) -> Option<String> {
-    if let Some(s) = result.as_str() {
-        return Some(s.to_string());
-    }
-    if let Some(s) = result.get("output").and_then(|v| v.as_str()) {
-        return Some(s.to_string());
-    }
-    None
+    extract_tool_text_output(result)
 }
 
 /// Cap aggregated_output at 256 KiB on a UTF-8 boundary. Multi-megabyte
@@ -1379,6 +1373,33 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(s.open_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn bash_tool_completion_extracts_live_pi_content_array() {
+        let mut s = state();
+        s.translate(PiEvent::ToolExecutionStart {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            args: json!({"command": "printf marker"}),
+        });
+
+        let ended = s.translate(PiEvent::ToolExecutionEnd {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            result: json!({"content": [{"type": "text", "text": "marker"}]}),
+            is_error: false,
+        });
+
+        match &ended[0] {
+            ServerNotification::ItemCompleted(n) => match &n.item {
+                ThreadItem::CommandExecution {
+                    aggregated_output, ..
+                } => assert_eq!(aggregated_output.as_deref(), Some("marker")),
+                other => panic!("expected CommandExecution, got {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

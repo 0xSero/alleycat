@@ -219,6 +219,7 @@ impl AgentManager {
                 .launcher(studio_launcher)
                 .hydrator(PiHydrator::with_override(agent_dir.join("sessions")))
                 .model_provider_prefix("local-studio")
+                .model_catalog_path(agent_dir.join("models.json"))
                 .codex_home(agent_dir.join("bridge-index"));
             Some(
                 builder

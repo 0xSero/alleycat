@@ -51,6 +51,7 @@ pub struct PiBridge {
     per_conn: DashMap<String, Arc<Mutex<ThreadDefaults>>>,
     trust_persisted_cwd: bool,
     model_provider_prefixes: Arc<Vec<String>>,
+    model_catalog_path: Option<PathBuf>,
 }
 
 impl PiBridge {
@@ -105,6 +106,7 @@ impl PiBridge {
             Arc::clone(&self.launcher),
             self.trust_persisted_cwd,
             Arc::clone(&self.model_provider_prefixes),
+            self.model_catalog_path.clone(),
         ))
     }
 }
@@ -121,6 +123,7 @@ pub struct PiBridgeBuilder {
     hydrator: Option<PiHydrator>,
     rpc_session_listing_only: bool,
     model_provider_prefixes: Vec<String>,
+    model_catalog_path: Option<PathBuf>,
 }
 
 impl PiBridgeBuilder {
@@ -172,6 +175,12 @@ impl PiBridgeBuilder {
     /// controller variants. Empty means the runtime's complete catalog.
     pub fn model_provider_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.model_provider_prefixes.push(prefix.into());
+        self
+    }
+
+    /// Prefer a controller-owned Pi `models.json` for `model/list`.
+    pub fn model_catalog_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.model_catalog_path = Some(path.into());
         self
     }
 
@@ -241,6 +250,7 @@ impl PiBridgeBuilder {
             per_conn: DashMap::new(),
             trust_persisted_cwd: self.trust_persisted_cwd,
             model_provider_prefixes: Arc::new(self.model_provider_prefixes),
+            model_catalog_path: self.model_catalog_path,
         }))
     }
 }
