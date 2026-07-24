@@ -111,6 +111,7 @@ impl EventTranslatorState {
             PiEvent::AgentStart => Vec::new(),
             PiEvent::TurnStart => Vec::new(),
             PiEvent::AgentEnd { .. } => self.translate_agent_end(),
+            PiEvent::AgentSettled => Vec::new(),
             PiEvent::TurnEnd { .. } => Vec::new(),
             PiEvent::ThinkingLevelChanged { .. } => Vec::new(),
 

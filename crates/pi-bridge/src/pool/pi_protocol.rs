@@ -564,6 +564,7 @@ pub enum PiEvent {
     AgentEnd {
         messages: Vec<AgentMessage>,
     },
+    AgentSettled,
 
     // Turn lifecycle (one assistant response + tool calls/results)
     TurnStart,
@@ -1653,6 +1654,14 @@ mod tests {
             PiEvent::AgentEnd { messages } => assert_eq!(messages.len(), 1),
             _ => panic!("expected agent_end"),
         }
+        assert_eq!(serde_json::to_value(&event).unwrap(), body);
+    }
+
+    #[test]
+    fn agent_settled_event_round_trips() {
+        let body = json!({"type": "agent_settled"});
+        let event: PiEvent = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(event, PiEvent::AgentSettled);
         assert_eq!(serde_json::to_value(&event).unwrap(), body);
     }
 }

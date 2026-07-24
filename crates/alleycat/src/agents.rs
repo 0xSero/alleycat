@@ -254,7 +254,8 @@ impl AgentManager {
 
         let mut droid_builder = DroidBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.droid.bin))
-            .launcher(Arc::clone(&launcher));
+            .launcher(Arc::clone(&launcher))
+            .defer_initial_hydration(true);
         if let Some(ref home) = codex_home {
             droid_builder = droid_builder.codex_home(home.join("droid-bridge"));
         }

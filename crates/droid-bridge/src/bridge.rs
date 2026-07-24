@@ -15,6 +15,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::index::{self, DroidHydrator, DroidSessionRef, IndexEntry, ListFilter, ListSort};
@@ -36,6 +37,7 @@ pub struct DroidBridge {
     factory_sessions_dir: Option<PathBuf>,
     threads: Arc<Mutex<HashMap<String, ThreadRecord>>>,
     processes: Arc<Mutex<HashMap<String, Arc<DroidProcess>>>>,
+    initial_hydration_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,6 +61,7 @@ pub struct DroidBridgeBuilder {
     launcher: Option<Arc<dyn ProcessLauncher>>,
     codex_home: Option<PathBuf>,
     factory_sessions_dir: Option<PathBuf>,
+    defer_initial_hydration: bool,
 }
 
 impl DroidBridge {
@@ -85,6 +88,14 @@ impl DroidBridgeBuilder {
 
     pub fn factory_sessions_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.factory_sessions_dir = Some(dir.into());
+        self
+    }
+
+    /// Open the persisted thread index immediately and hydrate Factory's
+    /// session history in the background. The default remains eager so
+    /// standalone bridge callers keep their existing startup contract.
+    pub fn defer_initial_hydration(mut self, enabled: bool) -> Self {
+        self.defer_initial_hydration = enabled;
         self
     }
 
@@ -117,8 +128,35 @@ impl DroidBridgeBuilder {
             tracing::warn!(?codex_home, %err, "failed to create codex_home; continuing");
         }
         let factory_sessions_dir = self.factory_sessions_dir;
-        let thread_index =
-            index::open_and_hydrate(&codex_home, factory_sessions_dir.clone()).await?;
+        let (thread_index, initial_hydration_task) = if self.defer_initial_hydration {
+            let thread_index = index::ThreadIndex::open_at(codex_home.join("threads.json")).await?;
+            let hydration_index = Arc::clone(&thread_index);
+            let hydrator = match factory_sessions_dir.clone() {
+                Some(dir) => DroidHydrator::with_sessions_dir(dir),
+                None => DroidHydrator::new(),
+            };
+            let task = tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                match hydration_index.hydrate_from(&hydrator).await {
+                    Ok(added) => {
+                        tracing::info!(
+                            added,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            "deferred droid hydration completed"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "deferred droid hydration failed");
+                    }
+                }
+            });
+            (thread_index, Some(task))
+        } else {
+            (
+                index::open_and_hydrate(&codex_home, factory_sessions_dir.clone()).await?,
+                None,
+            )
+        };
         Ok(Arc::new(DroidBridge {
             droid_bin: self
                 .agent_bin
@@ -131,6 +169,7 @@ impl DroidBridgeBuilder {
             factory_sessions_dir,
             threads: Arc::new(Mutex::new(HashMap::new())),
             processes: Arc::new(Mutex::new(HashMap::new())),
+            initial_hydration_task: Mutex::new(initial_hydration_task),
         }))
     }
 }
@@ -402,6 +441,14 @@ impl Bridge for DroidBridge {
 
     async fn notification(&self, _ctx: &Conn, method: &str, params: Value) {
         tracing::debug!(method, params = %params, "droid bridge ignored client notification");
+    }
+
+    async fn shutdown(&self) {
+        let task = self.initial_hydration_task.lock().await.take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
     }
 }
 
@@ -961,6 +1008,9 @@ impl DroidBridge {
     }
 
     async fn refresh_thread_index(&self) -> Result<(), JsonRpcError> {
+        if self.initial_hydration_covers_refresh().await {
+            return Ok(());
+        }
         let hydrator = self.hydrator();
         let scanned = hydrator.scan_sessions().await;
         for info in scanned {
@@ -982,6 +1032,36 @@ impl DroidBridge {
             }
         }
         Ok(())
+    }
+
+    /// A deferred initial scan is already authoritative for this refresh.
+    /// While it is running, serve the persisted cache instead of launching a
+    /// duplicate full-disk scan. Once it finishes, consume the task handle;
+    /// later explicit refreshes resume their normal behavior.
+    async fn initial_hydration_covers_refresh(&self) -> bool {
+        let finished_task = {
+            let mut guard = self.initial_hydration_task.lock().await;
+            match guard.as_ref() {
+                Some(task) if task.is_finished() => guard.take(),
+                Some(_) => return true,
+                None => return false,
+            }
+        };
+        if let Some(task) = finished_task
+            && let Err(err) = task.await
+            && !err.is_cancelled()
+        {
+            tracing::warn!(%err, "deferred droid hydration task failed");
+        }
+        true
+    }
+
+    #[cfg(test)]
+    async fn wait_for_initial_hydration(&self) {
+        let task = self.initial_hydration_task.lock().await.take();
+        if let Some(task) = task {
+            task.await.expect("deferred hydration task should join");
+        }
     }
 
     fn hydrator(&self) -> DroidHydrator {
@@ -1486,5 +1566,102 @@ fn method_not_found(method: &str) -> JsonRpcError {
         code: error_codes::METHOD_NOT_FOUND,
         message: format!("method `{method}` is not implemented"),
         data: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_session(root: &Path, file_id: &str, session_id: &str) -> PathBuf {
+        let project_dir = root.join("-tmp-work");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join(format!("{file_id}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session_start\",\"id\":\"{session_id}\",\"cwd\":\"/tmp/work\"}}\n\
+                 {{\"type\":\"message\",\"timestamp\":\"2026-07-24T00:00:00Z\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn eager_hydration_remains_the_builder_default() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        write_session(sessions.path(), "fresh", "fresh");
+
+        let bridge = DroidBridge::builder()
+            .codex_home(home.path())
+            .factory_sessions_dir(sessions.path())
+            .build()
+            .await
+            .unwrap();
+
+        assert!(bridge.thread_index.lookup("fresh").await.is_some());
+        assert!(bridge.initial_hydration_task.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn deferred_hydration_opens_cache_then_adds_scanned_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let cached_path = sessions.path().join("cached.jsonl");
+        let cached_index = index::ThreadIndex::open_at(home.path().join("threads.json"))
+            .await
+            .unwrap();
+        cached_index
+            .insert(IndexEntry {
+                thread_id: "cached".into(),
+                cwd: "/tmp/work".into(),
+                created_at: 1,
+                updated_at: 1,
+                archived: false,
+                name: None,
+                preview: "cached".into(),
+                forked_from_id: None,
+                model_provider: MODEL_PROVIDER.into(),
+                source: p::ThreadSourceKind::AppServer,
+                metadata: DroidSessionRef {
+                    droid_session_path: cached_path,
+                    droid_session_id: "cached".into(),
+                },
+            })
+            .await
+            .unwrap();
+        drop(cached_index);
+        write_session(sessions.path(), "fresh", "fresh");
+
+        let bridge = DroidBridge::builder()
+            .codex_home(home.path())
+            .factory_sessions_dir(sessions.path())
+            .defer_initial_hydration(true)
+            .build()
+            .await
+            .unwrap();
+
+        assert!(bridge.thread_index.lookup("cached").await.is_some());
+        bridge.wait_for_initial_hydration().await;
+        assert!(bridge.thread_index.lookup("fresh").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn shutdown_consumes_the_deferred_hydration_task() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let bridge = DroidBridge::builder()
+            .codex_home(home.path())
+            .factory_sessions_dir(sessions.path())
+            .defer_initial_hydration(true)
+            .build()
+            .await
+            .unwrap();
+
+        assert!(bridge.initial_hydration_task.lock().await.is_some());
+        Bridge::shutdown(bridge.as_ref()).await;
+        assert!(bridge.initial_hydration_task.lock().await.is_none());
     }
 }

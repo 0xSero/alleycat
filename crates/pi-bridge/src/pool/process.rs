@@ -429,7 +429,15 @@ async fn reader_task(
                 let _ = events_tx.send(event);
             }
             Err(err) => {
-                tracing::warn!(?err, line = %trimmed, "pi reader task: failed to parse line");
+                let frame_type = serde_json::from_str::<serde_json::Value>(trimmed)
+                    .ok()
+                    .and_then(|value| value.get("type")?.as_str().map(str::to_owned));
+                tracing::warn!(
+                    ?err,
+                    frame_type,
+                    frame_bytes = trimmed.len(),
+                    "pi reader task: failed to parse frame"
+                );
             }
         }
     }
