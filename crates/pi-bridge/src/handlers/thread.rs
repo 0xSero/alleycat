@@ -1011,7 +1011,7 @@ fn pi_thinking_level(effort: p::ReasoningEffort) -> pi::ThinkingLevel {
         p::ReasoningEffort::Medium => pi::ThinkingLevel::Medium,
         p::ReasoningEffort::High => pi::ThinkingLevel::High,
         p::ReasoningEffort::XHigh => pi::ThinkingLevel::Xhigh,
-        p::ReasoningEffort::Max => pi::ThinkingLevel::Xhigh,
+        p::ReasoningEffort::Max => pi::ThinkingLevel::Max,
     }
 }
 

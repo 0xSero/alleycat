@@ -255,6 +255,8 @@ pub enum ThinkingLevel {
     High,
     /// Only valid for select OpenAI gpt-5.x models.
     Xhigh,
+    /// Provider-defined maximum reasoning level.
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1508,6 +1510,7 @@ mod tests {
             ThinkingLevel::Medium,
             ThinkingLevel::High,
             ThinkingLevel::Xhigh,
+            ThinkingLevel::Max,
         ] {
             let event = PiEvent::ThinkingLevelChanged { level };
             let body = serde_json::to_value(&event).unwrap();

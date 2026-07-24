@@ -51,6 +51,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 directories = { workspace = true }
+walkdir = { workspace = true }
 
 [features]
 # Exposes `crate::index::testing` (and any future `crate::*::testing` modules)

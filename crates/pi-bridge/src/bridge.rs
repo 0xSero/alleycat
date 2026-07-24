@@ -423,6 +423,10 @@ async fn dispatch(
             };
             ok(handlers::model::handle_model_list(state, typed).await)
         }
+        "fuzzyFileSearch" => {
+            let typed: p::FuzzyFileSearchParams = decode(&params)?;
+            ok(handlers::file_search::handle_fuzzy_file_search(typed).await)
+        }
         "skills/list" => {
             let typed: p::SkillsListParams = if params.is_null() {
                 Default::default()

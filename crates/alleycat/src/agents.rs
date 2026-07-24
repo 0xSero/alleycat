@@ -197,15 +197,25 @@ impl AgentManager {
         // Local Studio owns a separate Pi home containing its controller
         // catalog and sessions. Expose it as its own standard app-server
         // runtime instead of redirecting the user's standalone `pi` runtime.
-        let local_studio_bridge = if let Some(agent_dir) = local_studio::pi_agent_dir() {
-            let studio_launcher: Arc<dyn ProcessLauncher> =
-                Arc::new(EnvironmentOverlayLauncher::new(
-                    Arc::clone(&launcher),
-                    "PI_CODING_AGENT_DIR",
-                    agent_dir.as_os_str(),
-                ));
+        let local_studio_runtime = local_studio::bundled_pi_runtime().or_else(|| {
+            resolve_pi_bin(&snapshot.agents.pi.bin, &daemon_env).map(|program| {
+                local_studio::PiRuntimeCommand {
+                    program,
+                    prefix_args: Vec::new(),
+                    env: Vec::new(),
+                }
+            })
+        });
+        let local_studio_bridge = if let (Some(agent_dir), Some(runtime)) =
+            (local_studio::pi_agent_dir(), local_studio_runtime)
+        {
+            let studio_launcher: Arc<dyn ProcessLauncher> = Arc::new(LocalStudioLauncher::new(
+                Arc::clone(&launcher),
+                agent_dir.clone(),
+                runtime.clone(),
+            ));
             let builder = PiBridge::builder()
-                .agent_bin(PathBuf::from(&snapshot.agents.pi.bin))
+                .agent_bin(runtime.program)
                 .launcher(studio_launcher)
                 .hydrator(PiHydrator::with_override(agent_dir.join("sessions")))
                 .model_provider_prefix("local-studio")
@@ -1106,6 +1116,56 @@ struct EnvironmentOverlayLauncher {
     inner: Arc<dyn ProcessLauncher>,
     key: OsString,
     value: OsString,
+}
+
+#[derive(Clone)]
+struct LocalStudioLauncher {
+    inner: Arc<dyn ProcessLauncher>,
+    agent_dir: OsString,
+    command: local_studio::PiRuntimeCommand,
+}
+
+impl LocalStudioLauncher {
+    fn new(
+        inner: Arc<dyn ProcessLauncher>,
+        agent_dir: PathBuf,
+        command: local_studio::PiRuntimeCommand,
+    ) -> Self {
+        Self {
+            inner,
+            agent_dir: agent_dir.into_os_string(),
+            command,
+        }
+    }
+}
+
+impl ProcessLauncher for LocalStudioLauncher {
+    fn launch(
+        &self,
+        mut spec: alleycat_bridge_core::ProcessSpec,
+    ) -> futures::future::BoxFuture<'_, std::io::Result<Box<dyn alleycat_bridge_core::ChildProcess>>>
+    {
+        let agent_dir = self.agent_dir.clone();
+        let command = self.command.clone();
+        Box::pin(async move {
+            if !spec.env.iter().any(|(key, _)| key == "PI_CODING_AGENT_DIR") {
+                spec.env
+                    .push((OsString::from("PI_CODING_AGENT_DIR"), agent_dir));
+            }
+            if spec.role == alleycat_bridge_core::ProcessRole::Agent {
+                let mut args = command.prefix_args;
+                args.extend(spec.args);
+                spec.program = command.program;
+                spec.args = args;
+                for (key, value) in command.env {
+                    if !spec.env.iter().any(|(candidate, _)| candidate == &key) {
+                        spec.env.push((key, value));
+                    }
+                }
+            }
+            self.inner.launch(spec).await
+        })
+    }
 }
 
 impl EnvironmentOverlayLauncher {

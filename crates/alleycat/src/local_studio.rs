@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::net::IpAddr;
@@ -43,6 +44,14 @@ const IMPLEMENTED_CAPABILITIES: [Capability; 3] = [
     Capability::SessionsRead,
     Capability::AgentTurn,
 ];
+const PI_PACKAGE_CLI: &str = "frontend/node_modules/@earendil-works/pi-coding-agent/dist/cli.js";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PiRuntimeCommand {
+    pub program: PathBuf,
+    pub prefix_args: Vec<OsString>,
+    pub env: Vec<(OsString, OsString)>,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -183,6 +192,118 @@ pub(crate) fn pi_agent_dir() -> Option<PathBuf> {
         .to_path_buf();
     let agent_dir = data_dir.join("pi-agent");
     agent_dir.join("models.json").is_file().then_some(agent_dir)
+}
+
+/// Resolve the Pi CLI shipped with Local Studio. The desktop bundle runs the
+/// package through Electron's Node mode; Linux controller installs run the
+/// same package through the node process that owns the agent-runtime sidecar.
+/// An explicit override is useful for non-standard/package-manager layouts.
+pub(crate) fn bundled_pi_runtime() -> Option<PiRuntimeCommand> {
+    if let (Some(program), Some(cli)) = (
+        absolute_env_path("LOCAL_STUDIO_NODE_BIN"),
+        absolute_env_path("LOCAL_STUDIO_PI_CLI"),
+    ) {
+        return runtime_command(program, cli, Vec::new());
+    }
+    if let Some(program) = absolute_env_path("LOCAL_STUDIO_PI_BIN")
+        && executable_file(&program)
+    {
+        return Some(PiRuntimeCommand {
+            program,
+            prefix_args: Vec::new(),
+            env: Vec::new(),
+        });
+    }
+
+    let base = directories::BaseDirs::new()?;
+    for root in [
+        PathBuf::from("/Applications/Local Studio.app"),
+        base.home_dir().join("Applications/Local Studio.app"),
+        PathBuf::from("/Applications/vLLM Studio.app"),
+        base.home_dir().join("Applications/vLLM Studio.app"),
+    ] {
+        if let Some(runtime) = runtime_from_app_bundle(&root) {
+            return Some(runtime);
+        }
+    }
+
+    let metadata = load_gateway_metadata().ok()?;
+    #[cfg(target_os = "linux")]
+    {
+        let proc_root = PathBuf::from(format!("/proc/{}", metadata.pid));
+        if let Some(runtime) = runtime_from_process(
+            &std::fs::read_link(proc_root.join("exe")).ok()?,
+            &std::fs::read_link(proc_root.join("cwd")).ok()?,
+        ) {
+            return Some(runtime);
+        }
+    }
+    let _ = metadata;
+    None
+}
+
+fn runtime_from_app_bundle(root: &Path) -> Option<PiRuntimeCommand> {
+    let cli = root
+        .join("Contents/Resources/app/frontend/.next/standalone")
+        .join(PI_PACKAGE_CLI);
+    for executable in ["Local Studio", "vLLM Studio"] {
+        if let Some(runtime) = runtime_command(
+            root.join("Contents/MacOS").join(executable),
+            cli.clone(),
+            vec![(OsString::from("ELECTRON_RUN_AS_NODE"), OsString::from("1"))],
+        ) {
+            return Some(runtime);
+        }
+    }
+    None
+}
+
+fn runtime_from_process(program: &Path, cwd: &Path) -> Option<PiRuntimeCommand> {
+    for root in [cwd.to_path_buf(), cwd.join("../.."), cwd.join("../../..")] {
+        if let Some(runtime) =
+            runtime_command(program.to_path_buf(), root.join(PI_PACKAGE_CLI), Vec::new())
+        {
+            return Some(runtime);
+        }
+    }
+    None
+}
+
+fn runtime_command(
+    program: PathBuf,
+    cli: PathBuf,
+    env: Vec<(OsString, OsString)>,
+) -> Option<PiRuntimeCommand> {
+    if !executable_file(&program) || !cli.is_file() {
+        return None;
+    }
+    let cli = cli.canonicalize().ok()?;
+    Some(PiRuntimeCommand {
+        program,
+        prefix_args: vec![cli.into_os_string()],
+        env,
+    })
+}
+
+fn absolute_env_path(name: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(name)?);
+    path.is_absolute().then_some(path)
+}
+
+fn executable_file(path: &Path) -> bool {
+    let Ok(metadata) = path.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return metadata.permissions().mode() & 0o111 != 0;
+    }
+    #[cfg(not(unix))]
+    true
 }
 
 fn env_path(name: &str) -> anyhow::Result<Option<PathBuf>> {
@@ -1049,6 +1170,55 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    fn executable(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn app_bundle_runtime_uses_electron_node_mode_and_bundled_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let app = temp.path().join("Local Studio.app");
+        executable(&app.join("Contents/MacOS/Local Studio"));
+        let cli = app
+            .join("Contents/Resources/app/frontend/.next/standalone")
+            .join(PI_PACKAGE_CLI);
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "export {};\n").unwrap();
+
+        let runtime = runtime_from_app_bundle(&app).unwrap();
+        assert_eq!(runtime.program, app.join("Contents/MacOS/Local Studio"));
+        assert_eq!(
+            runtime.prefix_args,
+            vec![cli.canonicalize().unwrap().into_os_string()]
+        );
+        assert_eq!(
+            runtime.env,
+            vec![(OsString::from("ELECTRON_RUN_AS_NODE"), OsString::from("1"))]
+        );
+    }
+
+    #[test]
+    fn linux_sidecar_layout_resolves_node_and_frontend_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let program = temp.path().join("bin/node");
+        executable(&program);
+        let cwd = temp.path().join("project/services/agent-runtime");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let cli = temp.path().join("project").join(PI_PACKAGE_CLI);
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(&cli, "export {};\n").unwrap();
+
+        let runtime = runtime_from_process(&program, &cwd).unwrap();
+        assert_eq!(runtime.program, program);
+        assert_eq!(
+            runtime.prefix_args,
+            vec![cli.canonicalize().unwrap().into_os_string()]
+        );
+        assert!(runtime.env.is_empty());
     }
 
     fn grant_stats(node: EndpointId) {

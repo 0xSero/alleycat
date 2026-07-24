@@ -27,7 +27,7 @@ use crate::pool::pi_protocol as pi;
 use crate::state::ConnectionState;
 
 const PI_SETTINGS_PATH_ENV: &str = "PI_AGENT_SETTINGS_PATH";
-const THINKING_SUFFIXES: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
+const THINKING_SUFFIXES: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 pub async fn handle_model_list(
     state: &Arc<ConnectionState>,
@@ -108,9 +108,8 @@ fn translate_pi_model(model: &PiAvailableModel, is_default: bool) -> p::Model {
 
     // Codex contract: `supported_reasoning_efforts` is a list of
     // `{ reasoning_effort, description }` pairs. Pi's `ThinkingLevel`
-    // vocabulary is wider than codex's `ReasoningEffort` (it includes "off"
-    // and "xhigh" which codex doesn't expose), so we always advertise the
-    // full codex set and let the bridge map at `set_thinking_level` time.
+    // vocabulary maps directly to the app-server effort levels. Advertising
+    // both xhigh and max matters for controller models that distinguish them.
     let supported_reasoning_efforts = vec![
         p::ReasoningEffortOption {
             reasoning_effort: p::ReasoningEffort::Minimal,
@@ -126,6 +125,14 @@ fn translate_pi_model(model: &PiAvailableModel, is_default: bool) -> p::Model {
         },
         p::ReasoningEffortOption {
             reasoning_effort: p::ReasoningEffort::High,
+            description: "Deep reasoning".to_string(),
+        },
+        p::ReasoningEffortOption {
+            reasoning_effort: p::ReasoningEffort::XHigh,
+            description: "Very deep reasoning".to_string(),
+        },
+        p::ReasoningEffortOption {
+            reasoning_effort: p::ReasoningEffort::Max,
             description: "Maximum reasoning effort".to_string(),
         },
     ];
@@ -390,7 +397,7 @@ mod tests {
         assert_eq!(m.model, "gpt-5");
         assert_eq!(m.display_name, "GPT-5 (openai)");
         assert!(m.is_default);
-        assert_eq!(m.supported_reasoning_efforts.len(), 4);
+        assert_eq!(m.supported_reasoning_efforts.len(), 6);
         assert!(matches!(
             m.default_reasoning_effort,
             p::ReasoningEffort::Medium
