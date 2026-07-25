@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev libcap-dev clang cmake
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Everything must compile, including tests and benches. This alone would
+      # have caught more than the repo had before, since there was no CI at all.
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      # This repo has never had CI, so several suites are already red. Rather
+      # than a skip list that silently grows, the exclusions are whole crates
+      # plus one named test, each with a reason. New crates are covered
+      # automatically. Verified against a clean checkout of the branch point —
+      # none of these are caused by the change this workflow ships with.
+      #
+      #   alleycat-bridge-conformance  live harness: launches real agent
+      #                                binaries and diffs their wire output;
+      #                                most cases are already #[ignore]d and
+      #                                `conformance_acp` needs an ACP agent
+      #                                installed. Stays a local/manual suite.
+      #   alleycat-acp-bridge          test_acp_to_codex_initialize_result fails
+      #   alleycat-opencode-bridge     5 failures across v2_cross_cwd,
+      #                                v3_resume, v7_tool_call_surfacing
+      #   posix_resolver_accepts_dev_suffix_versions  (alleycat-bridge-core)
+      #                                fails; the crate's other 55 tests gate
+      #
+      # Tracked in #33. Remove each exclusion as it is fixed.
+      - name: Test
+        run: |
+          cargo test --workspace \
+            --exclude alleycat-bridge-conformance \
+            --exclude alleycat-acp-bridge \
+            --exclude alleycat-opencode-bridge \
+            -- --skip posix_resolver_accepts_dev_suffix_versions
+
+      # Advisory until the existing warnings are cleared — `crates/alleycat`
+      # alone emits 37 dead-code warnings from the unreachable Local Studio
+      # gateway (see #31).
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+        continue-on-error: true
