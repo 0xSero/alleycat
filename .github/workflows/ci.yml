@@ -63,9 +63,12 @@ jobs:
             --exclude alleycat-opencode-bridge \
             -- --skip posix_resolver_accepts_dev_suffix_versions
 
-      # Advisory until the existing warnings are cleared — `crates/alleycat`
-      # alone emits 37 dead-code warnings from the unreachable Local Studio
-      # gateway (see #31).
-      - name: Clippy
+      # Advisory until the existing lints are cleared: `crates/alleycat` emits
+      # 37 dead-code warnings from the unreachable Local Studio gateway (#31),
+      # and `alleycat-bridge-core` has 3 real clippy findings. `continue-on-error`
+      # reports this step as "success" even when it fails, so the name says
+      # non-blocking — otherwise a green tick here reads as a clean lint run.
+      # Drop `continue-on-error` once #31 and #33 land.
+      - name: Clippy (advisory, non-blocking)
         run: cargo clippy --workspace --all-targets -- -D warnings
         continue-on-error: true
