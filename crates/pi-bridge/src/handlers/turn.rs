@@ -354,6 +354,10 @@ fn active_turn(thread_id: &str) -> Option<ActiveTurn> {
     ACTIVE_TURNS.lock().unwrap().get(thread_id).cloned()
 }
 
+pub(crate) fn active_turn_id(thread_id: &str) -> Option<String> {
+    active_turn(thread_id).map(|turn| turn.turn_id)
+}
+
 fn clear_active_turn(thread_id: &str) {
     ACTIVE_TURNS.lock().unwrap().remove(thread_id);
 }

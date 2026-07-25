@@ -282,6 +282,10 @@ pub async fn handle_thread_resume(
     if !params.exclude_turns {
         thread.turns = fetch_turns(&handle).await?;
     }
+    apply_live_turn_state(
+        &mut thread,
+        super::turn::active_turn_id(&params.thread_id).as_deref(),
+    );
 
     let defaults = state.defaults();
     let model = match params.model.clone().or_else(|| defaults.model.clone()) {
@@ -398,6 +402,10 @@ pub async fn handle_thread_fork(
     if !params.exclude_turns {
         thread.turns = fetch_turns(&handle).await?;
     }
+    apply_live_turn_state(
+        &mut thread,
+        super::turn::active_turn_id(&new_thread_id).as_deref(),
+    );
 
     let defaults = state.defaults();
     Ok(p::ThreadForkResponse {
@@ -658,6 +666,10 @@ pub async fn handle_thread_rollback(
 
     let mut thread = thread_from_entry(&updated);
     thread.turns = fetch_turns(&handle).await?;
+    apply_live_turn_state(
+        &mut thread,
+        super::turn::active_turn_id(&params.thread_id).as_deref(),
+    );
     Ok(p::ThreadRollbackResponse { thread })
 }
 
@@ -729,7 +741,13 @@ pub async fn handle_thread_list(
             // (start/resume/read) that always return loaded threads.
             let mut t = crate::index::thread_from_entry(&entry);
             if loaded.contains(&t.id) {
-                t.status = p::ThreadStatus::Idle;
+                t.status = if super::turn::active_turn_id(&t.id).is_some() {
+                    p::ThreadStatus::Active {
+                        active_flags: Vec::new(),
+                    }
+                } else {
+                    p::ThreadStatus::Idle
+                };
             }
             t
         })
@@ -799,6 +817,10 @@ pub async fn handle_thread_read(
         };
         thread.turns = fetch_turns(&handle).await?;
     }
+    apply_live_turn_state(
+        &mut thread,
+        super::turn::active_turn_id(&params.thread_id).as_deref(),
+    );
     Ok(p::ThreadReadResponse { thread })
 }
 
@@ -846,6 +868,10 @@ pub async fn handle_thread_turns_list(
     };
 
     let mut turns = fetch_turns(&handle).await?;
+    apply_live_turn_to_turns(
+        &mut turns,
+        super::turn::active_turn_id(&params.thread_id).as_deref(),
+    );
     if matches!(
         params.sort_direction.unwrap_or(SortDirection::Desc),
         SortDirection::Desc
@@ -857,6 +883,7 @@ pub async fn handle_thread_turns_list(
     {
         turns.truncate(limit as usize);
     }
+    apply_turn_items_view(&mut turns, params.items_view);
 
     Ok(p::ThreadTurnsListResponse {
         data: turns,
@@ -949,6 +976,40 @@ fn thread_from_entry(entry: &IndexEntry) -> p::Thread {
         git_info: alleycat_bridge_core::git_info_for_cwd(&entry.cwd),
         name: entry.name.clone(),
         turns: Vec::new(),
+    }
+}
+
+fn apply_live_turn_state(thread: &mut p::Thread, active_turn_id: Option<&str>) {
+    let Some(active_turn_id) = active_turn_id else {
+        return;
+    };
+    thread.status = p::ThreadStatus::Active {
+        active_flags: Vec::new(),
+    };
+    apply_live_turn_to_turns(&mut thread.turns, Some(active_turn_id));
+}
+
+fn apply_live_turn_to_turns(turns: &mut [p::Turn], active_turn_id: Option<&str>) {
+    let Some(active_turn_id) = active_turn_id else {
+        return;
+    };
+    let Some(turn) = turns.last_mut() else {
+        return;
+    };
+    turn.id = active_turn_id.to_string();
+    turn.status = p::TurnStatus::InProgress;
+    turn.error = None;
+    turn.completed_at = None;
+    turn.duration_ms = None;
+}
+
+fn apply_turn_items_view(turns: &mut [p::Turn], items_view: Option<p::TurnItemsView>) {
+    if !matches!(items_view, Some(p::TurnItemsView::NotLoaded)) {
+        return;
+    }
+    for turn in turns {
+        turn.items.clear();
+        turn.items_view = "notLoaded".to_string();
     }
 }
 
@@ -1466,6 +1527,53 @@ mod tests {
         assert_eq!(resp.thread.id, "r1");
         assert_eq!(resp.thread.preview, preview);
         assert!(resp.thread.turns.is_empty());
+    }
+
+    #[test]
+    fn live_turn_state_overrides_persisted_idle_snapshot() {
+        let entry = sample_entry("active-thread");
+        let mut thread = thread_from_entry(&entry);
+        thread.turns.push(p::Turn {
+            id: "turn_0".into(),
+            items: Vec::new(),
+            items_view: p::default_items_view(),
+            status: p::TurnStatus::Completed,
+            error: None,
+            started_at: Some(10),
+            completed_at: Some(20),
+            duration_ms: Some(10_000),
+        });
+
+        apply_live_turn_state(&mut thread, Some("live-turn-id"));
+
+        assert!(matches!(thread.status, p::ThreadStatus::Active { .. }));
+        let turn = thread.turns.last().unwrap();
+        assert_eq!(turn.id, "live-turn-id");
+        assert!(matches!(turn.status, p::TurnStatus::InProgress));
+        assert!(turn.completed_at.is_none());
+        assert!(turn.duration_ms.is_none());
+    }
+
+    #[test]
+    fn not_loaded_turn_view_strips_item_bodies() {
+        let mut turns = vec![p::Turn {
+            id: "turn_0".into(),
+            items: vec![p::ThreadItem::UserMessage {
+                id: "item_0".into(),
+                content: Vec::new(),
+            }],
+            items_view: p::default_items_view(),
+            status: p::TurnStatus::InProgress,
+            error: None,
+            started_at: Some(10),
+            completed_at: None,
+            duration_ms: None,
+        }];
+
+        apply_turn_items_view(&mut turns, Some(p::TurnItemsView::NotLoaded));
+
+        assert!(turns[0].items.is_empty());
+        assert_eq!(turns[0].items_view, "notLoaded");
     }
 
     #[test]

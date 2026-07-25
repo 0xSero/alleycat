@@ -360,6 +360,13 @@ pub enum SortDirection {
     Desc,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TurnItemsView {
+    Full,
+    NotLoaded,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadListResponse {
@@ -414,6 +421,8 @@ pub struct ThreadTurnsListParams {
     pub limit: Option<u32>,
     #[serde(default)]
     pub sort_direction: Option<SortDirection>,
+    #[serde(default)]
+    pub items_view: Option<TurnItemsView>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
