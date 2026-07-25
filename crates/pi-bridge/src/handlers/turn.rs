@@ -112,11 +112,28 @@ pub async fn handle_turn_start(
     state: &Arc<ConnectionState>,
     params: p::TurnStartParams,
 ) -> Result<p::TurnStartResponse, TurnError> {
-    let handle = state
-        .pi_pool()
-        .get(&params.thread_id)
-        .await
-        .ok_or_else(|| TurnError::ThreadNotLoaded(params.thread_id.clone()))?;
+    // Resume the thread from its persisted session if the pool has no live
+    // process for it (idle-reaped, or cleared by a daemon restart). Without
+    // this, a follow-up turn from a backgrounded client fails with
+    // `ThreadNotLoaded` instead of continuing the conversation.
+    let handle = match state.pi_pool().get(&params.thread_id).await {
+        Some(handle) => handle,
+        None => {
+            let entry = state
+                .thread_index()
+                .lookup(&params.thread_id)
+                .await
+                .ok_or_else(|| TurnError::ThreadNotLoaded(params.thread_id.clone()))?;
+            crate::handlers::thread::load_or_resume_handle(state, &params.thread_id, &entry)
+                .await
+                .map_err(|e| match e {
+                    crate::handlers::thread::ThreadError::NotFound(id) => {
+                        TurnError::ThreadNotLoaded(id)
+                    }
+                    other => TurnError::PiRpc(other.to_string()),
+                })?
+        }
+    };
 
     apply_overrides(&handle, &params).await;
 

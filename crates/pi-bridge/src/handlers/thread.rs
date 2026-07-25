@@ -235,41 +235,7 @@ pub async fn handle_thread_resume(
         .await
         .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
 
-    let cwd = resume_cwd_or_fallback(&entry.cwd, &params.thread_id, state.trust_persisted_cwd());
-    let (handle, already_loaded) = match state.pi_pool().get(&params.thread_id).await {
-        Some(h) => (h, true),
-        None => (
-            state
-                .pi_pool()
-                .acquire_for_resume(params.thread_id.clone(), &cwd)
-                .await
-                .map_err(ThreadError::pool)?,
-            false,
-        ),
-    };
-
-    if !already_loaded {
-        // A loaded handle is already on this session. Clients may race
-        // thread/resume with turn/start; do not switch during an active prompt.
-        let switch = handle
-            .send_request(pi::RpcCommand::SwitchSession(pi::SwitchSessionCmd {
-                id: None,
-                session_path: entry
-                    .metadata
-                    .pi_session_path
-                    .to_string_lossy()
-                    .into_owned(),
-            }))
-            .await
-            .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
-        if !switch.success {
-            return Err(ThreadError::PiRpc(
-                switch
-                    .error
-                    .unwrap_or_else(|| "switch_session failed".into()),
-            ));
-        }
-    }
+    let handle = load_or_resume_handle(state, &params.thread_id, &entry).await?;
 
     apply_model_override(&handle, &params.model, &params.model_provider).await;
     apply_thinking_override(
@@ -923,6 +889,54 @@ fn resolve_cwd(requested: Option<&str>) -> Result<PathBuf, ThreadError> {
 /// "spawning ...: No such file or directory" with no hint that the *project
 /// dir* — not the binary — is what's missing. Fall back to the home directory
 /// so old threads stay listable/readable rather than wedging the UI.
+/// Return a live pi handle for `thread_id`, resuming it from the persisted
+/// session file if the pool has no live process for it.
+///
+/// The process pool reaps idle processes and is cleared entirely on a daemon
+/// restart, and JSONL persists on disk across both. Without this, a `turn/start`
+/// on a thread whose process is gone fails with `ThreadNotLoaded` — the crash
+/// reported when a backgrounded phone sends a follow-up. Both `thread/resume`
+/// and `turn/start` route through here so a cold thread reloads transparently,
+/// matching the generic pi runtime.
+pub(crate) async fn load_or_resume_handle(
+    state: &Arc<ConnectionState>,
+    thread_id: &str,
+    entry: &IndexEntry,
+) -> Result<Arc<PiProcessHandle>, ThreadError> {
+    if let Some(handle) = state.pi_pool().get(thread_id).await {
+        // Already loaded on this session. Callers may race resume/turn-start;
+        // do not switch sessions during an active prompt.
+        return Ok(handle);
+    }
+
+    let cwd = resume_cwd_or_fallback(&entry.cwd, thread_id, state.trust_persisted_cwd());
+    let handle = state
+        .pi_pool()
+        .acquire_for_resume(thread_id.to_string(), &cwd)
+        .await
+        .map_err(ThreadError::pool)?;
+
+    let switch = handle
+        .send_request(pi::RpcCommand::SwitchSession(pi::SwitchSessionCmd {
+            id: None,
+            session_path: entry
+                .metadata
+                .pi_session_path
+                .to_string_lossy()
+                .into_owned(),
+        }))
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    if !switch.success {
+        return Err(ThreadError::PiRpc(
+            switch
+                .error
+                .unwrap_or_else(|| "switch_session failed".into()),
+        ));
+    }
+    Ok(handle)
+}
+
 fn resume_cwd_or_fallback(persisted: &str, thread_id: &str, trust_persisted_cwd: bool) -> PathBuf {
     let original = PathBuf::from(persisted);
     if trust_persisted_cwd || original.is_dir() {

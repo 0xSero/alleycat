@@ -169,6 +169,109 @@ async fn resume_after_state_drop_repopulates_turns_from_jsonl() {
     );
 }
 
+/// Regression for the reported "follow-up message crashes after backgrounding"
+/// bug: a `turn/start` on a thread whose pi process is gone (idle-reaped, or —
+/// as here — cleared by a fresh `ConnectionState` standing in for a daemon
+/// restart) must transparently resume the persisted session instead of failing
+/// with `ThreadNotLoaded`. This is what gives Local Studio parity with the
+/// generic pi runtime.
+#[tokio::test]
+async fn turn_start_resumes_a_thread_whose_process_was_reaped() {
+    let home = PiHomeFixture::new();
+    let cwd_dir = TempDir::new().unwrap();
+    let cwd_path = cwd_dir.path().to_string_lossy().into_owned();
+
+    let session_path = home.seed_session(
+        "encoded-cwd",
+        "sess-followup",
+        &[
+            json!({
+                "type": "session",
+                "version": 3,
+                "id": "pi-followup",
+                "timestamp": "2026-04-27T10:00:00Z",
+                "cwd": cwd_path
+            }),
+            json!({
+                "type": "message",
+                "id": "m1",
+                "parentId": null,
+                "timestamp": "2026-04-27T10:00:05Z",
+                "message": user_message("first turn", 1_745_751_605_000)
+            }),
+            json!({
+                "type": "message",
+                "id": "m2",
+                "parentId": "m1",
+                "timestamp": "2026-04-27T10:00:10Z",
+                "message": assistant_message("first reply", 1_745_751_610_000)
+            }),
+        ],
+    );
+    let _ = &session_path;
+
+    let codex_home = TempDir::new().unwrap();
+
+    // Boot #1: hydrate the index so threads.json records the session.
+    let index1 = ThreadIndex::open(codex_home.path()).await.unwrap();
+    index1
+        .hydrate_from_pi_dir(Some(&home.sessions_dir()))
+        .await
+        .unwrap();
+    let pool1 = Arc::new(PiPool::new(fake_pi_path()));
+    let (state1, _rx1) = ConnectionState::for_test(
+        pool1,
+        Arc::clone(&index1) as Arc<dyn alleycat_pi_bridge::state::ThreadIndexHandle>,
+        ThreadDefaults::default(),
+    );
+    let list_resp = handlers::thread::handle_thread_list(&state1, p::ThreadListParams::default())
+        .await
+        .expect("thread/list");
+    let thread_id = list_resp.data[0].id.clone();
+
+    // Tear down boot #1: this drops the pool, terminating the fake-pi child —
+    // exactly the cold-pool state a daemon restart or idle reap leaves behind.
+    drop(state1);
+    drop(index1);
+
+    // Boot #2: a fresh state with an empty pool. The thread exists in the
+    // index but has no live process.
+    let index2 = ThreadIndex::open(codex_home.path()).await.unwrap();
+    let pool2 = Arc::new(PiPool::new(fake_pi_path()));
+    let (state2, _rx2) = ConnectionState::for_test(
+        pool2,
+        Arc::clone(&index2) as Arc<dyn alleycat_pi_bridge::state::ThreadIndexHandle>,
+        ThreadDefaults::default(),
+    );
+    assert!(
+        state2.pi_pool().get(&thread_id).await.is_none(),
+        "precondition: the thread's process must be absent from the fresh pool"
+    );
+
+    // The follow-up turn. Before the fix this returned `ThreadNotLoaded`;
+    // it must now succeed by resuming the persisted session.
+    let resp = handlers::turn::handle_turn_start(
+        &state2,
+        p::TurnStartParams {
+            thread_id: thread_id.clone(),
+            input: vec![p::UserInput::Text {
+                text: "follow up after backgrounding".into(),
+                text_elements: Vec::new(),
+            }],
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("turn/start on a reaped thread must resume, not fail ThreadNotLoaded");
+
+    assert_eq!(resp.turn.status, p::TurnStatus::InProgress);
+    // The process is now live in the pool, so a second follow-up needs no resume.
+    assert!(
+        state2.pi_pool().get(&thread_id).await.is_some(),
+        "the thread's process should be loaded after the resuming turn/start"
+    );
+}
+
 /// Build a pi `UserMessage` JSON. Fields must satisfy strict deserialization
 /// (`UserMessage.role` / `content` / `timestamp` are required in
 /// `pool::pi_protocol::UserMessage`).
