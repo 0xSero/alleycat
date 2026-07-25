@@ -883,8 +883,6 @@ pub async fn handle_thread_turns_list(
     {
         turns.truncate(limit as usize);
     }
-    apply_turn_items_view(&mut turns, params.items_view);
-
     Ok(p::ThreadTurnsListResponse {
         data: turns,
         next_cursor: None,
@@ -1001,16 +999,6 @@ fn apply_live_turn_to_turns(turns: &mut [p::Turn], active_turn_id: Option<&str>)
     turn.error = None;
     turn.completed_at = None;
     turn.duration_ms = None;
-}
-
-fn apply_turn_items_view(turns: &mut [p::Turn], items_view: Option<p::TurnItemsView>) {
-    if !matches!(items_view, Some(p::TurnItemsView::NotLoaded)) {
-        return;
-    }
-    for turn in turns {
-        turn.items.clear();
-        turn.items_view = "notLoaded".to_string();
-    }
 }
 
 fn source_kind_to_session_source(kind: ThreadSourceKind) -> SessionSource {
@@ -1552,28 +1540,6 @@ mod tests {
         assert!(matches!(turn.status, p::TurnStatus::InProgress));
         assert!(turn.completed_at.is_none());
         assert!(turn.duration_ms.is_none());
-    }
-
-    #[test]
-    fn not_loaded_turn_view_strips_item_bodies() {
-        let mut turns = vec![p::Turn {
-            id: "turn_0".into(),
-            items: vec![p::ThreadItem::UserMessage {
-                id: "item_0".into(),
-                content: Vec::new(),
-            }],
-            items_view: p::default_items_view(),
-            status: p::TurnStatus::InProgress,
-            error: None,
-            started_at: Some(10),
-            completed_at: None,
-            duration_ms: None,
-        }];
-
-        apply_turn_items_view(&mut turns, Some(p::TurnItemsView::NotLoaded));
-
-        assert!(turns[0].items.is_empty());
-        assert_eq!(turns[0].items_view, "notLoaded");
     }
 
     #[test]
