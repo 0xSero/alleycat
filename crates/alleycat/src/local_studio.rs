@@ -69,6 +69,11 @@ struct GatewayMetadata {
     url: Url,
     secret: HeaderValue,
     controller_id: String,
+    /// Local Studio's agent-runtime pid. Only the Linux runtime resolver reads
+    /// it, via `/proc/<pid>/{exe,cwd}`; macOS resolves through the `.app`
+    /// bundle and never touches this.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pid: u32,
     issued_at: String,
 }
 
@@ -415,6 +420,7 @@ fn validate_gateway_metadata(parsed: GatewayMetadataFile) -> anyhow::Result<Gate
         url,
         secret,
         controller_id: parsed.controller_id,
+        pid: parsed.pid,
         issued_at: parsed.issued_at,
     })
 }
