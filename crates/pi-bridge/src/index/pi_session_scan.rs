@@ -15,6 +15,7 @@
 //! larger histories retain a bounded summary and use file mtime for freshness.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -189,6 +190,48 @@ pub async fn list_all() -> Vec<PiSessionInfo> {
     }
 
     sessions.sort_by(|a, b| b.modified.cmp(&a.modified));
+    sessions
+}
+
+pub async fn list_sessions_modified_since(
+    sessions_root: &Path,
+    modified_after: SystemTime,
+) -> Vec<PiSessionInfo> {
+    let mut sessions = Vec::new();
+    let mut roots = match fs::read_dir(sessions_root).await {
+        Ok(entries) => entries,
+        Err(_) => return sessions,
+    };
+    while let Ok(Some(root)) = roots.next_entry().await {
+        if !root.file_type().await.is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        let mut files = match fs::read_dir(root.path()).await {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        while let Ok(Some(file)) = files.next_entry().await {
+            let path = file.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let recently_modified = file
+                .metadata()
+                .await
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .is_some_and(|modified| modified >= modified_after);
+            if !recently_modified {
+                continue;
+            }
+            if let Some(info) = build_session_info_with_limit(&path, MAX_SESSION_SCAN_BYTES)
+                .await
+                .info
+            {
+                sessions.push(info);
+            }
+        }
+    }
     sessions
 }
 

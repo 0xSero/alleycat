@@ -248,6 +248,64 @@ impl<H: PoolMember + 'static> ProcessPool<H> {
             .map(|(_, e)| e.handle.clone())
     }
 
+    pub async fn reassign_lru_idle_with_prefix_for_cwd(
+        &self,
+        thread_id: ThreadId,
+        cwd: &Path,
+        previous_id_prefix: &str,
+    ) -> Result<Option<(ThreadId, Arc<H>)>, PoolError> {
+        let mut inner = self.inner.lock().await;
+        if inner.processes.contains_key(&thread_id) {
+            return Err(PoolError::DuplicateThread(thread_id));
+        }
+        let previous_id = inner
+            .by_cwd
+            .get(cwd)
+            .into_iter()
+            .flatten()
+            .filter(|id| id.starts_with(previous_id_prefix))
+            .filter_map(|id| inner.processes.get(id).map(|entry| (id, entry)))
+            .filter(|(_, entry)| !entry.active)
+            .min_by_key(|(_, entry)| entry.last_active)
+            .map(|(id, _)| id.clone());
+        let Some(previous_id) = previous_id else {
+            return Ok(None);
+        };
+        let mut entry = inner
+            .remove(&previous_id)
+            .expect("selected process must still exist while pool is locked");
+        entry.last_active = Instant::now();
+        let handle = entry.handle.clone();
+        inner.insert(thread_id, entry);
+        Ok(Some((previous_id, handle)))
+    }
+
+    pub async fn track_new_if_below_capacity(
+        &self,
+        thread_id: ThreadId,
+        cwd: PathBuf,
+        handle: Arc<H>,
+        active: bool,
+    ) -> Result<(), PoolError> {
+        let mut inner = self.inner.lock().await;
+        if inner.processes.contains_key(&thread_id) {
+            return Err(PoolError::DuplicateThread(thread_id));
+        }
+        if inner.processes.len() >= inner.max_processes {
+            return Err(PoolError::Capacity(inner.max_processes));
+        }
+        inner.insert(
+            thread_id,
+            PoolEntry {
+                handle,
+                cwd,
+                last_active: Instant::now(),
+                active,
+            },
+        );
+        Ok(())
+    }
+
     /// Reap idle entries and, if needed, evict the LRU idle thread to make
     /// room for one new spawn. Returns `Capacity` if every tracked thread
     /// is currently active. The pool is unchanged on success — callers must
@@ -473,6 +531,61 @@ mod tests {
         track(&p, "newer", "/y").await;
         let h = p.try_reuse_for_utility(None).await.expect("reuse");
         assert!(Arc::ptr_eq(&h, &older_handle));
+    }
+
+    #[tokio::test]
+    async fn reassign_lru_idle_with_prefix_for_cwd_retags_warm_process() {
+        let p = pool(8, Duration::from_secs(60));
+        let (handle, _) = track(&p, "utility_old", "/repo").await;
+        let reassigned = p
+            .reassign_lru_idle_with_prefix_for_cwd("new".into(), Path::new("/repo"), "utility_")
+            .await
+            .expect("reassign")
+            .expect("warm process");
+        assert_eq!(reassigned.0, "utility_old");
+        assert!(Arc::ptr_eq(&reassigned.1, &handle));
+        assert!(p.get("utility_old").await.is_none());
+        assert!(Arc::ptr_eq(&p.get("new").await.expect("new"), &handle));
+    }
+
+    #[tokio::test]
+    async fn reassign_lru_idle_with_prefix_for_cwd_preserves_active_process() {
+        let p = pool(8, Duration::from_secs(60));
+        track(&p, "utility_active", "/repo").await;
+        p.mark_active("utility_active").await;
+        assert!(
+            p.reassign_lru_idle_with_prefix_for_cwd("new".into(), Path::new("/repo"), "utility_",)
+                .await
+                .expect("reassign")
+                .is_none()
+        );
+        assert!(p.get("utility_active").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn track_new_if_below_capacity_preserves_warming_process() {
+        let p = pool(1, Duration::from_secs(60));
+        let (handle, _) = FakeHandle::new();
+        p.track_new_if_below_capacity("utility_warm".into(), PathBuf::from("/repo"), handle, true)
+            .await
+            .expect("track warm");
+        assert!(
+            p.reassign_lru_idle_with_prefix_for_cwd("new".into(), Path::new("/repo"), "utility_",)
+                .await
+                .expect("reassign")
+                .is_none()
+        );
+        let (extra, _) = FakeHandle::new();
+        assert!(matches!(
+            p.track_new_if_below_capacity(
+                "utility_extra".into(),
+                PathBuf::from("/repo"),
+                extra,
+                false,
+            )
+            .await,
+            Err(PoolError::Capacity(1))
+        ));
     }
 
     #[tokio::test]

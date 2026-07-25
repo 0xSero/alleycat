@@ -669,6 +669,7 @@ pub async fn handle_thread_list(
     state: &Arc<ConnectionState>,
     params: p::ThreadListParams,
 ) -> Result<p::ThreadListResponse, ThreadError> {
+    state.refresh_session_index().await;
     // Per codex-rs `thread_list`: omitted `archived` means "non-archived
     // only" (`unwrap_or(false)`), not "all". Bridge-core's `ListFilter` keeps
     // `Option<bool>` so internal callers can ask for "all" if they need to;

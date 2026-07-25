@@ -26,7 +26,7 @@ use crate::codex_proto as p;
 use crate::handlers;
 use crate::index::{PiHydrator, PiSessionInfo, ThreadIndex};
 use crate::pool::{self as pi, PiPool};
-use crate::state::{ConnectionState, ThreadDefaults, ThreadIndexHandle};
+use crate::state::{ConnectionState, SessionIndexRefresh, ThreadDefaults, ThreadIndexHandle};
 
 /// Build the per-session map key from the session's `(node_id, agent)`
 /// identity. Matches the registry's keying so the same daemon-managed
@@ -52,6 +52,7 @@ pub struct PiBridge {
     trust_persisted_cwd: bool,
     model_provider_prefixes: Arc<Vec<String>>,
     model_catalog_path: Option<PathBuf>,
+    session_index_refresh: Option<SessionIndexRefresh>,
 }
 
 impl PiBridge {
@@ -107,6 +108,7 @@ impl PiBridge {
             self.trust_persisted_cwd,
             Arc::clone(&self.model_provider_prefixes),
             self.model_catalog_path.clone(),
+            self.session_index_refresh.clone(),
         ))
     }
 }
@@ -240,6 +242,15 @@ impl PiBridgeBuilder {
         };
         let thread_index: Arc<ThreadIndex> =
             ThreadIndex::open_and_hydrate_with(&codex_home, &hydrator).await?;
+        let session_index_refresh = if hydrator.sessions.is_none() {
+            hydrator
+                .override_dir
+                .clone()
+                .or_else(crate::index::pi_sessions_dir)
+                .map(|root| SessionIndexRefresh::new(thread_index.clone(), root))
+        } else {
+            None
+        };
         let thread_index_handle: Arc<dyn ThreadIndexHandle> = thread_index;
 
         Ok(Arc::new(PiBridge {
@@ -251,6 +262,7 @@ impl PiBridgeBuilder {
             trust_persisted_cwd: self.trust_persisted_cwd,
             model_provider_prefixes: Arc::new(self.model_provider_prefixes),
             model_catalog_path: self.model_catalog_path,
+            session_index_refresh,
         }))
     }
 }

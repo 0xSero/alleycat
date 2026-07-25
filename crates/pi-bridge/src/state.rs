@@ -15,6 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use alleycat_bridge_core::ProcessLauncher;
 use alleycat_bridge_core::session::Session;
@@ -25,7 +26,7 @@ use crate::codex_proto::{
     ApprovalsReviewer, AskForApproval, InitializeCapabilities, JsonRpcMessage, ReasoningEffort,
     RequestId, SandboxMode,
 };
-use crate::index::PiSessionRef;
+use crate::index::{PiSessionRef, ThreadIndex};
 use crate::pool::PiPool;
 
 /// Per-connection bridge state. Cheap to clone: every field is either copy
@@ -64,6 +65,42 @@ pub struct ConnectionState {
 
     /// Optional Pi `models.json` owned by the embedding controller.
     model_catalog_path: Option<PathBuf>,
+
+    session_index_refresh: Option<SessionIndexRefresh>,
+}
+
+#[derive(Clone)]
+pub struct SessionIndexRefresh {
+    index: Arc<ThreadIndex>,
+    sessions_root: PathBuf,
+    last_scan: Arc<tokio::sync::Mutex<SystemTime>>,
+}
+
+impl SessionIndexRefresh {
+    pub fn new(index: Arc<ThreadIndex>, sessions_root: PathBuf) -> Self {
+        Self {
+            index,
+            sessions_root,
+            last_scan: Arc::new(tokio::sync::Mutex::new(
+                SystemTime::now()
+                    .checked_sub(Duration::from_secs(2))
+                    .unwrap_or(SystemTime::UNIX_EPOCH),
+            )),
+        }
+    }
+
+    async fn refresh(&self) -> anyhow::Result<usize> {
+        let mut last_scan = self.last_scan.lock().await;
+        let scan_started = SystemTime::now();
+        let added = self
+            .index
+            .hydrate_modified_since(&self.sessions_root, *last_scan)
+            .await?;
+        *last_scan = scan_started
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        Ok(added)
+    }
 }
 
 /// Negotiated client capabilities. Defaults to "no opt-outs, no experimental
@@ -132,6 +169,7 @@ impl ConnectionState {
         trust_persisted_cwd: bool,
         model_provider_prefixes: Arc<Vec<String>>,
         model_catalog_path: Option<PathBuf>,
+        session_index_refresh: Option<SessionIndexRefresh>,
     ) -> Self {
         Self {
             defaults,
@@ -142,6 +180,7 @@ impl ConnectionState {
             trust_persisted_cwd,
             model_provider_prefixes,
             model_catalog_path,
+            session_index_refresh,
         }
     }
 
@@ -151,6 +190,15 @@ impl ConnectionState {
 
     pub fn model_catalog_path(&self) -> Option<&std::path::Path> {
         self.model_catalog_path.as_deref()
+    }
+
+    pub async fn refresh_session_index(&self) {
+        let Some(refresh) = &self.session_index_refresh else {
+            return;
+        };
+        if let Err(error) = refresh.refresh().await {
+            tracing::warn!(%error, "failed to refresh pi session index");
+        }
     }
 
     /// Underlying session — exposed for callers that need session-scoped
@@ -317,6 +365,7 @@ impl ConnectionState {
             launcher,
             false,
             Arc::new(Vec::new()),
+            None,
             None,
         ));
         (state, attach.live_rx)

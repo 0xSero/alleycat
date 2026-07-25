@@ -66,7 +66,7 @@ async fn two_threads_in_different_cwds_run_concurrently_and_pin_their_cwd() {
     let cwd_a = TempDir::new().unwrap();
     let cwd_b = TempDir::new().unwrap();
 
-    let pool = PiPool::new(fake_pi_path());
+    let pool = PiPool::with_limits(fake_pi_path(), 2, Duration::from_secs(60));
 
     // Spawn both threads in parallel. tokio::join! polls them on the same
     // task, but the underlying spawn is async I/O — both children should be

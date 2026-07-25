@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use crate::codex_proto::{SessionSource, Thread, ThreadSourceKind, ThreadStatus};
 
-pub use pi_session_scan::{PiSessionInfo, list_all, list_sessions_from_dir, pi_sessions_dir};
+pub use pi_session_scan::{
+    PiSessionInfo, list_all, list_sessions_from_dir, list_sessions_modified_since, pi_sessions_dir,
+};
 
 pub use alleycat_bridge_core::{ListFilter, ListPage, ListSort};
 
@@ -204,6 +206,33 @@ impl ThreadIndex {
         }
         for (child, parent) in updates {
             self.0.set_forked_from_id(&child, Some(parent)).await?;
+        }
+        Ok(added)
+    }
+
+    pub async fn hydrate_modified_since(
+        &self,
+        sessions_root: &Path,
+        modified_after: std::time::SystemTime,
+    ) -> Result<usize> {
+        let scanned = list_sessions_modified_since(sessions_root, modified_after).await;
+        if scanned.is_empty() {
+            return Ok(0);
+        }
+        let known_paths: std::collections::HashSet<PathBuf> = self
+            .0
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|entry| entry.metadata.pi_session_path)
+            .collect();
+        let mut added = 0;
+        for info in scanned {
+            if known_paths.contains(&info.path) {
+                continue;
+            }
+            self.0.insert(entry_from_pi(&info)).await?;
+            added += 1;
         }
         Ok(added)
     }
@@ -506,6 +535,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reopened.snapshot().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn incremental_hydration_discovers_external_session_once() {
+        let dir = TempDir::new().unwrap();
+        let pi_root = dir.path().join("sessions");
+        let cwd_dir = pi_root.join("encoded");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        let index = ThreadIndex::open_at(dir.path().join("threads.json"))
+            .await
+            .unwrap();
+
+        std::fs::write(
+            cwd_dir.join("external.jsonl"),
+            r#"{"type":"session","version":3,"id":"external","timestamp":"2026-07-24T23:59:00Z","cwd":"/shared"}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            index
+                .hydrate_modified_since(&pi_root, std::time::SystemTime::UNIX_EPOCH)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            index
+                .hydrate_modified_since(&pi_root, std::time::SystemTime::UNIX_EPOCH)
+                .await
+                .unwrap(),
+            0
+        );
+        let rows = index.snapshot().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].metadata.pi_session_id, "external");
     }
 
     #[tokio::test]
