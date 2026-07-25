@@ -1731,6 +1731,179 @@ fn has_amp_auth(api_key_env: &str, env: &LaunchEnvironment) -> bool {
 }
 
 #[cfg(test)]
+mod local_studio_launcher_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Captures the spec it is handed and fails the launch. The decorator's
+    /// contract is the spec rewrite, not the spawn.
+    struct CapturingLauncher {
+        captured: Mutex<Option<alleycat_bridge_core::ProcessSpec>>,
+    }
+
+    impl CapturingLauncher {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                captured: Mutex::new(None),
+            })
+        }
+
+        fn take(&self) -> alleycat_bridge_core::ProcessSpec {
+            self.captured
+                .lock()
+                .expect("capture mutex poisoned")
+                .take()
+                .expect("launcher was never invoked")
+        }
+    }
+
+    impl ProcessLauncher for CapturingLauncher {
+        fn launch(
+            &self,
+            spec: alleycat_bridge_core::ProcessSpec,
+        ) -> futures::future::BoxFuture<
+            '_,
+            std::io::Result<Box<dyn alleycat_bridge_core::ChildProcess>>,
+        > {
+            *self.captured.lock().expect("capture mutex poisoned") = Some(spec);
+            Box::pin(async {
+                Err(std::io::Error::other("capturing launcher does not spawn"))
+            })
+        }
+    }
+
+    fn electron_command() -> local_studio::PiRuntimeCommand {
+        local_studio::PiRuntimeCommand {
+            program: PathBuf::from("/Applications/Local Studio.app/Contents/MacOS/Local Studio"),
+            prefix_args: vec![OsString::from(
+                "/Applications/Local Studio.app/Contents/Resources/cli.js",
+            )],
+            env: vec![(
+                OsString::from("ELECTRON_RUN_AS_NODE"),
+                OsString::from("1"),
+            )],
+        }
+    }
+
+    fn env_value<'a>(
+        spec: &'a alleycat_bridge_core::ProcessSpec,
+        key: &str,
+    ) -> Option<&'a std::ffi::OsStr> {
+        spec.env
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.as_os_str())
+    }
+
+    async fn launch_capturing(
+        spec: alleycat_bridge_core::ProcessSpec,
+    ) -> alleycat_bridge_core::ProcessSpec {
+        let inner = CapturingLauncher::new();
+        let decorated = LocalStudioLauncher::new(
+            Arc::clone(&inner) as Arc<dyn ProcessLauncher>,
+            PathBuf::from("/Users/test/Library/Application Support/Local Studio/pi-agent"),
+            electron_command(),
+        );
+        let _ = decorated.launch(spec).await;
+        inner.take()
+    }
+
+    #[tokio::test]
+    async fn agent_launch_uses_the_bundled_local_studio_runtime() {
+        let mut spec = alleycat_bridge_core::ProcessSpec::new("/usr/bin/pi");
+        spec.role = alleycat_bridge_core::ProcessRole::Agent;
+        spec.args = vec![OsString::from("--mode"), OsString::from("rpc")];
+
+        let launched = launch_capturing(spec).await;
+
+        assert_eq!(
+            launched.program,
+            PathBuf::from("/Applications/Local Studio.app/Contents/MacOS/Local Studio")
+        );
+        assert_eq!(
+            launched
+                .args
+                .iter()
+                .filter_map(|arg| arg.to_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/Applications/Local Studio.app/Contents/Resources/cli.js",
+                "--mode",
+                "rpc"
+            ],
+            "the bundled CLI must precede the original args, not replace them"
+        );
+        assert_eq!(
+            env_value(&launched, "ELECTRON_RUN_AS_NODE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            env_value(&launched, "PI_CODING_AGENT_DIR"),
+            Some(std::ffi::OsStr::new(
+                "/Users/test/Library/Application Support/Local Studio/pi-agent"
+            )),
+            "Local Studio's Pi home is what keeps this runtime distinct from `pi`"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_commands_keep_their_program_but_still_see_the_agent_dir() {
+        let mut spec = alleycat_bridge_core::ProcessSpec::new("/bin/sh");
+        spec.role = alleycat_bridge_core::ProcessRole::ToolCommand;
+        spec.args = vec![OsString::from("-c"), OsString::from("pwd")];
+
+        let launched = launch_capturing(spec).await;
+
+        assert_eq!(launched.program, PathBuf::from("/bin/sh"));
+        assert_eq!(
+            launched
+                .args
+                .iter()
+                .filter_map(|arg| arg.to_str())
+                .collect::<Vec<_>>(),
+            vec!["-c", "pwd"],
+            "tool commands must not gain the agent CLI prefix"
+        );
+        assert_eq!(
+            env_value(&launched, "PI_CODING_AGENT_DIR"),
+            Some(std::ffi::OsStr::new(
+                "/Users/test/Library/Application Support/Local Studio/pi-agent"
+            ))
+        );
+        assert!(
+            env_value(&launched, "ELECTRON_RUN_AS_NODE").is_none(),
+            "ELECTRON_RUN_AS_NODE is an agent-only concern"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_agent_dir_is_never_overridden() {
+        let mut spec = alleycat_bridge_core::ProcessSpec::new("/usr/bin/pi");
+        spec.role = alleycat_bridge_core::ProcessRole::Agent;
+        spec.env.push((
+            OsString::from("PI_CODING_AGENT_DIR"),
+            OsString::from("/explicit/override"),
+        ));
+
+        let launched = launch_capturing(spec).await;
+
+        assert_eq!(
+            env_value(&launched, "PI_CODING_AGENT_DIR"),
+            Some(std::ffi::OsStr::new("/explicit/override"))
+        );
+        assert_eq!(
+            launched
+                .env
+                .iter()
+                .filter(|(key, _)| key == "PI_CODING_AGENT_DIR")
+                .count(),
+            1,
+            "the decorator must not append a duplicate agent-dir entry"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

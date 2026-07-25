@@ -35,6 +35,21 @@ pub enum LocalStudioCommand {
     },
 }
 
+/// Printed by every `local-studio` subcommand.
+///
+/// `f443a83` replaced the signed `LocalStudioBridge` with a second `PiBridge`,
+/// and the new dispatch arm in `agents.rs` discards `authenticated_node`. The
+/// grant store is still written and read faithfully, but nothing consults it
+/// for authorization — `local_studio_agent_info`, the only reader of
+/// `GrantStore::effective`, is dead code. Until that is resolved these
+/// subcommands must not imply an access-control decision they do not make.
+/// See https://github.com/0xSero/alleycat/issues/31.
+const NOT_ENFORCED_NOTICE: &str = "\
+warning: Local Studio grants are NOT currently enforced.
+         The `local-studio` runtime is gated only by the host pair token, so
+         any paired device can reach it regardless of the grants below, and
+         `revoke` does not cut off access. See alleycat issue #31.";
+
 pub async fn run(args: LocalStudioArgs) -> anyhow::Result<()> {
     cli::ensure_current_daemon().await?;
     let request = match args.command {
@@ -74,6 +89,7 @@ pub async fn run(args: LocalStudioArgs) -> anyhow::Result<()> {
         }
     };
     let document: PairedNodesDocument = cli::decode_data(cli::send(request).await?)?;
+    eprintln!("{NOT_ENFORCED_NOTICE}");
     if document.nodes.is_empty() {
         println!("no Local Studio paired-node grants");
         return Ok(());
