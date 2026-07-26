@@ -705,6 +705,21 @@ pub async fn handle_thread_list(
         .first()
         .map(|e| alleycat_bridge_core::encode_backwards_cursor(e, sort));
 
+    // The first persisted-session resume otherwise pays the full pi process
+    // startup cost after the user taps. Warm the first few distinct project
+    // directories represented on this page while the list is being rendered.
+    // `schedule_prewarm` is detached and deduplicates by cwd.
+    let mut warmed_cwds = std::collections::HashSet::new();
+    for entry in page.data.iter().take(8) {
+        let cwd = resume_cwd_or_fallback(&entry.cwd, &entry.thread_id, state.trust_persisted_cwd());
+        if warmed_cwds.insert(cwd.clone()) {
+            state.pi_pool().schedule_prewarm(cwd);
+        }
+        if warmed_cwds.len() == 4 {
+            break;
+        }
+    }
+
     // Enrich entries that pi has actually spawned right now so codex
     // clients can render the correct badge without a follow-up
     // `thread/loaded/list` call.
