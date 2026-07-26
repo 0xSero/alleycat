@@ -101,7 +101,7 @@ impl ThreadIndex {
                 .collect();
             for info in &scanned {
                 if let Some(existing) = known_paths.get(&info.path) {
-                    refresh_entry_summary(&inner, existing, info).await?;
+                    refresh_entry_summary(&inner, existing, info, false).await?;
                     continue;
                 }
                 inner.insert(entry_from_pi(info)).await.with_context(|| {
@@ -230,7 +230,7 @@ impl ThreadIndex {
         let mut added = 0;
         for info in scanned {
             if let Some(existing) = known_paths.get(&info.path) {
-                refresh_entry_summary(&self.0, existing, &info).await?;
+                refresh_entry_summary(&self.0, existing, &info, true).await?;
                 continue;
             }
             self.0.insert(entry_from_pi(&info)).await?;
@@ -244,9 +244,13 @@ async fn refresh_entry_summary(
     index: &alleycat_bridge_core::ThreadIndex<PiSessionRef>,
     existing: &IndexEntry,
     info: &PiSessionInfo,
+    include_freshness: bool,
 ) -> Result<()> {
-    if existing.preview != info.first_message
-        || existing.updated_at != info.modified.timestamp_millis()
+    let missing_preview = existing.preview.trim().is_empty() || existing.preview == "(no messages)";
+    if (missing_preview && info.first_message != "(no messages)")
+        || (include_freshness
+            && (existing.preview != info.first_message
+                || existing.updated_at != info.modified.timestamp_millis()))
     {
         index
             .update_preview_and_updated_at(
@@ -256,7 +260,7 @@ async fn refresh_entry_summary(
             )
             .await?;
     }
-    if existing.name != info.name {
+    if existing.name != info.name && (include_freshness || existing.name.is_none()) {
         index
             .set_name(&existing.thread_id, info.name.clone())
             .await?;
