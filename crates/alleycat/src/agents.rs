@@ -116,6 +116,129 @@ impl CodexUnixEndpoint {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BridgeStateLayout {
+    base: PathBuf,
+    pi: PathBuf,
+    amp: PathBuf,
+    claude: PathBuf,
+    droid: PathBuf,
+    hermes: PathBuf,
+    devin: PathBuf,
+    opencode: PathBuf,
+}
+
+impl BridgeStateLayout {
+    fn new(base: PathBuf) -> Self {
+        Self {
+            pi: base.join("pi"),
+            amp: base.join("amp"),
+            claude: base.join("claude"),
+            droid: base.join("droid"),
+            hermes: base.join("hermes"),
+            devin: base.join("devin"),
+            opencode: base.join("opencode"),
+            base,
+        }
+    }
+
+    async fn ensure(&self) -> anyhow::Result<()> {
+        for directory in [
+            &self.base,
+            &self.pi,
+            &self.amp,
+            &self.claude,
+            &self.droid,
+            &self.hermes,
+            &self.devin,
+            &self.opencode,
+        ] {
+            tokio::fs::create_dir_all(directory)
+                .await
+                .with_context(|| format!("creating bridge state dir {}", directory.display()))?;
+            #[cfg(unix)]
+            tokio::fs::set_permissions(
+                directory,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .await
+            .with_context(|| format!("securing bridge state directory {}", directory.display()))?;
+        }
+        Ok(())
+    }
+}
+
+fn bridge_state_layout(
+    daemon_env: &LaunchEnvironment,
+) -> anyhow::Result<(BridgeStateLayout, PathBuf)> {
+    let configured_home = env_path(daemon_env, "CODEX_HOME");
+    let legacy_pi_home = configured_home
+        .clone()
+        .unwrap_or_else(|| alleycat_pi_bridge::handlers::lifecycle::default_codex_home());
+    let base = configured_home.unwrap_or(crate::paths::state_dir()?.join("bridges"));
+    Ok((BridgeStateLayout::new(base), legacy_pi_home))
+}
+
+async fn preserve_legacy_pi_state(legacy_home: &Path, pi_home: &Path) {
+    if legacy_home == pi_home {
+        return;
+    }
+    for file_name in ["threads.json", "config.json"] {
+        let source = legacy_home.join(file_name);
+        let destination = pi_home.join(file_name);
+        if destination.exists() || !source.is_file() {
+            continue;
+        }
+        if file_name == "threads.json" {
+            let compatible = tokio::fs::read(&source)
+                .await
+                .ok()
+                .is_some_and(|bytes| pi_threads_index_compatible(&bytes));
+            if !compatible {
+                warn!(
+                    source = %source.display(),
+                    "legacy bridge index is not Pi-shaped; leaving it untouched"
+                );
+                continue;
+            }
+        }
+        let temporary = pi_home.join(format!(".{file_name}.migrating"));
+        let copied = async {
+            tokio::fs::copy(&source, &temporary).await?;
+            tokio::fs::rename(&temporary, &destination).await
+        }
+        .await;
+        match copied {
+            Ok(()) => info!(
+                source = %source.display(),
+                destination = %destination.display(),
+                "copied legacy Pi bridge state into its namespaced directory"
+            ),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                warn!(
+                    source = %source.display(),
+                    destination = %destination.display(),
+                    %error,
+                    "could not copy legacy Pi bridge state; source was left untouched"
+                );
+            }
+        }
+    }
+}
+
+fn pi_threads_index_compatible(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    let Some(threads) = value.get("threads").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    threads
+        .iter()
+        .all(|thread| thread.get("piSessionPath").is_some() && thread.get("piSessionId").is_some())
+}
+
 #[derive(Clone)]
 pub struct AgentManager {
     config: Arc<ArcSwap<HostConfig>>,
@@ -125,6 +248,7 @@ pub struct AgentManager {
     /// child + opens an SSE subscription; we don't want to pay that cost on
     /// daemon startup if no client ever asks for opencode.
     opencode_bridge: Arc<OnceCell<Arc<OpencodeBridge>>>,
+    opencode_state_dir: PathBuf,
     /// One daemon-owned `codex app-server` child for modes that keep a shared
     /// app-server alive (`UnixProxy` or legacy `Websocket`). Not populated when
     /// Alleycat is proxying to an externally-started Codex app-server.
@@ -154,12 +278,9 @@ impl AgentManager {
         // Honor `CODEX_HOME` from the same resolved launch environment used
         // for child processes, so bridge indexes/config and spawned agents all
         // agree even when launchd/systemd did not inherit the user's shell env.
-        let codex_home = env_path(&daemon_env, "CODEX_HOME");
-        if let Some(ref home) = codex_home {
-            tokio::fs::create_dir_all(home)
-                .await
-                .with_context(|| format!("creating {}", home.display()))?;
-        }
+        let (bridge_state, legacy_pi_home) = bridge_state_layout(&daemon_env)?;
+        bridge_state.ensure().await?;
+        preserve_legacy_pi_state(&legacy_pi_home, &bridge_state.pi).await;
 
         let base_launcher: Arc<dyn ProcessLauncher> = Arc::new(LocalLauncher);
         let user_launcher =
@@ -185,12 +306,10 @@ impl AgentManager {
 
         let mut pi_builder = PiBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.pi.bin))
-            .launcher(pi_launcher);
+            .launcher(pi_launcher)
+            .codex_home(bridge_state.pi.clone());
         if let Some(agent_dir) = pi_agent_dir {
             pi_builder = pi_builder.hydrator(PiHydrator::with_override(agent_dir.join("sessions")));
-        }
-        if let Some(ref home) = codex_home {
-            pi_builder = pi_builder.codex_home(home.clone());
         }
         let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
 
@@ -231,34 +350,28 @@ impl AgentManager {
             None
         };
 
-        let mut amp_builder = AmpBridge::builder()
+        let amp_builder = AmpBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.amp.bin))
             .launcher(Arc::clone(&launcher))
+            .codex_home(bridge_state.amp.clone())
             .dangerously_allow_all(snapshot.agents.amp.dangerously_allow_all);
-        if let Some(ref home) = codex_home {
-            amp_builder = amp_builder.codex_home(home.join("amp-bridge"));
-        }
         let amp_bridge = amp_builder.build().await.context("building amp bridge")?;
 
-        let mut claude_builder = ClaudeBridge::builder()
+        let claude_builder = ClaudeBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.claude.bin))
             .launcher(Arc::clone(&launcher))
+            .codex_home(bridge_state.claude.clone())
             .bypass_permissions(snapshot.agents.claude.bypass_permissions);
-        if let Some(ref home) = codex_home {
-            claude_builder = claude_builder.codex_home(home.join("claude-bridge"));
-        }
         let claude_bridge = claude_builder
             .build()
             .await
             .context("building claude bridge")?;
 
-        let mut droid_builder = DroidBridge::builder()
+        let droid_builder = DroidBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.droid.bin))
             .launcher(Arc::clone(&launcher))
+            .codex_home(bridge_state.droid.clone())
             .defer_initial_hydration(true);
-        if let Some(ref home) = codex_home {
-            droid_builder = droid_builder.codex_home(home.join("droid-bridge"));
-        }
         let droid_bridge = droid_builder
             .build()
             .await
@@ -266,7 +379,8 @@ impl AgentManager {
 
         let devin_builder = AcpBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.devin.bin))
-            .launcher(Arc::clone(&launcher));
+            .launcher(Arc::clone(&launcher))
+            .state_dir(bridge_state.devin.clone());
         let devin_acp = devin_builder
             .build()
             .await
@@ -316,9 +430,7 @@ impl AgentManager {
                 api_base: hermes_cfg.api_base.clone(),
                 bin: Some(hermes_cfg.bin.clone()),
             },
-            state_dir: codex_home
-                .as_ref()
-                .map(|p| p.join("hermes-bridge").to_string_lossy().to_string()),
+            state_dir: Some(bridge_state.hermes.to_string_lossy().to_string()),
         };
         bridges.insert(
             AgentKind::Hermes,
@@ -359,6 +471,7 @@ impl AgentManager {
             bridges,
             local_studio_bridge,
             opencode_bridge: Arc::new(OnceCell::new()),
+            opencode_state_dir: bridge_state.opencode,
             codex_child: Arc::new(Mutex::new(None)),
             codex_mode: codex_detection.mode,
             codex_bin: codex_detection.bin,
@@ -1033,6 +1146,7 @@ impl AgentManager {
                 }
                 OpencodeBridge::builder()
                     .from_env()
+                    .state_dir(self.opencode_state_dir.clone())
                     .build()
                     .await
                     .context("initializing opencode bridge")
@@ -1906,6 +2020,87 @@ mod local_studio_launcher_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_bridge_state_layout_is_stable_and_namespaced() {
+        let mut home = crate::test_support::TempHome::new();
+        home.override_env(&[("CODEX_HOME", "")]);
+        let env = LaunchEnvironment::current();
+
+        let (layout, legacy_pi_home) = bridge_state_layout(&env).unwrap();
+        assert_eq!(
+            layout.base,
+            crate::paths::state_dir().unwrap().join("bridges")
+        );
+        assert_eq!(
+            legacy_pi_home,
+            alleycat_pi_bridge::handlers::lifecycle::default_codex_home()
+        );
+
+        let roots = [
+            &layout.pi,
+            &layout.amp,
+            &layout.claude,
+            &layout.droid,
+            &layout.hermes,
+            &layout.devin,
+            &layout.opencode,
+        ];
+        assert_eq!(
+            roots
+                .iter()
+                .map(|path| path.as_path())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            roots.len()
+        );
+        assert!(roots.iter().all(|path| path.parent() == Some(&layout.base)));
+    }
+
+    #[tokio::test]
+    async fn legacy_pi_state_is_copied_without_deleting_the_source() {
+        let legacy = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source = legacy.path().join("threads.json");
+        let pi_index = serde_json::json!({
+            "threads": [{
+                "threadId": "pi-thread",
+                "piSessionPath": "/sessions/pi.jsonl",
+                "piSessionId": "pi-session"
+            }]
+        });
+        tokio::fs::write(&source, serde_json::to_vec(&pi_index).unwrap())
+            .await
+            .unwrap();
+
+        preserve_legacy_pi_state(legacy.path(), destination.path()).await;
+
+        assert!(source.is_file(), "migration must never remove legacy state");
+        assert_eq!(
+            tokio::fs::read(destination.path().join("threads.json"))
+                .await
+                .unwrap(),
+            tokio::fs::read(&source).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_pi_legacy_index_is_left_in_place() {
+        let legacy = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source = legacy.path().join("threads.json");
+        tokio::fs::write(
+            &source,
+            br#"{"threads":[{"threadId":"amp","ampThreadId":"amp-session"}]}"#,
+        )
+        .await
+        .unwrap();
+
+        preserve_legacy_pi_state(legacy.path(), destination.path()).await;
+
+        assert!(source.is_file());
+        assert!(!destination.path().join("threads.json").exists());
+    }
 
     #[test]
     fn factory_auth_accepts_v2_store() {
