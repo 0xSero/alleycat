@@ -258,6 +258,13 @@ impl PiBridgeBuilder {
         };
         let thread_index: Arc<ThreadIndex> =
             ThreadIndex::open_and_hydrate_with(&codex_home, &hydrator).await?;
+        let scoped_model_provider = self.model_provider_prefixes.first().cloned();
+        if let Some(model_provider) = scoped_model_provider.as_deref() {
+            thread_index
+                .inner()
+                .set_all_model_providers(model_provider)
+                .await?;
+        }
         for cwd in recent_unique_cwds(
             &thread_index.inner().snapshot().await,
             STARTUP_PREWARM_CWD_LIMIT,
@@ -269,7 +276,13 @@ impl PiBridgeBuilder {
                 .override_dir
                 .clone()
                 .or_else(crate::index::pi_sessions_dir)
-                .map(|root| SessionIndexRefresh::new(thread_index.clone(), root))
+                .map(|root| {
+                    SessionIndexRefresh::new(
+                        thread_index.clone(),
+                        root,
+                        scoped_model_provider.clone(),
+                    )
+                })
         } else {
             None
         };
@@ -770,6 +783,34 @@ mod tests {
                 PathBuf::from("/third")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_provider_relabels_hydrated_history() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let bridge = PiBridge::builder()
+            .codex_home(codex_home.path())
+            .hydrator(PiHydrator::with_sessions(vec![PiSessionInfo {
+                path: codex_home.path().join("session.jsonl"),
+                id: "pi-session".to_string(),
+                cwd: String::new(),
+                name: None,
+                parent_session_path: None,
+                created: now,
+                modified: now,
+                message_count: 0,
+                first_message: "(no messages)".to_string(),
+                all_messages_text: String::new(),
+            }]))
+            .model_provider_prefix("local-studio")
+            .build()
+            .await
+            .unwrap();
+
+        let thread_id = bridge.thread_index().loaded_thread_ids().await.remove(0);
+        let entry = bridge.thread_index().lookup(&thread_id).await.unwrap();
+        assert_eq!(entry.model_provider, "local-studio");
     }
 
     struct HangingLauncher;

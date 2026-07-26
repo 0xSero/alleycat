@@ -73,14 +73,20 @@ pub struct ConnectionState {
 pub struct SessionIndexRefresh {
     index: Arc<ThreadIndex>,
     sessions_root: PathBuf,
+    model_provider: Option<String>,
     last_scan: Arc<tokio::sync::Mutex<SystemTime>>,
 }
 
 impl SessionIndexRefresh {
-    pub fn new(index: Arc<ThreadIndex>, sessions_root: PathBuf) -> Self {
+    pub fn new(
+        index: Arc<ThreadIndex>,
+        sessions_root: PathBuf,
+        model_provider: Option<String>,
+    ) -> Self {
         Self {
             index,
             sessions_root,
+            model_provider,
             last_scan: Arc::new(tokio::sync::Mutex::new(
                 SystemTime::now()
                     .checked_sub(Duration::from_secs(2))
@@ -96,6 +102,12 @@ impl SessionIndexRefresh {
             .index
             .hydrate_modified_since(&self.sessions_root, *last_scan)
             .await?;
+        if let Some(model_provider) = self.model_provider.as_deref() {
+            self.index
+                .inner()
+                .set_all_model_providers(model_provider)
+                .await?;
+        }
         *last_scan = scan_started
             .checked_sub(Duration::from_secs(1))
             .unwrap_or(SystemTime::UNIX_EPOCH);
