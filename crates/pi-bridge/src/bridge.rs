@@ -8,6 +8,7 @@
 //! `DashMap` keyed by `session_id` so the same `(client_node_id, agent)`
 //! session keeps its config across iroh disconnects.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -27,6 +28,8 @@ use crate::handlers;
 use crate::index::{PiHydrator, PiSessionInfo, ThreadIndex};
 use crate::pool::{self as pi, PiPool};
 use crate::state::{ConnectionState, SessionIndexRefresh, ThreadDefaults, ThreadIndexHandle};
+
+const STARTUP_PREWARM_CWD_LIMIT: usize = 3;
 
 /// Build the per-session map key from the session's `(node_id, agent)`
 /// identity. Matches the registry's keying so the same daemon-managed
@@ -242,6 +245,12 @@ impl PiBridgeBuilder {
         };
         let thread_index: Arc<ThreadIndex> =
             ThreadIndex::open_and_hydrate_with(&codex_home, &hydrator).await?;
+        for cwd in recent_unique_cwds(
+            &thread_index.inner().snapshot().await,
+            STARTUP_PREWARM_CWD_LIMIT,
+        ) {
+            pool.schedule_prewarm(cwd);
+        }
         let session_index_refresh = if hydrator.sessions.is_none() {
             hydrator
                 .override_dir
@@ -265,6 +274,28 @@ impl PiBridgeBuilder {
             session_index_refresh,
         }))
     }
+}
+
+fn recent_unique_cwds(entries: &[crate::index::IndexEntry], limit: usize) -> Vec<PathBuf> {
+    let mut recent: Vec<_> = entries
+        .iter()
+        .filter(|entry| !entry.cwd.is_empty())
+        .collect();
+    recent.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+    });
+
+    let mut seen = HashSet::new();
+    recent
+        .into_iter()
+        .filter(|entry| seen.insert(entry.cwd.as_str()))
+        .take(limit)
+        .map(|entry| PathBuf::from(&entry.cwd))
+        .collect()
 }
 
 async fn list_sessions_via_rpc(pool: &PiPool) -> Result<Vec<PiSessionInfo>> {
@@ -668,5 +699,52 @@ fn turn_err(err: handlers::turn::TurnError) -> JsonRpcError {
         code: err.rpc_code(),
         message: err.to_string(),
         data: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{IndexEntry, PiSessionRef};
+
+    fn entry(thread_id: &str, cwd: &str, updated_at: i64) -> IndexEntry {
+        IndexEntry {
+            thread_id: thread_id.to_string(),
+            cwd: cwd.to_string(),
+            created_at: updated_at,
+            updated_at,
+            archived: false,
+            name: None,
+            preview: String::new(),
+            forked_from_id: None,
+            model_provider: "pi".to_string(),
+            source: p::ThreadSourceKind::AppServer,
+            metadata: PiSessionRef {
+                pi_session_path: PathBuf::from(format!("/sessions/{thread_id}.jsonl")),
+                pi_session_id: thread_id.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn startup_prewarm_uses_three_most_recent_unique_cwds() {
+        let entries = vec![
+            entry("old", "/old", 1),
+            entry("duplicate-newer", "/same", 9),
+            entry("newest", "/new", 10),
+            entry("duplicate-older", "/same", 8),
+            entry("third", "/third", 7),
+            entry("fourth", "/fourth", 6),
+            entry("blank", "", 11),
+        ];
+
+        assert_eq!(
+            recent_unique_cwds(&entries, STARTUP_PREWARM_CWD_LIMIT),
+            vec![
+                PathBuf::from("/new"),
+                PathBuf::from("/same"),
+                PathBuf::from("/third")
+            ]
+        );
     }
 }

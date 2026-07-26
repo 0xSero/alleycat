@@ -126,7 +126,7 @@ impl PiPool {
         Ok((thread_id, handle))
     }
 
-    fn schedule_prewarm(&self, cwd: PathBuf) {
+    pub(crate) fn schedule_prewarm(&self, cwd: PathBuf) {
         let pool = self.clone();
         tokio::spawn(async move {
             let mut hasher = DefaultHasher::new();
