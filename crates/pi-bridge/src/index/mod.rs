@@ -93,14 +93,15 @@ impl ThreadIndex {
         // Step 1: scan and insert any rows we haven't seen before.
         let scanned = hydrator.scan_sessions().await;
         if !scanned.is_empty() {
-            let known_paths: std::collections::HashSet<PathBuf> = inner
+            let known_paths: std::collections::HashMap<PathBuf, IndexEntry> = inner
                 .snapshot()
                 .await
                 .into_iter()
-                .map(|e| e.metadata.pi_session_path)
+                .map(|entry| (entry.metadata.pi_session_path.clone(), entry))
                 .collect();
             for info in &scanned {
-                if known_paths.contains(&info.path) {
+                if let Some(existing) = known_paths.get(&info.path) {
+                    refresh_entry_summary(&inner, existing, info).await?;
                     continue;
                 }
                 inner.insert(entry_from_pi(info)).await.with_context(|| {
@@ -229,22 +230,7 @@ impl ThreadIndex {
         let mut added = 0;
         for info in scanned {
             if let Some(existing) = known_paths.get(&info.path) {
-                if existing.preview != info.first_message
-                    || existing.updated_at != info.modified.timestamp_millis()
-                {
-                    self.0
-                        .update_preview_and_updated_at(
-                            &existing.thread_id,
-                            info.first_message.clone(),
-                            info.modified,
-                        )
-                        .await?;
-                }
-                if existing.name != info.name {
-                    self.0
-                        .set_name(&existing.thread_id, info.name.clone())
-                        .await?;
-                }
+                refresh_entry_summary(&self.0, existing, &info).await?;
                 continue;
             }
             self.0.insert(entry_from_pi(&info)).await?;
@@ -252,6 +238,30 @@ impl ThreadIndex {
         }
         Ok(added)
     }
+}
+
+async fn refresh_entry_summary(
+    index: &alleycat_bridge_core::ThreadIndex<PiSessionRef>,
+    existing: &IndexEntry,
+    info: &PiSessionInfo,
+) -> Result<()> {
+    if existing.preview != info.first_message
+        || existing.updated_at != info.modified.timestamp_millis()
+    {
+        index
+            .update_preview_and_updated_at(
+                &existing.thread_id,
+                info.first_message.clone(),
+                info.modified,
+            )
+            .await?;
+    }
+    if existing.name != info.name {
+        index
+            .set_name(&existing.thread_id, info.name.clone())
+            .await?;
+    }
+    Ok(())
 }
 
 impl std::ops::Deref for ThreadIndex {
@@ -546,11 +556,27 @@ mod tests {
             Some(parent_row.thread_id.as_str())
         );
 
-        // Re-running hydrate is idempotent.
+        let parent_thread_id = parent_row.thread_id.clone();
+        let mut parent_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&parent_path)
+            .unwrap();
+        parent_file
+            .write_all(
+                br#"{"type":"message","timestamp":"2026-04-27T11:30:00Z","message":{"role":"user","content":"Startup refresh title"}}
+"#,
+            )
+            .unwrap();
+        drop(parent_file);
+
         let reopened = ThreadIndex::open_and_hydrate_with(&codex_home, &hydrator)
             .await
             .unwrap();
         assert_eq!(reopened.snapshot().await.len(), 2);
+        assert_eq!(
+            reopened.lookup(&parent_thread_id).await.unwrap().preview,
+            "Startup refresh title"
+        );
     }
 
     #[tokio::test]
