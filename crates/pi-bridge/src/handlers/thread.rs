@@ -944,15 +944,26 @@ pub(crate) async fn load_or_resume_handle(
                 .to_string_lossy()
                 .into_owned(),
         }))
-        .await
-        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+        .await;
+    let switch = match switch {
+        Ok(switch) => switch,
+        Err(error) => {
+            state.pi_pool().release(thread_id).await;
+            return Err(ThreadError::PiRpc(error.to_string()));
+        }
+    };
     if !switch.success {
+        state.pi_pool().release(thread_id).await;
         return Err(ThreadError::PiRpc(
             switch
                 .error
                 .unwrap_or_else(|| "switch_session failed".into()),
         ));
     }
+    // Keep the next cold open off the user-facing path. When this resume
+    // claimed the cwd's warm utility process, this replenishes it; when it
+    // had to spawn, it creates the first warm slot for the next session.
+    state.pi_pool().schedule_prewarm(cwd);
     Ok(handle)
 }
 

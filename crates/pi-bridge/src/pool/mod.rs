@@ -176,6 +176,13 @@ impl PiPool {
         thread_id: ThreadId,
         cwd: impl AsRef<Path>,
     ) -> Result<Arc<PiProcessHandle>, PoolError> {
+        if let Some((_previous_id, handle)) = self
+            .inner
+            .reassign_lru_idle_with_prefix_for_cwd(thread_id.clone(), cwd.as_ref(), "utility_")
+            .await?
+        {
+            return Ok(handle);
+        }
         self.spawn_with_capacity_check(thread_id, cwd.as_ref())
             .await
     }
@@ -362,6 +369,24 @@ mod tests {
             .await
             .expect("utility");
         assert!(Arc::ptr_eq(&handle, &target_handle));
+    }
+
+    #[tokio::test]
+    async fn resume_claims_idle_warm_process_for_same_cwd() {
+        let pool = fake_pi_pool(8, Duration::from_secs(60));
+        let warm = track_dummy(&pool, "utility_warm", "/repo").await;
+
+        let resumed = pool
+            .acquire_for_resume("thread-1".into(), "/repo")
+            .await
+            .expect("resume should claim warm process");
+
+        assert!(Arc::ptr_eq(&resumed, &warm));
+        assert!(pool.get("utility_warm").await.is_none());
+        assert!(Arc::ptr_eq(
+            &pool.get("thread-1").await.expect("retagged process"),
+            &warm
+        ));
     }
 
     #[tokio::test]
