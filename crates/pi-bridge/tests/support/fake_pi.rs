@@ -17,6 +17,8 @@
 //!   or the file is missing, a minimal default script (`agent_start` →
 //!   `agent_end`) is used. The script can also include `{"type":"sleep",
 //!   "ms":N}` directives to insert delays — these are stripped from the wire.
+//! - A `prompt` whose message starts with `FAKE_PI_REJECT:` rejects during
+//!   preflight without running the script. The suffix becomes its error.
 //! - The fake exits cleanly when stdin EOFs, mirroring the real pi shutdown
 //!   path the bridge relies on (closing stdin = drain pending work + exit).
 //!
@@ -82,8 +84,26 @@ fn main() -> ExitCode {
 
         match cmd_type {
             "prompt" | "steer" | "follow_up" => {
-                run_script(&mut out, &script);
-                emit(&mut out, &response(id.as_deref(), cmd_type, true, None));
+                let prompt_error = (cmd_type == "prompt")
+                    .then(|| cmd.get("message").and_then(Value::as_str))
+                    .flatten()
+                    .and_then(|message| message.strip_prefix("FAKE_PI_REJECT:"))
+                    .map(str::trim)
+                    .filter(|message| !message.is_empty());
+                if let Some(message) = prompt_error {
+                    emit(
+                        &mut out,
+                        &response(
+                            id.as_deref(),
+                            cmd_type,
+                            false,
+                            Some(json!({ "error": message })),
+                        ),
+                    );
+                } else {
+                    run_script(&mut out, &script);
+                    emit(&mut out, &response(id.as_deref(), cmd_type, true, None));
+                }
             }
             "abort" | "abort_bash" | "abort_retry" => {
                 emit(&mut out, &response(id.as_deref(), cmd_type, true, None));

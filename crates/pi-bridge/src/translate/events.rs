@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::codex_proto::common::{TurnError, TurnStatus};
+use crate::codex_proto::common::TurnError;
 use crate::codex_proto::items::{
     CommandExecutionStatus, DynamicToolCallStatus, FileUpdateChange, McpToolCallError,
     McpToolCallResult, McpToolCallStatus, PatchApplyStatus, PatchChangeKind, ThreadItem,
@@ -1285,23 +1285,6 @@ fn mcp_result_split(
         meta: None,
     };
     (Some(Box::new(payload)), None)
-}
-
-/// Helper for `handlers/turn.rs`: derive a `TurnStatus`/`TurnError` pair from
-/// the optional error string carried out of the final pi event of a turn.
-pub fn turn_status_from_agent_end(error_message: Option<&str>) -> (TurnStatus, Option<TurnError>) {
-    if let Some(message) = error_message {
-        (
-            TurnStatus::Failed,
-            Some(TurnError {
-                message: message.to_string(),
-                codex_error_info: None,
-                additional_details: None,
-            }),
-        )
-    } else {
-        (TurnStatus::Completed, None)
-    }
 }
 
 #[cfg(test)]

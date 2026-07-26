@@ -23,17 +23,17 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::codex_proto::common::TurnStatus;
 use crate::codex_proto::items::{
     CommandExecutionStatus, DynamicToolCallStatus, McpToolCallError, McpToolCallResult,
     McpToolCallStatus, PatchApplyStatus, ThreadItem, UserInput,
 };
 use crate::codex_proto::thread::Turn;
 use crate::pool::pi_protocol::{
-    AgentMessage, AssistantContentBlock, AssistantMessage, ToolResultContentBlock,
+    AgentMessage, AssistantContentBlock, AssistantMessage, StopReason, ToolResultContentBlock,
     ToolResultMessage, UserContentBlock, UserMessage, UserMessageContent,
 };
 use crate::translate::tool_call::{CodexToolKind, classify};
+use crate::translate::turn_terminal_state;
 
 /// Translate a flat pi message stream into the per-turn codex shape.
 pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
@@ -43,6 +43,8 @@ pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
     let mut current_items: Vec<ThreadItem> = Vec::new();
     let mut current_started_at: Option<i64> = None;
     let mut current_completed_at: Option<i64> = None;
+    let mut current_stop_reason: Option<StopReason> = None;
+    let mut current_error_message: Option<String> = None;
     let mut assistant_index = 0;
     let mut user_index = 0;
     let mut saw_assistant_or_tool = false;
@@ -62,6 +64,8 @@ pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
                         &mut current_items,
                         &mut current_started_at,
                         &mut current_completed_at,
+                        &mut current_stop_reason,
+                        &mut current_error_message,
                     );
                     current_started_at = Some(user.timestamp);
                     current_completed_at = Some(user.timestamp);
@@ -77,6 +81,8 @@ pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
                     current_started_at = Some(asst.timestamp);
                 }
                 current_completed_at = Some(asst.timestamp);
+                current_stop_reason = Some(asst.stop_reason);
+                current_error_message = asst.error_message.clone();
                 let turn_index = turns.len();
                 push_assistant_items(
                     asst,
@@ -107,6 +113,8 @@ pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
         &mut current_items,
         &mut current_started_at,
         &mut current_completed_at,
+        &mut current_stop_reason,
+        &mut current_error_message,
     );
     turns
 }
@@ -116,6 +124,8 @@ fn flush_turn(
     items: &mut Vec<ThreadItem>,
     started_at: &mut Option<i64>,
     completed_at: &mut Option<i64>,
+    stop_reason: &mut Option<StopReason>,
+    error_message: &mut Option<String>,
 ) {
     if items.is_empty() {
         return;
@@ -126,12 +136,14 @@ fn flush_turn(
         (Some(s), Some(c)) if c >= s => Some(c - s),
         _ => None,
     };
+    let message = error_message.take();
+    let (status, error) = turn_terminal_state(stop_reason.take(), message.as_deref());
     turns.push(Turn {
         id: format!("turn_{}", turns.len()),
         items: std::mem::take(items),
         items_view: crate::codex_proto::default_items_view(),
-        status: TurnStatus::Completed,
-        error: None,
+        status,
+        error,
         started_at: s,
         completed_at: c,
         duration_ms,
@@ -488,6 +500,7 @@ fn merge_tool_result_text(result: &ToolResultMessage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_proto::TurnStatus;
     use crate::pool::pi_protocol::{
         AssistantRole, ImageContent, StopReason, TextContent, ThinkingContent, ToolCall,
         ToolResultRole, Usage, UsageCost, UserRole,
@@ -503,6 +516,15 @@ mod tests {
     }
 
     fn assistant_with_blocks(blocks: Vec<AssistantContentBlock>, ts: i64) -> AgentMessage {
+        assistant_with_outcome(blocks, ts, StopReason::Stop, None)
+    }
+
+    fn assistant_with_outcome(
+        blocks: Vec<AssistantContentBlock>,
+        ts: i64,
+        stop_reason: StopReason,
+        error_message: Option<&str>,
+    ) -> AgentMessage {
         AgentMessage::Assistant(AssistantMessage {
             role: AssistantRole::Assistant,
             content: blocks,
@@ -524,8 +546,8 @@ mod tests {
                     total: 0.0,
                 },
             },
-            stop_reason: StopReason::Stop,
-            error_message: None,
+            stop_reason,
+            error_message: error_message.map(str::to_string),
             timestamp: ts,
         })
     }
@@ -554,6 +576,31 @@ mod tests {
     #[test]
     fn empty_input_yields_no_turns() {
         assert!(translate_messages(&[]).is_empty());
+    }
+
+    #[test]
+    fn replay_preserves_terminal_stop_reason() {
+        let cases = [
+            (StopReason::Stop, TurnStatus::Completed, None),
+            (StopReason::Length, TurnStatus::Completed, None),
+            (StopReason::ToolUse, TurnStatus::Completed, None),
+            (StopReason::Error, TurnStatus::Failed, Some("model failed")),
+            (StopReason::Aborted, TurnStatus::Interrupted, None),
+        ];
+
+        for (reason, expected_status, expected_error) in cases {
+            let turns = translate_messages(&[
+                user(UserMessageContent::Text("q".into()), 1),
+                assistant_with_outcome(Vec::new(), 2, reason, expected_error),
+            ]);
+            assert_eq!(turns.len(), 1, "reason: {reason:?}");
+            assert_eq!(turns[0].status, expected_status, "reason: {reason:?}");
+            assert_eq!(
+                turns[0].error.as_ref().map(|error| error.message.as_str()),
+                expected_error,
+                "reason: {reason:?}"
+            );
+        }
     }
 
     #[test]

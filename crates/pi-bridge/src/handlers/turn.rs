@@ -53,9 +53,10 @@ use crate::codex_proto as p;
 use crate::pool::PiProcessHandle;
 use crate::pool::pi_protocol as pi;
 use crate::state::ConnectionState;
-use crate::translate::events::{EventTranslatorState, turn_status_from_agent_end};
+use crate::translate::events::EventTranslatorState;
 use crate::translate::input::translate_user_input;
 use crate::translate::items::{translate_messages, user_item_id};
+use crate::translate::turn_terminal_state;
 
 /// Per-thread active-turn registry. Pi only allows one active turn per
 /// process, so this is a 1:1 map. Keyed by codex `thread_id`.
@@ -219,7 +220,7 @@ pub async fn handle_turn_start(
 
     // Send pi `prompt`. Per the pi RPC contract, `success: true` arrives
     // after preflight only — pi continues async.
-    let resp = handle
+    let resp = match handle
         .send_request(pi::RpcCommand::Prompt(pi::PromptCmd {
             id: None,
             message: prompt.message,
@@ -227,13 +228,44 @@ pub async fn handle_turn_start(
             streaming_behavior: None,
         }))
         .await
-        .map_err(|e| TurnError::PiRpc(e.to_string()))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let message = error.to_string();
+            clear_active_turn(&params.thread_id);
+            state.pi_pool().mark_idle(&params.thread_id).await;
+            emit_turn_completed(
+                state,
+                &params.thread_id,
+                &turn_id,
+                started_at,
+                p::TurnStatus::Failed,
+                Some(p::TurnError {
+                    message: message.clone(),
+                    codex_error_info: None,
+                    additional_details: None,
+                }),
+            );
+            return Err(TurnError::PiRpc(message));
+        }
+    };
     if !resp.success {
+        let message = resp.error.unwrap_or_else(|| "prompt failed".into());
         clear_active_turn(&params.thread_id);
         state.pi_pool().mark_idle(&params.thread_id).await;
-        return Err(TurnError::PiRpc(
-            resp.error.unwrap_or_else(|| "prompt failed".into()),
-        ));
+        emit_turn_completed(
+            state,
+            &params.thread_id,
+            &turn_id,
+            started_at,
+            p::TurnStatus::Failed,
+            Some(p::TurnError {
+                message: message.clone(),
+                codex_error_info: None,
+                additional_details: None,
+            }),
+        );
+        return Err(TurnError::PiRpc(message));
     }
 
     spawn_event_pump(EventPumpArgs {
@@ -471,8 +503,8 @@ async fn run_event_pump(mut args: EventPumpArgs) {
         args.turn_id.clone(),
         args.turn_index,
     );
+    let mut stop_reason: Option<pi::StopReason> = None;
     let mut error_message: Option<String> = None;
-    let mut sent_completed = false;
 
     loop {
         let event = match args.events_rx.recv().await {
@@ -489,7 +521,9 @@ async fn run_event_pump(mut args: EventPumpArgs) {
             Err(broadcast::error::RecvError::Closed) => {
                 // Pi process exited unexpectedly — fall through to emit
                 // a synthetic agent_end.
-                error_message = Some("pi process exited".into());
+                if stop_reason.is_none() && error_message.is_none() {
+                    error_message = Some("pi process exited".into());
+                }
                 break;
             }
         };
@@ -555,11 +589,12 @@ async fn run_event_pump(mut args: EventPumpArgs) {
             continue;
         }
 
-        // Capture agent_end error message before consuming event for
-        // translation; the translator emits item/completed for any open
-        // items but does not emit turn/completed (that's our job).
-        if let pi::PiEvent::AgentEnd { messages } = &event {
-            error_message = agent_end_error(messages);
+        // Capture Pi's terminal reason before consuming the event for
+        // translation. The translator closes items but the pump owns the
+        // enclosing codex turn lifecycle.
+        if let Some((reason, message)) = event_terminal_state(&event) {
+            stop_reason = Some(reason);
+            error_message = message;
         }
 
         let notifications = translator.translate(event.clone());
@@ -583,48 +618,86 @@ async fn run_event_pump(mut args: EventPumpArgs) {
         }
     }
 
-    // Emit turn/completed unless a prior path already sent it.
-    if !sent_completed {
-        let (status, error) = turn_status_from_agent_end(error_message.as_deref());
-        let completed_at = now_unix_secs();
-        let duration_ms = ((completed_at - args.started_at) * 1000).max(0);
-        let turn = p::Turn {
-            id: args.turn_id.clone(),
-            items: Vec::new(),
-            items_view: p::default_items_view(),
-            status,
-            error,
-            started_at: Some(args.started_at),
-            completed_at: Some(completed_at),
-            duration_ms: Some(duration_ms),
-        };
-        if args.state.should_emit("turn/completed") {
-            let frame = notification_frame(p::ServerNotification::TurnCompleted(
-                p::TurnCompletedNotification {
-                    thread_id: args.thread_id.clone(),
-                    turn,
-                },
-            ));
-            let _ = args.state.send(frame);
-        }
-        sent_completed = true;
-    }
-    let _ = sent_completed; // silence unused-assignment lint when no other path sets it.
+    let (status, error) = turn_terminal_state(stop_reason, error_message.as_deref());
+    emit_turn_completed(
+        &args.state,
+        &args.thread_id,
+        &args.turn_id,
+        args.started_at,
+        status,
+        error,
+    );
 
     clear_active_turn(&args.thread_id);
     args.state.pi_pool().mark_idle(&args.thread_id).await;
 }
 
-fn agent_end_error(messages: &[pi::AgentMessage]) -> Option<String> {
-    let pi::AgentMessage::Assistant(message) = messages.last()? else {
-        return None;
+fn event_terminal_state(event: &pi::PiEvent) -> Option<(pi::StopReason, Option<String>)> {
+    let assistant = match event {
+        pi::PiEvent::MessageUpdate {
+            assistant_message_event: pi::AssistantMessageEvent::Done { reason, message },
+            ..
+        } => return Some((*reason, normalized_error(message.error_message.as_deref()))),
+        pi::PiEvent::MessageUpdate {
+            assistant_message_event: pi::AssistantMessageEvent::Error { reason, error },
+            ..
+        } => return Some((*reason, normalized_error(error.error_message.as_deref()))),
+        pi::PiEvent::MessageEnd {
+            message: pi::AgentMessage::Assistant(message),
+        }
+        | pi::PiEvent::TurnEnd {
+            message: pi::AgentMessage::Assistant(message),
+            ..
+        } => message,
+        pi::PiEvent::AgentEnd { messages } => {
+            messages.iter().rev().find_map(|message| match message {
+                pi::AgentMessage::Assistant(message) => Some(message),
+                _ => None,
+            })?
+        }
+        _ => return None,
     };
+    Some((
+        assistant.stop_reason,
+        normalized_error(assistant.error_message.as_deref()),
+    ))
+}
+
+fn normalized_error(message: Option<&str>) -> Option<String> {
     message
-        .error_message
-        .as_deref()
         .map(str::trim)
         .filter(|message| !message.is_empty())
         .map(str::to_string)
+}
+
+fn emit_turn_completed(
+    state: &Arc<ConnectionState>,
+    thread_id: &str,
+    turn_id: &str,
+    started_at: i64,
+    status: p::TurnStatus,
+    error: Option<p::TurnError>,
+) {
+    let completed_at = now_unix_secs();
+    let turn = p::Turn {
+        id: turn_id.to_string(),
+        items: Vec::new(),
+        items_view: p::default_items_view(),
+        status,
+        error,
+        started_at: Some(started_at),
+        completed_at: Some(completed_at),
+        duration_ms: Some(((completed_at - started_at) * 1000).max(0)),
+    };
+    if state.should_emit("turn/completed") {
+        let frame = notification_frame(p::ServerNotification::TurnCompleted(
+            p::TurnCompletedNotification {
+                thread_id: thread_id.to_string(),
+                turn,
+            },
+        ));
+        let _ = state.send(frame);
+    }
 }
 
 /// Map a `ServerNotification` to its `method` string and consult the
@@ -936,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_end_carries_the_final_assistant_error() {
+    fn agent_end_carries_the_final_assistant_outcome() {
         let messages: Vec<pi::AgentMessage> = serde_json::from_value(serde_json::json!([{
             "role": "assistant",
             "content": [],
@@ -964,8 +1037,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            agent_end_error(&messages).as_deref(),
-            Some("model is not running")
+            event_terminal_state(&pi::PiEvent::AgentEnd { messages }),
+            Some((
+                pi::StopReason::Error,
+                Some("model is not running".to_string())
+            ))
         );
     }
 }
