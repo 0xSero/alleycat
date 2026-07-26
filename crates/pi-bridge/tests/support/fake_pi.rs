@@ -40,6 +40,8 @@ fn main() -> ExitCode {
     let script = load_script();
     let mut session_id = mint_session_id();
     let mut session_path: Option<String> = None;
+    let mut active_model: Option<Value> = None;
+    let mut thinking_level = "off".to_string();
 
     let mut lines = stdin.lock().lines();
     while let Some(Ok(line)) = lines.next() {
@@ -157,7 +159,8 @@ fn main() -> ExitCode {
                         cmd_type,
                         true,
                         Some(json!({
-                            "thinkingLevel": "off",
+                            "model": active_model.clone(),
+                            "thinkingLevel": thinking_level.clone(),
                             "isStreaming": false,
                             "isCompacting": false,
                             "steeringMode": "all",
@@ -203,6 +206,23 @@ fn main() -> ExitCode {
                     .and_then(|v| v.as_str())
                     .unwrap_or("fake-model")
                     .to_string();
+                active_model = Some(json!({
+                    "id": model_id.clone(),
+                    "name": "Fake Model",
+                    "api": "fake",
+                    "provider": provider.clone(),
+                    "baseUrl": "http://127.0.0.1",
+                    "reasoning": true,
+                    "input": ["text"],
+                    "cost": {
+                        "input": 0.0,
+                        "output": 0.0,
+                        "cacheRead": 0.0,
+                        "cacheWrite": 0.0
+                    },
+                    "contextWindow": 1,
+                    "maxTokens": 1
+                }));
                 emit(
                     &mut out,
                     &response(
@@ -224,8 +244,15 @@ fn main() -> ExitCode {
                     &response(id.as_deref(), cmd_type, true, Some(Value::Null)),
                 );
             }
-            "set_thinking_level"
-            | "cycle_thinking_level"
+            "set_thinking_level" => {
+                thinking_level = cmd
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("off")
+                    .to_string();
+                emit(&mut out, &response(id.as_deref(), cmd_type, true, None));
+            }
+            "cycle_thinking_level"
             | "set_steering_mode"
             | "set_follow_up_mode"
             | "set_auto_compaction"

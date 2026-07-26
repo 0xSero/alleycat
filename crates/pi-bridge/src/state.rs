@@ -354,6 +354,19 @@ impl ConnectionState {
         Arc<Self>,
         tokio::sync::mpsc::UnboundedReceiver<alleycat_bridge_core::session::Sequenced>,
     ) {
+        Self::for_test_with_model_scope(pi_pool, thread_index, defaults, Vec::new())
+    }
+
+    #[doc(hidden)]
+    pub fn for_test_with_model_scope(
+        pi_pool: Arc<PiPool>,
+        thread_index: Arc<dyn ThreadIndexHandle>,
+        defaults: ThreadDefaults,
+        model_provider_prefixes: Vec<String>,
+    ) -> (
+        Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<alleycat_bridge_core::session::Sequenced>,
+    ) {
         let session = Arc::new(Session::new("pi", "test".into(), 64, 1 << 20));
         let attach = session.install_attachment(None);
         let launcher: Arc<dyn ProcessLauncher> = Arc::new(alleycat_bridge_core::LocalLauncher);
@@ -364,7 +377,7 @@ impl ConnectionState {
             Arc::new(Mutex::new(defaults)),
             launcher,
             false,
-            Arc::new(Vec::new()),
+            Arc::new(model_provider_prefixes),
             None,
             None,
         ));

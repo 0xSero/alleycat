@@ -114,11 +114,20 @@ pub async fn handle_thread_start(
         ));
     }
 
+    let requested_model = params.model.clone().or_else(|| defaults.model.clone());
+    let requested_provider = model_provider_override(
+        requested_model.as_deref(),
+        params.model_provider.as_deref(),
+        defaults.model_provider.as_deref(),
+        state.model_provider_prefixes(),
+    );
+    let requested_effort = additional_effort(&params.additional).or(defaults.reasoning_effort);
+
     // Apply optional model + thinking-level overrides before any first
     // turn. Errors here are downgraded to warnings so the thread still
     // comes up — codex clients usually retry overrides on next turn.
-    apply_model_override(&handle, &params.model, &params.model_provider).await;
-    apply_thinking_override(&handle, params_effort(&params)).await;
+    apply_model_override(&handle, &requested_model, &requested_provider).await;
+    apply_thinking_override(&handle, requested_effort).await;
 
     // Pi has no native session-naming for `service_name` / `personality`,
     // so we pass `service_name` through to pi as the session name when
@@ -134,14 +143,28 @@ pub async fn handle_thread_start(
 
     // Recover pi's session id + path so the index can route resumes back
     // to the same JSONL file.
-    let (pi_session_id, pi_session_path) = pi_session_identity(&handle).await?;
+    let pi_state = pi_session_state(&handle).await?;
+    let pi_session_path = pi_state
+        .session_file
+        .clone()
+        .map(PathBuf::from)
+        .ok_or_else(|| ThreadError::PiRpc("pi did not surface session_file".into()))?;
+    let pi_session_id = pi_state.session_id.clone();
+    let model = pi_state
+        .model
+        .as_ref()
+        .map(|model| model.id.clone())
+        .or(requested_model)
+        .unwrap_or_default();
+    let model_provider = pi_state
+        .model
+        .as_ref()
+        .map(|model| model.provider.clone())
+        .or(requested_provider)
+        .unwrap_or_else(|| "pi".to_string());
+    let reasoning_effort = Some(reasoning_effort_from_pi(pi_state.thinking_level));
 
     let now_ms = now_unix_millis();
-    let model_provider = params
-        .model_provider
-        .clone()
-        .or_else(|| defaults.model_provider.clone())
-        .unwrap_or_else(|| "pi".to_string());
     let entry = IndexEntry {
         thread_id: thread_id.clone(),
         cwd: cwd.to_string_lossy().into_owned(),
@@ -176,10 +199,6 @@ pub async fn handle_thread_start(
         let _ = state.send(frame);
     }
 
-    let model = match params.model.clone().or_else(|| defaults.model.clone()) {
-        Some(m) => m,
-        None => pi_current_model_id(&handle).await.unwrap_or_default(),
-    };
     let approval_policy = params
         .approval_policy
         .clone()
@@ -196,12 +215,6 @@ pub async fn handle_thread_start(
         .or(defaults.approvals_reviewer)
         .unwrap_or(p::ApprovalsReviewer::User);
     let sandbox = sandbox_value(params.sandbox.or(defaults.sandbox));
-    let reasoning_effort = params
-        .additional
-        .get("effort")
-        .and_then(parse_effort)
-        .or_else(|| Some(p::ReasoningEffort::High));
-
     Ok(p::ThreadStartResponse {
         thread: thread_from_entry(&entry),
         model,
@@ -237,12 +250,18 @@ pub async fn handle_thread_resume(
 
     let handle = load_or_resume_handle(state, &params.thread_id, &entry).await?;
 
-    apply_model_override(&handle, &params.model, &params.model_provider).await;
-    apply_thinking_override(
-        &handle,
-        params.additional.get("effort").and_then(parse_effort),
-    )
-    .await;
+    let defaults = state.defaults();
+    let requested_model = params.model.clone().or_else(|| defaults.model.clone());
+    let requested_provider = model_provider_override(
+        requested_model.as_deref(),
+        params.model_provider.as_deref(),
+        Some(entry.model_provider.as_str()),
+        state.model_provider_prefixes(),
+    );
+    let requested_effort = additional_effort(&params.additional).or(defaults.reasoning_effort);
+    apply_model_override(&handle, &requested_model, &requested_provider).await;
+    apply_thinking_override(&handle, requested_effort).await;
+    let pi_state = pi_session_state(&handle).await?;
 
     let mut thread = thread_from_entry(&entry);
     if !params.exclude_turns {
@@ -253,14 +272,17 @@ pub async fn handle_thread_resume(
         super::turn::active_turn_id(&params.thread_id).as_deref(),
     );
 
-    let defaults = state.defaults();
-    let model = match params.model.clone().or_else(|| defaults.model.clone()) {
-        Some(m) => m,
-        None => pi_current_model_id(&handle).await.unwrap_or_default(),
-    };
-    let model_provider = params
-        .model_provider
-        .clone()
+    let model = pi_state
+        .model
+        .as_ref()
+        .map(|model| model.id.clone())
+        .or(requested_model)
+        .unwrap_or_default();
+    let model_provider = pi_state
+        .model
+        .as_ref()
+        .map(|model| model.provider.clone())
+        .or(requested_provider)
         .unwrap_or_else(|| entry.model_provider.clone());
     let approval_policy = params
         .approval_policy
@@ -288,11 +310,7 @@ pub async fn handle_thread_resume(
             .clone()
             .or_else(|| Some(default_permission_profile())),
         active_permission_profile: None,
-        reasoning_effort: params
-            .additional
-            .get("effort")
-            .and_then(parse_effort)
-            .or_else(|| Some(p::ReasoningEffort::High)),
+        reasoning_effort: Some(reasoning_effort_from_pi(pi_state.thinking_level)),
     })
 }
 
@@ -400,7 +418,7 @@ pub async fn handle_thread_fork(
         sandbox: sandbox_value(params.sandbox.or(defaults.sandbox)),
         permission_profile: params.permission_profile.clone(),
         active_permission_profile: None,
-        reasoning_effort: params.additional.get("effort").and_then(parse_effort),
+        reasoning_effort: additional_effort(&params.additional),
     })
 }
 
@@ -1069,8 +1087,40 @@ fn parse_effort(value: &serde_json::Value) -> Option<p::ReasoningEffort> {
     }
 }
 
-fn params_effort(params: &p::ThreadStartParams) -> Option<p::ReasoningEffort> {
-    params.additional.get("effort").and_then(parse_effort)
+fn additional_effort(
+    additional: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<p::ReasoningEffort> {
+    additional
+        .get("reasoningEffort")
+        .and_then(parse_effort)
+        .or_else(|| additional.get("effort").and_then(parse_effort))
+}
+
+fn model_provider_override(
+    model: Option<&str>,
+    explicit_provider: Option<&str>,
+    default_provider: Option<&str>,
+    controller_provider_prefixes: &[String],
+) -> Option<String> {
+    if let Some(provider) = explicit_provider
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Some(provider.to_string());
+    }
+    let model_is_qualified = model.is_some_and(|model| {
+        model.split_once('/').is_some_and(|(provider, model_id)| {
+            !provider.trim().is_empty() && !model_id.trim().is_empty()
+        })
+    });
+    if model_is_qualified {
+        return None;
+    }
+    default_provider
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| controller_provider_prefixes.first().cloned())
 }
 
 fn pi_thinking_level(effort: p::ReasoningEffort) -> pi::ThinkingLevel {
@@ -1082,6 +1132,18 @@ fn pi_thinking_level(effort: p::ReasoningEffort) -> pi::ThinkingLevel {
         p::ReasoningEffort::High => pi::ThinkingLevel::High,
         p::ReasoningEffort::XHigh => pi::ThinkingLevel::Xhigh,
         p::ReasoningEffort::Max => pi::ThinkingLevel::Max,
+    }
+}
+
+fn reasoning_effort_from_pi(level: pi::ThinkingLevel) -> p::ReasoningEffort {
+    match level {
+        pi::ThinkingLevel::Off => p::ReasoningEffort::None,
+        pi::ThinkingLevel::Minimal => p::ReasoningEffort::Minimal,
+        pi::ThinkingLevel::Low => p::ReasoningEffort::Low,
+        pi::ThinkingLevel::Medium => p::ReasoningEffort::Medium,
+        pi::ThinkingLevel::High => p::ReasoningEffort::High,
+        pi::ThinkingLevel::Xhigh => p::ReasoningEffort::XHigh,
+        pi::ThinkingLevel::Max => p::ReasoningEffort::Max,
     }
 }
 
@@ -1135,6 +1197,15 @@ async fn apply_thinking_override(
 async fn pi_session_identity(
     handle: &Arc<PiProcessHandle>,
 ) -> Result<(String, PathBuf), ThreadError> {
+    let state = pi_session_state(handle).await?;
+    let session_path = state
+        .session_file
+        .map(PathBuf::from)
+        .ok_or_else(|| ThreadError::PiRpc("pi did not surface session_file".into()))?;
+    Ok((state.session_id, session_path))
+}
+
+async fn pi_session_state(handle: &Arc<PiProcessHandle>) -> Result<pi::SessionState, ThreadError> {
     let resp = handle
         .send_request(pi::RpcCommand::GetState(pi::BareCmd::default()))
         .await
@@ -1144,31 +1215,11 @@ async fn pi_session_identity(
             resp.error.unwrap_or_else(|| "get_state failed".into()),
         ));
     }
-    let state: pi::SessionState = serde_json::from_value(
+    serde_json::from_value(
         resp.data
             .ok_or_else(|| ThreadError::PiRpc("missing get_state data".into()))?,
     )
-    .map_err(|e| ThreadError::PiRpc(format!("decode session state: {e}")))?;
-    let session_path = state
-        .session_file
-        .map(PathBuf::from)
-        .ok_or_else(|| ThreadError::PiRpc("pi did not surface session_file".into()))?;
-    Ok((state.session_id, session_path))
-}
-
-/// Ask pi which model it's currently running. Pi exposes the active model
-/// through `get_state`; falls back to `None` when pi can't surface one (e.g.
-/// fresh process before the first prompt).
-async fn pi_current_model_id(handle: &Arc<PiProcessHandle>) -> Option<String> {
-    let resp = handle
-        .send_request(pi::RpcCommand::GetState(pi::BareCmd::default()))
-        .await
-        .ok()?;
-    if !resp.success {
-        return None;
-    }
-    let state: pi::SessionState = serde_json::from_value(resp.data?).ok()?;
-    state.model.map(|m| m.id)
+    .map_err(|e| ThreadError::PiRpc(format!("decode session state: {e}")))
 }
 
 async fn switch_handle_to(
@@ -1588,6 +1639,35 @@ mod tests {
         ));
         assert!(parse_effort(&json!(42)).is_none());
         assert!(parse_effort(&json!("nonsense")).is_none());
+    }
+
+    #[test]
+    fn canonical_reasoning_effort_wins_with_legacy_fallback() {
+        let canonical = std::collections::HashMap::from([
+            ("reasoningEffort".to_string(), json!("low")),
+            ("effort".to_string(), json!("high")),
+        ]);
+        assert_eq!(additional_effort(&canonical), Some(p::ReasoningEffort::Low));
+        let legacy = std::collections::HashMap::from([("effort".to_string(), json!("medium"))]);
+        assert_eq!(additional_effort(&legacy), Some(p::ReasoningEffort::Medium));
+    }
+
+    #[test]
+    fn unqualified_model_uses_controller_provider_scope() {
+        assert_eq!(
+            model_provider_override(Some("GLM-5.2"), None, None, &["local-studio".to_string()])
+                .as_deref(),
+            Some("local-studio")
+        );
+        assert_eq!(
+            model_provider_override(
+                Some("other/model"),
+                None,
+                None,
+                &["local-studio".to_string()]
+            ),
+            None
+        );
     }
 
     #[test]

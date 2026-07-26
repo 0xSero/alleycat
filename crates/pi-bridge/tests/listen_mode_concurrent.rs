@@ -64,8 +64,9 @@ async fn two_concurrent_connections_share_one_daemon() -> Result<()> {
 
     let socket_dir = TempDir::new()?;
     let socket_path = socket_dir.path().join("pi-bridge.sock");
+    let codex_home = TempDir::new()?;
 
-    let mut daemon = spawn_daemon(&socket_path, &script_path)?;
+    let mut daemon = spawn_daemon(&socket_path, &script_path, codex_home.path())?;
     wait_for_socket(&socket_path).await?;
 
     let cwd_a = TempDir::new()?;
@@ -123,12 +124,18 @@ async fn two_concurrent_connections_share_one_daemon() -> Result<()> {
     Ok(())
 }
 
-fn spawn_daemon(socket_path: &PathBuf, script_path: &PathBuf) -> Result<Child> {
+fn spawn_daemon(
+    socket_path: &PathBuf,
+    script_path: &PathBuf,
+    codex_home: &std::path::Path,
+) -> Result<Child> {
     let bin = env!("CARGO_BIN_EXE_alleycat-pi-bridge");
     Command::new(bin)
         .args(["--listen", socket_path.to_str().expect("socket path utf8")])
         .env("PI_BRIDGE_PI_BIN", fake_pi_path())
         .env("FAKE_PI_SCRIPT", script_path)
+        .env("CODEX_HOME", codex_home)
+        .env("PI_CODING_AGENT_DIR", codex_home)
         // Quiet logs unless the developer overrides — keeps `cargo test`
         // output clean. RUST_LOG still wins if set.
         .env(
