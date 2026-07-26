@@ -30,6 +30,7 @@ use crate::pool::{self as pi, PiPool};
 use crate::state::{ConnectionState, SessionIndexRefresh, ThreadDefaults, ThreadIndexHandle};
 
 const STARTUP_PREWARM_CWD_LIMIT: usize = 3;
+const STARTUP_SESSION_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the per-session map key from the session's `(node_id, agent)`
 /// identity. Matches the registry's keying so the same daemon-managed
@@ -167,10 +168,12 @@ impl PiBridgeBuilder {
         self
     }
 
-    /// When enabled, startup session hydration uses only Pi's RPC
-    /// `list_sessions` command. If that command fails, the bridge starts with
-    /// an empty index instead of falling back to a local `~/.pi` scan. Remote
-    /// launchers use this so session discovery stays on the remote machine.
+    /// When enabled, startup session hydration uses only Pi's short-bounded
+    /// RPC `list_sessions` command. If that command fails or times out, the
+    /// bridge starts with an empty index instead of falling back to a local
+    /// `~/.pi` scan. Remote launchers use this so session discovery stays on
+    /// the remote machine. The default local builder scans Pi's filesystem
+    /// directly and never probes this optional RPC.
     pub fn rpc_session_listing_only(mut self, enabled: bool) -> Self {
         self.rpc_session_listing_only = enabled;
         self
@@ -229,17 +232,27 @@ impl PiBridgeBuilder {
             idle_ttl,
         ));
 
-        let hydrator = match self.hydrator {
-            Some(hydrator) => hydrator,
-            None => match list_sessions_via_rpc(&pool).await {
-                Ok(sessions) => PiHydrator::with_sessions(sessions),
-                Err(error) => {
+        let hydrator = match (self.hydrator, self.rpc_session_listing_only) {
+            (Some(hydrator), _) => hydrator,
+            (None, false) => PiHydrator::new(),
+            (None, true) => match tokio::time::timeout(
+                STARTUP_SESSION_RPC_TIMEOUT,
+                list_sessions_via_rpc(&pool),
+            )
+            .await
+            {
+                Ok(Ok(sessions)) => PiHydrator::with_sessions(sessions),
+                Ok(Err(error)) => {
                     tracing::warn!(%error, "pi RPC list_sessions failed during bridge startup");
-                    if self.rpc_session_listing_only {
-                        PiHydrator::with_sessions(Vec::new())
-                    } else {
-                        PiHydrator::new()
-                    }
+                    PiHydrator::with_sessions(Vec::new())
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = STARTUP_SESSION_RPC_TIMEOUT.as_millis(),
+                        "pi RPC list_sessions timed out during bridge startup"
+                    );
+                    release_startup_utilities(Arc::clone(&pool));
+                    PiHydrator::with_sessions(Vec::new())
                 }
             },
         };
@@ -274,6 +287,16 @@ impl PiBridgeBuilder {
             session_index_refresh,
         }))
     }
+}
+
+fn release_startup_utilities(pool: Arc<PiPool>) {
+    tokio::spawn(async move {
+        for thread_id in pool.loaded_thread_ids().await {
+            if thread_id.starts_with("utility_") {
+                pool.release(&thread_id).await;
+            }
+        }
+    });
 }
 
 fn recent_unique_cwds(entries: &[crate::index::IndexEntry], limit: usize) -> Vec<PathBuf> {
@@ -706,6 +729,7 @@ fn turn_err(err: handlers::turn::TurnError) -> JsonRpcError {
 mod tests {
     use super::*;
     use crate::index::{IndexEntry, PiSessionRef};
+    use futures::future::BoxFuture;
 
     fn entry(thread_id: &str, cwd: &str, updated_at: i64) -> IndexEntry {
         IndexEntry {
@@ -746,5 +770,36 @@ mod tests {
                 PathBuf::from("/third")
             ]
         );
+    }
+
+    struct HangingLauncher;
+
+    impl ProcessLauncher for HangingLauncher {
+        fn launch(
+            &self,
+            _spec: alleycat_bridge_core::ProcessSpec,
+        ) -> BoxFuture<'_, std::io::Result<Box<dyn alleycat_bridge_core::ChildProcess>>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_only_session_discovery_is_short_bounded() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let started = tokio::time::Instant::now();
+
+        let bridge = PiBridge::builder()
+            .launcher(Arc::new(HangingLauncher))
+            .codex_home(codex_home.path())
+            .rpc_session_listing_only(true)
+            .build()
+            .await
+            .expect("timeout should degrade to an empty remote index");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "startup exceeded its short RPC discovery bound"
+        );
+        assert!(bridge.thread_index().loaded_thread_ids().await.is_empty());
     }
 }
