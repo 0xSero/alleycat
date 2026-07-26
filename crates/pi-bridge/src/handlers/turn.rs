@@ -481,8 +481,9 @@ async fn run_event_pump(mut args: EventPumpArgs) {
                 tracing::warn!(
                     thread_id = %args.thread_id,
                     turn_id = %args.turn_id,
-                    "event pump lagged by {n} events; some notifications dropped"
+                    "event pump lagged by {n} events; reconciling from agent history"
                 );
+                translator.mark_lagged();
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => {
