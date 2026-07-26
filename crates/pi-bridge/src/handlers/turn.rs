@@ -140,6 +140,18 @@ pub async fn handle_turn_start(
 
     let prompt = translate_user_input(&params.input)
         .map_err(|e| TurnError::InputTranslation(e.to_string()))?;
+    let index_preview = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .map(|entry| {
+            if entry.preview.trim().is_empty() || entry.preview == "(no messages)" {
+                prompt.message.clone()
+            } else {
+                entry.preview
+            }
+        })
+        .unwrap_or_else(|| prompt.message.clone());
 
     let next_turn_index = next_turn_index(&handle).await?;
 
@@ -267,7 +279,6 @@ pub async fn handle_turn_start(
         );
         return Err(TurnError::PiRpc(message));
     }
-
     spawn_event_pump(EventPumpArgs {
         state: Arc::clone(state),
         handle: Arc::clone(&handle),
@@ -277,6 +288,21 @@ pub async fn handle_turn_start(
         events_rx,
         started_at,
         turn_index: next_turn_index,
+    });
+    let summary_state = Arc::clone(state);
+    let summary_thread_id = params.thread_id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = summary_state
+            .thread_index()
+            .update_preview_and_updated_at(&summary_thread_id, index_preview, chrono::Utc::now())
+            .await
+        {
+            tracing::warn!(
+                thread_id = %summary_thread_id,
+                %error,
+                "failed to refresh pi thread list summary"
+            );
+        }
     });
 
     Ok(p::TurnStartResponse { turn })
