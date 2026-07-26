@@ -63,6 +63,27 @@ struct GatewayMetadataFile {
     controller_id: String,
     pid: u32,
     issued_at: String,
+    /// The running instance's own Pi agent directory. Authoritative when
+    /// present — it pins the data dir to the instance that wrote this file.
+    #[serde(default)]
+    pi_agent_dir: Option<String>,
+    /// The running instance's own resolved Pi runtime command. Authoritative
+    /// when present — it pins the binary to whatever Local Studio version is
+    /// actually running (the latest one launched), instead of guessing a
+    /// hardcoded `/Applications` bundle that may be an older install.
+    #[serde(default)]
+    pi_runtime: Option<PiRuntimeDescriptor>,
+}
+
+/// A Pi launch command published by the running Local Studio instance.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PiRuntimeDescriptor {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
 }
 
 struct GatewayMetadata {
@@ -75,6 +96,10 @@ struct GatewayMetadata {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pid: u32,
     issued_at: String,
+    /// Present only when the running instance published it (protocol addition).
+    pi_agent_dir: Option<PathBuf>,
+    /// Present only when the running instance published it (protocol addition).
+    pi_runtime: Option<PiRuntimeCommand>,
 }
 
 impl GatewayMetadata {
@@ -191,6 +216,16 @@ fn resolve_gateway_metadata_path() -> anyhow::Result<PathBuf> {
 /// present. The models file is the readiness marker: merely having a Local
 /// Studio data directory must not redirect a user's standalone Pi install.
 pub(crate) fn pi_agent_dir() -> Option<PathBuf> {
+    // Prefer the agent dir the running instance published — it is authoritative
+    // for the version that actually owns the data — and only fall back to
+    // deriving it from the descriptor's location for older builds.
+    if let Ok(metadata) = load_gateway_metadata()
+        && let Some(agent_dir) = metadata.pi_agent_dir
+        && agent_dir.join("models.json").is_file()
+    {
+        return Some(agent_dir);
+    }
+
     let data_dir = resolve_gateway_metadata_path()
         .ok()?
         .parent()?
@@ -220,6 +255,33 @@ pub(crate) fn bundled_pi_runtime() -> Option<PiRuntimeCommand> {
         });
     }
 
+    // Prefer the running instance's own published runtime. This binds the pi
+    // binary to whatever Local Studio version is actually running — the latest
+    // one the user launched — and keeps it consistent with the data dir that
+    // same instance owns, instead of a `/Applications` bundle that may be an
+    // older, split-brain install.
+    let metadata = load_gateway_metadata().ok();
+    if let Some(runtime) = metadata.as_ref().and_then(|m| m.pi_runtime.clone()) {
+        return Some(runtime);
+    }
+
+    // Linux fallback for older descriptors that don't publish `piRuntime`:
+    // resolve the running process's own bundle from its pid.
+    #[cfg(target_os = "linux")]
+    if let Some(metadata) = metadata.as_ref() {
+        let proc_root = PathBuf::from(format!("/proc/{}", metadata.pid));
+        if let (Ok(exe), Ok(cwd)) = (
+            std::fs::read_link(proc_root.join("exe")),
+            std::fs::read_link(proc_root.join("cwd")),
+        ) && let Some(runtime) = runtime_from_process(&exe, &cwd)
+        {
+            return Some(runtime);
+        }
+    }
+
+    // Last resort for when no instance is running or an old build published no
+    // runtime: scan the known install locations. This is the path that can pick
+    // a stale version, so it runs only after the live instance has been tried.
     let base = directories::BaseDirs::new()?;
     for root in [
         PathBuf::from("/Applications/Local Studio.app"),
@@ -232,18 +294,6 @@ pub(crate) fn bundled_pi_runtime() -> Option<PiRuntimeCommand> {
         }
     }
 
-    let metadata = load_gateway_metadata().ok()?;
-    #[cfg(target_os = "linux")]
-    {
-        let proc_root = PathBuf::from(format!("/proc/{}", metadata.pid));
-        if let Some(runtime) = runtime_from_process(
-            &std::fs::read_link(proc_root.join("exe")).ok()?,
-            &std::fs::read_link(proc_root.join("cwd")).ok()?,
-        ) {
-            return Some(runtime);
-        }
-    }
-    let _ = metadata;
     None
 }
 
@@ -416,12 +466,44 @@ fn validate_gateway_metadata(parsed: GatewayMetadataFile) -> anyhow::Result<Gate
     let mut secret = HeaderValue::from_str(&parsed.secret)
         .map_err(|_| anyhow!("Local Studio gateway metadata contains an invalid secret"))?;
     secret.set_sensitive(true);
+    // The published data dir and runtime are trusted at the same level as the
+    // rest of this file (validated 0600, owned by the current user). Still
+    // require an absolute program path and reject empty values so a malformed
+    // descriptor falls back to discovery rather than launching something odd.
+    let pi_agent_dir = parsed
+        .pi_agent_dir
+        .and_then(|dir| {
+            let path = PathBuf::from(dir);
+            path.is_absolute().then_some(path)
+        });
+    let pi_runtime = parsed.pi_runtime.and_then(runtime_from_descriptor);
+
     Ok(GatewayMetadata {
         url,
         secret,
         controller_id: parsed.controller_id,
         pid: parsed.pid,
         issued_at: parsed.issued_at,
+        pi_agent_dir,
+        pi_runtime,
+    })
+}
+
+/// Convert a published runtime descriptor into an executable command, or `None`
+/// if the program is not an absolute executable file.
+fn runtime_from_descriptor(descriptor: PiRuntimeDescriptor) -> Option<PiRuntimeCommand> {
+    let program = PathBuf::from(&descriptor.program);
+    if !program.is_absolute() || !executable_file(&program) {
+        return None;
+    }
+    Some(PiRuntimeCommand {
+        program,
+        prefix_args: descriptor.args.into_iter().map(OsString::from).collect(),
+        env: descriptor
+            .env
+            .into_iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect(),
     })
 }
 
@@ -1204,6 +1286,81 @@ mod tests {
         assert_eq!(
             runtime.env,
             vec![(OsString::from("ELECTRON_RUN_AS_NODE"), OsString::from("1"))]
+        );
+    }
+
+    #[test]
+    fn published_runtime_descriptor_is_preferred_over_app_bundle_scan() {
+        // A running instance publishes its own runtime. That must win over the
+        // static /Applications scan so the binary tracks the version actually
+        // running, not a possibly-stale install.
+        let mut home = TempHome::new();
+        let metadata = configure_metadata_path(&mut home);
+
+        // The published program: a distinct executable, unrelated to any
+        // /Applications bundle.
+        let program = home.path().join("running-instance/pi-runner");
+        executable(&program);
+        let agent_dir = home.path().join("running-instance/pi-agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("models.json"), "{}").unwrap();
+
+        std::fs::write(
+            &metadata,
+            serde_json::to_vec_pretty(&json!({
+                "protocolVersion": 1,
+                "url": "http://127.0.0.1:8081/api/litter-bridge/v1",
+                "secretHeader": GATEWAY_SECRET_HEADER,
+                "secret": TEST_SECRET,
+                "controllerId": CONTROLLER_ID,
+                "pid": std::process::id(),
+                "issuedAt": "2026-07-20T18:30:00.000Z",
+                "piAgentDir": agent_dir.to_str().unwrap(),
+                "piRuntime": {
+                    "program": program.to_str().unwrap(),
+                    "args": ["/opt/pi/dist/cli.js"],
+                    "env": { "ELECTRON_RUN_AS_NODE": "1" }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&metadata, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let runtime = bundled_pi_runtime().expect("descriptor runtime should resolve");
+        assert_eq!(runtime.program, program);
+        assert_eq!(
+            runtime.prefix_args,
+            vec![OsString::from("/opt/pi/dist/cli.js")]
+        );
+        assert_eq!(
+            runtime.env,
+            vec![(OsString::from("ELECTRON_RUN_AS_NODE"), OsString::from("1"))]
+        );
+
+        // The published agent dir is authoritative too.
+        assert_eq!(pi_agent_dir(), Some(agent_dir));
+    }
+
+    #[test]
+    fn runtime_descriptor_with_relative_or_missing_program_is_ignored() {
+        // Relative program → rejected (falls back to discovery).
+        assert!(
+            runtime_from_descriptor(PiRuntimeDescriptor {
+                program: "pi-runner".into(),
+                args: vec![],
+                env: Default::default(),
+            })
+            .is_none()
+        );
+        // Absolute but non-existent → rejected.
+        assert!(
+            runtime_from_descriptor(PiRuntimeDescriptor {
+                program: "/no/such/pi-runner".into(),
+                args: vec![],
+                env: Default::default(),
+            })
+            .is_none()
         );
     }
 
