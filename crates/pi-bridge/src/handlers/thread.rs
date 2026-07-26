@@ -30,7 +30,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 use uuid::Uuid;
@@ -87,6 +87,9 @@ impl ThreadError {
 // thread/start
 // ============================================================================
 
+const INITIAL_SESSION_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const INITIAL_SESSION_CLAIM_ATTEMPTS: usize = 2;
+
 pub async fn handle_thread_start(
     state: &Arc<ConnectionState>,
     params: p::ThreadStartParams,
@@ -94,25 +97,10 @@ pub async fn handle_thread_start(
     let cwd = resolve_cwd(params.cwd.as_deref())?;
     let defaults = state.defaults();
 
-    let (thread_id, handle) = state
-        .pi_pool()
-        .acquire_for_new_thread(&cwd)
-        .await
-        .map_err(ThreadError::pool)?;
-
-    // Mint a fresh pi session in the spawned process. Pi requires this
-    // before any prompt can be sent.
-    let new_session = handle
-        .send_request(pi::RpcCommand::NewSession(pi::NewSessionCmd::default()))
-        .await
-        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
-    if !new_session.success {
-        return Err(ThreadError::PiRpc(
-            new_session
-                .error
-                .unwrap_or_else(|| "new_session failed".into()),
-        ));
-    }
+    // `pi --mode rpc` creates a fresh AgentSession before it starts reading
+    // commands. Adopt that initial session instead of immediately tearing it
+    // down with `new_session`, which repeats runtime/resource initialization.
+    let (thread_id, handle, initial_pi_state) = acquire_clean_initial_session(state, &cwd).await?;
 
     let requested_model = params.model.clone().or_else(|| defaults.model.clone());
     let requested_provider = model_provider_override(
@@ -122,6 +110,8 @@ pub async fn handle_thread_start(
         state.model_provider_prefixes(),
     );
     let requested_effort = additional_effort(&params.additional).or(defaults.reasoning_effort);
+    let has_session_overrides =
+        requested_model.is_some() || requested_effort.is_some() || params.service_name.is_some();
 
     // Apply optional model + thinking-level overrides before any first
     // turn. Errors here are downgraded to warnings so the thread still
@@ -143,12 +133,21 @@ pub async fn handle_thread_start(
 
     // Recover pi's session id + path so the index can route resumes back
     // to the same JSONL file.
-    let pi_state = pi_session_state(&handle).await?;
-    let pi_session_path = pi_state
-        .session_file
-        .clone()
-        .map(PathBuf::from)
-        .ok_or_else(|| ThreadError::PiRpc("pi did not surface session_file".into()))?;
+    let pi_state = if has_session_overrides {
+        match pi_session_state_with_timeout(&handle, INITIAL_SESSION_RPC_TIMEOUT).await {
+            Ok(pi_state) => pi_state,
+            Err(error) => {
+                state.pi_pool().release(&thread_id).await;
+                return Err(error);
+            }
+        }
+    } else {
+        initial_pi_state
+    };
+    let Some(pi_session_path) = pi_state.session_file.clone().map(PathBuf::from) else {
+        state.pi_pool().release(&thread_id).await;
+        return Err(ThreadError::PiRpc("pi did not surface session_file".into()));
+    };
     let pi_session_id = pi_state.session_id.clone();
     let model = pi_state
         .model
@@ -181,11 +180,13 @@ pub async fn handle_thread_start(
             pi_session_id,
         },
     };
-    state
-        .thread_index()
-        .insert(entry.clone())
-        .await
-        .map_err(ThreadError::from)?;
+    if let Err(error) = state.thread_index().insert(entry.clone()).await {
+        state.pi_pool().release(&thread_id).await;
+        return Err(ThreadError::from(error));
+    }
+    // Replenish the warm slot only after the claimed session is ready. The
+    // spawned replacement is detached from this request's critical path.
+    state.pi_pool().schedule_prewarm(cwd.clone());
 
     // Emit `thread/started` so codex clients (which key UI state off this
     // notification, not the thread/start response) can reflect the new
@@ -1147,6 +1148,74 @@ fn reasoning_effort_from_pi(level: pi::ThinkingLevel) -> p::ReasoningEffort {
     }
 }
 
+async fn acquire_clean_initial_session(
+    state: &Arc<ConnectionState>,
+    cwd: &Path,
+) -> Result<(String, Arc<PiProcessHandle>, pi::SessionState), ThreadError> {
+    for attempt in 0..INITIAL_SESSION_CLAIM_ATTEMPTS {
+        let (thread_id, handle) = state
+            .pi_pool()
+            .acquire_for_new_thread(cwd)
+            .await
+            .map_err(ThreadError::pool)?;
+
+        let pi_state =
+            match pi_session_state_with_timeout(&handle, INITIAL_SESSION_RPC_TIMEOUT).await {
+                Ok(pi_state) => pi_state,
+                Err(error) => {
+                    state.pi_pool().release(&thread_id).await;
+                    return Err(error);
+                }
+            };
+
+        match validate_initial_session(&pi_state) {
+            Ok(()) => return Ok((thread_id, handle, pi_state)),
+            Err(reason) => {
+                state.pi_pool().release(&thread_id).await;
+                if attempt + 1 == INITIAL_SESSION_CLAIM_ATTEMPTS {
+                    return Err(ThreadError::PiRpc(format!(
+                        "pi initial session was not clean after {INITIAL_SESSION_CLAIM_ATTEMPTS} attempts: {reason}"
+                    )));
+                }
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    %reason,
+                    "discarding non-empty pi utility session before thread/start"
+                );
+            }
+        }
+    }
+
+    unreachable!("initial session claim loop always returns")
+}
+
+fn validate_initial_session(state: &pi::SessionState) -> Result<(), String> {
+    let mut reasons = Vec::new();
+    if state.session_id.trim().is_empty() {
+        reasons.push("missing session id");
+    }
+    if state.session_file.as_deref().is_none_or(str::is_empty) {
+        reasons.push("missing session file");
+    }
+    if state.message_count != 0 {
+        reasons.push("session has messages");
+    }
+    if state.pending_message_count != 0 {
+        reasons.push("session has pending messages");
+    }
+    if state.is_streaming {
+        reasons.push("session is streaming");
+    }
+    if state.is_compacting {
+        reasons.push("session is compacting");
+    }
+    if reasons.is_empty() {
+        Ok(())
+    } else {
+        Err(reasons.join(", "))
+    }
+}
+
 async fn apply_model_override(
     handle: &Arc<PiProcessHandle>,
     model: &Option<String>,
@@ -1210,6 +1279,21 @@ async fn pi_session_state(handle: &Arc<PiProcessHandle>) -> Result<pi::SessionSt
         .send_request(pi::RpcCommand::GetState(pi::BareCmd::default()))
         .await
         .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    decode_pi_session_state(resp)
+}
+
+async fn pi_session_state_with_timeout(
+    handle: &Arc<PiProcessHandle>,
+    timeout: Duration,
+) -> Result<pi::SessionState, ThreadError> {
+    let resp = handle
+        .send_request_with_timeout(pi::RpcCommand::GetState(pi::BareCmd::default()), timeout)
+        .await
+        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    decode_pi_session_state(resp)
+}
+
+fn decode_pi_session_state(resp: pi::RpcResponse) -> Result<pi::SessionState, ThreadError> {
     if !resp.success {
         return Err(ThreadError::PiRpc(
             resp.error.unwrap_or_else(|| "get_state failed".into()),
@@ -1365,6 +1449,40 @@ mod tests {
                 pi_session_id: "pi-session-x".into(),
             },
         }
+    }
+
+    fn initial_session_state() -> pi::SessionState {
+        serde_json::from_value(json!({
+            "model": null,
+            "thinkingLevel": "high",
+            "isStreaming": false,
+            "isCompacting": false,
+            "steeringMode": "all",
+            "followUpMode": "all",
+            "sessionFile": "/tmp/pi/initial.jsonl",
+            "sessionId": "initial-session",
+            "autoCompactionEnabled": true,
+            "messageCount": 0,
+            "pendingMessageCount": 0
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn initial_session_validation_accepts_fresh_rpc_session() {
+        assert!(validate_initial_session(&initial_session_state()).is_ok());
+    }
+
+    #[test]
+    fn initial_session_validation_rejects_dirty_or_active_session() {
+        let mut state = initial_session_state();
+        state.message_count = 1;
+        state.pending_message_count = 2;
+        state.is_streaming = true;
+        let error = validate_initial_session(&state).expect_err("dirty session must be rejected");
+        assert!(error.contains("messages"));
+        assert!(error.contains("pending"));
+        assert!(error.contains("streaming"));
     }
 
     #[tokio::test]

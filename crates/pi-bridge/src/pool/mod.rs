@@ -103,10 +103,14 @@ impl PiPool {
         &self.launcher
     }
 
-    /// Spawn a fresh pi process for a brand-new codex thread, mint a thread
-    /// id, and return both. The handler is responsible for sending pi the
-    /// `new_session` (and any `set_model`/`set_thinking_level` overrides)
-    /// before the first `prompt`.
+    /// Claim a prewarmed pi process for a brand-new codex thread, or spawn one
+    /// when no matching warm process exists, then mint and return a thread id.
+    /// Pi RPC mode already owns a fresh session when it becomes ready; the
+    /// handler validates and adopts that session before the first `prompt`.
+    ///
+    /// The caller schedules the replacement prewarm only after validation.
+    /// Starting it here would make two cold Pi runtimes compete while the
+    /// user-facing `thread/start` is still waiting for readiness.
     pub async fn acquire_for_new_thread(
         &self,
         cwd: impl AsRef<Path>,
@@ -122,7 +126,6 @@ impl PiPool {
             self.spawn_with_capacity_check(thread_id.clone(), cwd.as_ref())
                 .await?
         };
-        self.schedule_prewarm(cwd.as_ref().to_path_buf());
         Ok((thread_id, handle))
     }
 

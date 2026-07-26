@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use alleycat_bridge_core::{
     ChildProcess, ChildStderr, ChildStdin, ChildStdout, LocalLauncher, ProcessLauncher,
@@ -60,6 +61,9 @@ pub enum PiProcessError {
 
     #[error("failed to write command to pi stdin: {0}")]
     WriterClosed(String),
+
+    #[error("pi process did not respond to command id={id} within {timeout_ms}ms")]
+    TimedOut { id: String, timeout_ms: u64 },
 
     #[error(transparent)]
     Json(#[from] serde_json::Error),
@@ -267,9 +271,30 @@ impl PiProcessHandle {
         &self,
         mut command: RpcCommand,
     ) -> Result<RpcResponse, PiProcessError> {
+        self.send_request_inner(&mut command, None).await
+    }
+
+    /// Send a command and fail if pi does not answer before `timeout`.
+    ///
+    /// Unlike wrapping [`Self::send_request`] in `tokio::time::timeout`, this
+    /// removes the correlation slot when the deadline fires. A late response
+    /// is therefore dropped instead of retaining a dead oneshot indefinitely.
+    pub async fn send_request_with_timeout(
+        &self,
+        mut command: RpcCommand,
+        timeout: Duration,
+    ) -> Result<RpcResponse, PiProcessError> {
+        self.send_request_inner(&mut command, Some(timeout)).await
+    }
+
+    async fn send_request_inner(
+        &self,
+        command: &mut RpcCommand,
+        timeout: Option<Duration>,
+    ) -> Result<RpcResponse, PiProcessError> {
         let id = Uuid::now_v7().to_string();
-        set_command_id(&mut command, id.clone());
-        let command_value = serde_json::to_value(&command)?;
+        set_command_id(command, id.clone());
+        let command_value = serde_json::to_value(command)?;
         let command_name = command_value
             .get("type")
             .and_then(serde_json::Value::as_str)
@@ -296,12 +321,30 @@ impl PiProcessHandle {
             return Err(PiProcessError::WriterClosed(id));
         }
 
-        match rx.await {
-            Ok(response) => Ok(response),
-            Err(_) => {
-                // Sender dropped before responding — happens when the reader
-                // task observes pi's stdout closing.
-                Err(PiProcessError::ProcessClosed(id))
+        if let Some(timeout) = timeout {
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(response)) => Ok(response),
+                Ok(Err(_)) => {
+                    // Sender dropped before responding — happens when the
+                    // reader task observes pi's stdout closing.
+                    Err(PiProcessError::ProcessClosed(id))
+                }
+                Err(_) => {
+                    self.pending.lock().await.remove(&id);
+                    Err(PiProcessError::TimedOut {
+                        id,
+                        timeout_ms: timeout.as_millis().try_into().unwrap_or(u64::MAX),
+                    })
+                }
+            }
+        } else {
+            match rx.await {
+                Ok(response) => Ok(response),
+                Err(_) => {
+                    // Sender dropped before responding — happens when the
+                    // reader task observes pi's stdout closing.
+                    Err(PiProcessError::ProcessClosed(id))
+                }
             }
         }
     }
@@ -597,6 +640,31 @@ mod tests {
             RpcCommand::Abort(b) => assert_eq!(b.id.as_deref(), Some("xyz")),
             _ => panic!("variant changed"),
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_request_removes_pending_slot_on_timeout() {
+        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel();
+        let (events_tx, _) = broadcast::channel(1);
+        let handle = PiProcessHandle::__test_dangling(writer_tx, events_tx, PathBuf::from("/repo"));
+
+        let err = handle
+            .send_request_with_timeout(
+                RpcCommand::GetState(BareCmd { id: None }),
+                Duration::from_millis(10),
+            )
+            .await
+            .expect_err("request without a reader must time out");
+
+        assert!(matches!(err, PiProcessError::TimedOut { .. }));
+        assert!(
+            handle.pending.lock().await.is_empty(),
+            "timed-out request must not leak its correlation slot"
+        );
+        assert!(
+            writer_rx.try_recv().is_ok(),
+            "bounded request should still enqueue the command"
+        );
     }
 
     #[tokio::test]

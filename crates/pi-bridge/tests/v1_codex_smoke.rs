@@ -136,6 +136,14 @@ async fn initialize_thread_start_turn_start_smoke() {
     assert!(!thread_id.is_empty(), "thread_id must be non-empty");
     assert_eq!(start_resp.cwd, cwd.path().to_string_lossy());
     assert_eq!(start_resp.approval_policy, p::AskForApproval::Never);
+    assert!(
+        start_resp
+            .thread
+            .path
+            .as_deref()
+            .is_some_and(|path| path.ends_with("-initial.jsonl")),
+        "thread/start must adopt Pi's initial RPC session instead of replacing it"
+    );
     assert_eq!(
         state.defaults().approval_policy,
         Some(p::AskForApproval::Never),

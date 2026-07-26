@@ -39,7 +39,14 @@ fn main() -> ExitCode {
 
     let script = load_script();
     let mut session_id = mint_session_id();
-    let mut session_path: Option<String> = None;
+    // Real Pi enters RPC mode with an already-created, persisted session.
+    // Keep the fake lifecycle-aligned so thread/start can adopt that initial
+    // session without issuing a redundant `new_session`.
+    let mut session_path = Some(format!("/tmp/fake-pi-sessions/{session_id}-initial.jsonl"));
+    let initial_message_count = env::var("FAKE_PI_INITIAL_MESSAGE_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     let mut active_model: Option<Value> = None;
     let mut thinking_level = "off".to_string();
 
@@ -168,7 +175,7 @@ fn main() -> ExitCode {
                             "sessionFile": session_path,
                             "sessionId": session_id,
                             "autoCompactionEnabled": true,
-                            "messageCount": 0,
+                            "messageCount": initial_message_count,
                             "pendingMessageCount": 0,
                         })),
                     ),
