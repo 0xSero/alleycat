@@ -197,39 +197,46 @@ pub async fn list_sessions_modified_since(
     sessions_root: &Path,
     modified_after: SystemTime,
 ) -> Vec<PiSessionInfo> {
-    let mut sessions = Vec::new();
-    let mut roots = match fs::read_dir(sessions_root).await {
-        Ok(entries) => entries,
-        Err(_) => return sessions,
-    };
-    while let Ok(Some(root)) = roots.next_entry().await {
-        if !root.file_type().await.is_ok_and(|kind| kind.is_dir()) {
-            continue;
-        }
-        let mut files = match fs::read_dir(root.path()).await {
-            Ok(entries) => entries,
-            Err(_) => continue,
+    // `tokio::fs` delegates each directory and metadata operation to the
+    // blocking pool. Awaiting hundreds of those tiny operations serially made
+    // every thread/list take seconds. Traverse metadata once on one blocking
+    // worker, then return to async I/O only for the few files that changed.
+    let root = sessions_root.to_path_buf();
+    let recent_paths = tokio::task::spawn_blocking(move || {
+        let mut paths = Vec::new();
+        let Ok(roots) = std::fs::read_dir(root) else {
+            return paths;
         };
-        while let Ok(Some(file)) = files.next_entry().await {
-            let path = file.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+        for directory in roots.flatten() {
+            if !directory.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
-            let recently_modified = file
-                .metadata()
-                .await
-                .ok()
-                .and_then(|metadata| metadata.modified().ok())
-                .is_some_and(|modified| modified >= modified_after);
-            if !recently_modified {
+            let Ok(files) = std::fs::read_dir(directory.path()) else {
                 continue;
-            }
-            if let Some(info) = build_session_info_with_limit(&path, MAX_SESSION_SCAN_BYTES)
-                .await
-                .info
-            {
-                sessions.push(info);
-            }
+            };
+            paths.extend(files.flatten().filter_map(|file| {
+                let path = file.path();
+                (path.extension().and_then(|value| value.to_str()) == Some("jsonl")
+                    && file
+                        .metadata()
+                        .ok()
+                        .and_then(|metadata| metadata.modified().ok())
+                        .is_some_and(|modified| modified >= modified_after))
+                .then_some(path)
+            }));
+        }
+        paths
+    })
+    .await
+    .unwrap_or_default();
+
+    let mut sessions = Vec::with_capacity(recent_paths.len());
+    for path in recent_paths {
+        if let Some(info) = build_session_info_with_limit(&path, MAX_SESSION_SCAN_BYTES)
+            .await
+            .info
+        {
+            sessions.push(info);
         }
     }
     sessions
@@ -563,6 +570,25 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("nope");
         assert!(list_sessions_from_dir(&missing).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unchanged_session_refresh_stays_bounded() {
+        let root = TempDir::new().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        for index in 0..1_000 {
+            std::fs::write(project.join(format!("{index}.jsonl")), "").unwrap();
+        }
+
+        let future = list_sessions_modified_since(
+            root.path(),
+            SystemTime::now() + std::time::Duration::from_secs(1),
+        );
+        let sessions = tokio::time::timeout(std::time::Duration::from_secs(1), future)
+            .await
+            .expect("metadata refresh should not enqueue one blocking task per file");
+        assert!(sessions.is_empty());
     }
 
     #[tokio::test]
