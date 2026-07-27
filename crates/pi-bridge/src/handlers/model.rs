@@ -58,7 +58,18 @@ async fn fetch_models_via_pool(state: &Arc<ConnectionState>) -> Vec<PiAvailableM
         }
     };
     match fetch_models_from_handle(&handle).await {
-        Ok(models) => filter_models_by_enabled_models(models),
+        Ok(models) => {
+            // When a provider prefix is set (Local Studio), the catalog is
+            // already scoped to that provider's models.json. Skip the global
+            // enabledModels filter, which reads the daemon's ~/.pi settings
+            // and would incorrectly gate a foreign controller's catalog.
+            let prefixes = state.model_provider_prefixes();
+            if prefixes.is_empty() {
+                filter_models_by_enabled_models(filter_models_by_provider(models, prefixes))
+            } else {
+                filter_models_by_provider(models, prefixes)
+            }
+        }
         Err(err) => {
             tracing::warn!(%err, "model/list: get_available_models RPC failed");
             Vec::new()
@@ -129,6 +140,24 @@ fn translate_pi_model(model: &PiAvailableModel, is_default: bool) -> p::Model {
         service_tiers: standard_service_tiers(),
         is_default,
     }
+}
+
+/// Filter models to those whose provider id starts with one of `prefixes`.
+/// Empty `prefixes` means the full catalog (no filtering).
+fn filter_models_by_provider(
+    models: Vec<PiAvailableModel>,
+    prefixes: &[String],
+) -> Vec<PiAvailableModel> {
+    if prefixes.is_empty() {
+        return models;
+    }
+    models
+        .into_iter()
+        .filter(|model| {
+            let provider = model.provider.as_deref().unwrap_or("");
+            prefixes.iter().any(|prefix| provider == prefix || provider.starts_with(&format!("{prefix}-")))
+        })
+        .collect()
 }
 
 fn filter_models_by_enabled_models(models: Vec<PiAvailableModel>) -> Vec<PiAvailableModel> {

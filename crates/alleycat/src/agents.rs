@@ -11,7 +11,7 @@ use alleycat_bridge_core::codex_resolver::{newest_codex_candidates_first, progra
 use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryConfig};
 use alleycat_bridge_core::{
     Bridge, LaunchEnvironment, LaunchEnvironmentResolver, LocalLauncher, ProcessLauncher,
-    UserEnvironmentLauncher,
+    ProcessRole, UserEnvironmentLauncher,
 };
 use alleycat_claude_bridge::ClaudeBridge;
 use alleycat_devin_bridge::DevinBridge;
@@ -33,6 +33,7 @@ use tokio::sync::{Mutex, OnceCell};
 use tracing::{info, warn};
 
 use crate::agent_manifest::{MANIFESTS, manifest_for};
+use crate::local_studio;
 use crate::config::HostConfig;
 use crate::protocol::{AgentInfo, AgentWire};
 use crate::stream::IrohStream;
@@ -43,6 +44,7 @@ use crate::stream::IrohStream;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     Pi,
+    LocalStudio,
     Amp,
     Claude,
     Opencode,
@@ -171,6 +173,32 @@ impl AgentManager {
         }
         let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
 
+        // Local Studio owns a separate Pi data directory with its own
+        // controller model catalog and sessions. Expose it as a second
+        // scoped PiBridge so the phone can reach Local Studio's models
+        // independently of the user's standalone `pi` runtime.
+        let local_studio_bridge = match (
+            local_studio::pi_agent_dir(),
+            local_studio::bundled_pi_runtime(),
+        ) {
+            (Some(agent_dir), Some(runtime)) => {
+                let studio_launcher: Arc<dyn ProcessLauncher> = Arc::new(
+                    LocalStudioLauncher::new(
+                        Arc::clone(&launcher),
+                        agent_dir.clone(),
+                        runtime.clone(),
+                    ),
+                );
+                let builder = PiBridge::builder()
+                    .agent_bin(runtime.program)
+                    .launcher(studio_launcher)
+                    .model_provider_prefix("local-studio")
+                    .codex_home(agent_dir.join("bridge-index"));
+                Some(builder.build().await.context("building Local Studio Pi bridge")?)
+            }
+            _ => None,
+        };
+
         let mut amp_builder = AmpBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.amp.bin))
             .launcher(Arc::clone(&launcher))
@@ -242,6 +270,9 @@ impl AgentManager {
 
         let mut bridges: HashMap<AgentKind, Arc<dyn Bridge>> = HashMap::new();
         bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
+        if let Some(bridge) = local_studio_bridge {
+            bridges.insert(AgentKind::LocalStudio, bridge as Arc<dyn Bridge>);
+        }
         bridges.insert(AgentKind::Amp, amp_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
@@ -338,6 +369,7 @@ impl AgentManager {
             let available = match manifest.name {
                 "codex" => self.codex_available(),
                 "pi" => self.pi_available(&launch_env),
+                "local-studio" => local_studio::pi_agent_dir().is_some(),
                 "amp" => self.amp_available(&launch_env),
                 "opencode" => self.opencode_available(&launch_env),
                 "claude" => self.claude_available(&launch_env),
@@ -442,6 +474,7 @@ impl AgentManager {
         match name {
             "codex" => Some("codex"),
             "pi" => Some("pi"),
+            "local-studio" => Some("local-studio"),
             "amp" => Some("amp"),
             "opencode" => Some("opencode"),
             "claude" => Some("claude"),
@@ -459,6 +492,7 @@ impl AgentManager {
         match agent {
             "codex" => cfg.agents.codex.enabled,
             "pi" => cfg.agents.pi.enabled,
+            "local-studio" => self.bridges.contains_key(&AgentKind::LocalStudio),
             "amp" => cfg.agents.amp.enabled,
             "opencode" => cfg.agents.opencode.enabled,
             "claude" => cfg.agents.claude.enabled,
@@ -1432,6 +1466,7 @@ fn resolve_pi_bin(configured: &str, env: &LaunchEnvironment) -> Option<PathBuf> 
 fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
     match name {
         "pi" => Some(AgentKind::Pi),
+        "local-studio" => Some(AgentKind::LocalStudio),
         "amp" => Some(AgentKind::Amp),
         "claude" => Some(AgentKind::Claude),
         "opencode" => Some(AgentKind::Opencode),
@@ -1447,6 +1482,7 @@ fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
 fn agent_kind_str(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::Pi => "pi",
+        AgentKind::LocalStudio => "local-studio",
         AgentKind::Amp => "amp",
         AgentKind::Claude => "claude",
         AgentKind::Opencode => "opencode",
@@ -1462,6 +1498,7 @@ impl crate::config::AgentsConfig {
     fn is_enabled(&self, kind: AgentKind) -> bool {
         match kind {
             AgentKind::Pi => self.pi.enabled,
+            AgentKind::LocalStudio => true,
             AgentKind::Amp => self.amp.enabled,
             AgentKind::Claude => self.claude.enabled,
             AgentKind::Opencode => self.opencode.enabled,
@@ -1476,6 +1513,56 @@ impl crate::config::AgentsConfig {
 
 fn program_available(env: &LaunchEnvironment, configured: &str) -> bool {
     resolve_program(configured, env).is_some()
+}
+
+/// Launcher decorator that pins `PI_CODING_AGENT_DIR` to Local Studio's agent
+/// data directory and overlays the Electron-node env the bundled Pi CLI
+/// needs. Only affects `Agent`-role spawns; tool commands pass through
+/// unchanged.
+struct LocalStudioLauncher {
+    inner: Arc<dyn ProcessLauncher>,
+    agent_dir: PathBuf,
+    runtime: crate::local_studio::PiRuntimeCommand,
+}
+
+impl LocalStudioLauncher {
+    fn new(
+        inner: Arc<dyn ProcessLauncher>,
+        agent_dir: PathBuf,
+        runtime: crate::local_studio::PiRuntimeCommand,
+    ) -> Self {
+        Self { inner, agent_dir, runtime }
+    }
+}
+
+impl ProcessLauncher for LocalStudioLauncher {
+    fn launch(
+        &self,
+        mut spec: alleycat_bridge_core::ProcessSpec,
+    ) -> futures::future::BoxFuture<'_, std::io::Result<Box<dyn alleycat_bridge_core::ChildProcess>>> {
+        if spec.role == ProcessRole::Agent {
+            spec.program = self.runtime.program.clone();
+            for arg in self.runtime.prefix_args.iter().rev() {
+                spec.args.insert(0, arg.clone());
+            }
+            spec.env.push((
+                OsString::from("PI_CODING_AGENT_DIR"),
+                self.agent_dir.as_os_str().to_os_string(),
+            ));
+            // Scope the settings filter to Local Studio's own settings so
+            // model/list does not inherit the user's standalone ~/.pi
+            // enabledModels list (which would filter out Local Studio's
+            // controller catalog).
+            spec.env.push((
+                OsString::from("PI_AGENT_SETTINGS_PATH"),
+                self.agent_dir.join("settings.json").into_os_string(),
+            ));
+            for (key, value) in &self.runtime.env {
+                spec.env.push((key.clone(), value.clone()));
+            }
+        }
+        self.inner.launch(spec)
+    }
 }
 
 fn resolve_program(configured: &str, env: &LaunchEnvironment) -> Option<PathBuf> {
