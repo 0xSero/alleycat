@@ -8,7 +8,6 @@ mod cli;
 mod config;
 mod daemon;
 mod framing;
-pub mod grants;
 mod host;
 mod ipc;
 mod local_studio;
@@ -136,8 +135,6 @@ enum Command {
     Restart,
     /// Inspect agents.
     Agents(cli::agents::AgentsArgs),
-    /// Manage caller-scoped Local Studio access on this computer.
-    LocalStudio(cli::local_studio::LocalStudioArgs),
     /// Install or update the exact Local Studio controller on this computer.
     Studio(cli::studio::StudioArgs),
     /// Connect to the daemon over iroh like a phone client and run JSON-RPC
@@ -203,10 +200,6 @@ async fn async_main() -> anyhow::Result<()> {
         Some(Command::Agents(args)) => {
             init_cli_logging();
             cli::agents::run(args).await
-        }
-        Some(Command::LocalStudio(args)) => {
-            init_cli_logging();
-            cli::local_studio::run(args).await
         }
         Some(Command::Studio(args)) => {
             init_cli_logging();

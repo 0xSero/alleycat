@@ -5,8 +5,6 @@
 
 use serde::{Deserialize, Serialize};
 
-use alleycat_local_studio_proto::Capability;
-
 use crate::protocol::{AgentInfo, PairPayload};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -24,28 +22,6 @@ pub enum Request {
     Stop,
     /// Agent introspection.
     AgentsList,
-    /// List host-owned Local Studio paired-node grants.
-    LocalStudioGrantsList,
-    /// Grant only protocol-v1 `stats.read` to one authenticated endpoint ID.
-    LocalStudioGrantStatsRead {
-        endpoint_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expires_at: Option<String>,
-    },
-    /// Grant an explicit non-empty set from the closed protocol-v1 capability enum.
-    LocalStudioGrantCapabilities {
-        endpoint_id: String,
-        capabilities: Vec<Capability>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        expires_at: Option<String>,
-    },
-    /// Revoke protocol-v1 `stats.read` for one authenticated endpoint ID.
-    LocalStudioRevokeStatsRead { endpoint_id: String },
-    /// Revoke an explicit non-empty set from the closed protocol-v1 capability enum.
-    LocalStudioRevokeCapabilities {
-        endpoint_id: String,
-        capabilities: Vec<Capability>,
-    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,8 +91,6 @@ pub fn token_fingerprint(token: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
 
     #[test]
@@ -131,53 +105,6 @@ mod tests {
         let s = serde_json::to_string(&Request::Rotate).unwrap();
         let back: Request = serde_json::from_str(&s).unwrap();
         assert!(matches!(back, Request::Rotate));
-    }
-
-    #[test]
-    fn local_studio_grant_requests_are_closed_host_operations() {
-        let endpoint = "a".repeat(64);
-        let request = Request::LocalStudioGrantStatsRead {
-            endpoint_id: endpoint.clone(),
-            expires_at: Some("2026-07-21T12:00:00Z".into()),
-        };
-        let encoded = serde_json::to_value(&request).unwrap();
-        assert_eq!(encoded["op"], "local_studio_grant_stats_read");
-        assert_eq!(encoded["endpoint_id"], endpoint);
-        assert!(matches!(
-            serde_json::from_value::<Request>(encoded).unwrap(),
-            Request::LocalStudioGrantStatsRead { .. }
-        ));
-        assert_eq!(
-            serde_json::to_value(Request::LocalStudioRevokeStatsRead {
-                endpoint_id: "b".repeat(64)
-            })
-            .unwrap()["op"],
-            "local_studio_revoke_stats_read"
-        );
-
-        let explicit = Request::LocalStudioGrantCapabilities {
-            endpoint_id: "c".repeat(64),
-            capabilities: vec![Capability::StatsRead, Capability::SessionsRead],
-            expires_at: None,
-        };
-        let encoded = serde_json::to_value(explicit).unwrap();
-        assert_eq!(encoded["op"], "local_studio_grant_capabilities");
-        assert_eq!(
-            encoded["capabilities"],
-            json!(["stats.read", "sessions.read"])
-        );
-        assert!(matches!(
-            serde_json::from_value::<Request>(encoded).unwrap(),
-            Request::LocalStudioGrantCapabilities { .. }
-        ));
-        assert!(
-            serde_json::from_value::<Request>(json!({
-                "op": "local_studio_grant_capabilities",
-                "endpoint_id": "d".repeat(64),
-                "capabilities": ["all"]
-            }))
-            .is_err()
-        );
     }
 
     #[test]

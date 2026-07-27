@@ -554,7 +554,6 @@ impl AgentManager {
                 available,
                 presentation: Some(manifest.presentation()),
                 capabilities: Some(manifest.capabilities()),
-                local_studio: None,
             });
         }
         if self.local_studio_bridge.is_some() {
@@ -572,7 +571,6 @@ impl AgentManager {
                     aliases: Vec::new(),
                 }),
                 capabilities: Some(pi_manifest.capabilities()),
-                local_studio: None,
             });
         }
         out

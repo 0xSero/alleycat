@@ -12,7 +12,6 @@ members = [
     "crates/grok-bridge",
     "crates/droid-bridge",
     "crates/hermes-bridge",
-    "crates/local-studio-proto",
     "crates/pi-bridge",
     "crates/opencode-bridge",
     "crates/shell-bridge",
@@ -39,7 +38,6 @@ alleycat-devin-bridge = { path = "crates/devin-bridge", version = "0.1" }
 alleycat-grok-bridge = { path = "crates/grok-bridge", version = "0.1" }
 alleycat-droid-bridge = { path = "crates/droid-bridge", version = "0.1" }
 alleycat-hermes-bridge = { path = "crates/hermes-bridge", version = "0.1" }
-alleycat-local-studio-proto = { path = "crates/local-studio-proto", version = "0.1" }
 alleycat-opencode-bridge = { path = "crates/opencode-bridge", version = "0.1" }
 alleycat-pi-bridge = { path = "crates/pi-bridge", version = "0.1" }
 alleycat-shell-bridge = { path = "crates/shell-bridge", version = "0.1" }

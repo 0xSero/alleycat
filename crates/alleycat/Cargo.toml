@@ -33,7 +33,6 @@ alleycat-devin-bridge = { workspace = true }
 alleycat-grok-bridge = { workspace = true }
 alleycat-droid-bridge = { workspace = true }
 alleycat-hermes-bridge = { workspace = true }
-alleycat-local-studio-proto = { workspace = true }
 alleycat-opencode-bridge = { workspace = true }
 alleycat-pi-bridge = { workspace = true }
 alleycat-shell-bridge = { workspace = true }

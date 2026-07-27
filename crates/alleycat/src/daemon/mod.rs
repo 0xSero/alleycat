@@ -12,10 +12,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use alleycat_local_studio_proto::Capability;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
-use chrono::Utc;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -188,32 +186,6 @@ async fn dispatch(daemon: Arc<DaemonState>, request: Request) -> (Response, Opti
         Request::Rotate => (handle_rotate(&daemon).await, None),
         Request::Reload => (handle_reload(&daemon).await, None),
         Request::AgentsList => (handle_agents_list(&daemon).await, None),
-        Request::LocalStudioGrantsList => (handle_local_studio_grants_list(), None),
-        Request::LocalStudioGrantStatsRead {
-            endpoint_id,
-            expires_at,
-        } => (
-            handle_local_studio_grant_stats_read(endpoint_id, expires_at),
-            None,
-        ),
-        Request::LocalStudioGrantCapabilities {
-            endpoint_id,
-            capabilities,
-            expires_at,
-        } => (
-            handle_local_studio_grant_capabilities(endpoint_id, capabilities, expires_at),
-            None,
-        ),
-        Request::LocalStudioRevokeStatsRead { endpoint_id } => {
-            (handle_local_studio_revoke_stats_read(endpoint_id), None)
-        }
-        Request::LocalStudioRevokeCapabilities {
-            endpoint_id,
-            capabilities,
-        } => (
-            handle_local_studio_revoke_capabilities(endpoint_id, capabilities),
-            None,
-        ),
         Request::Stop => (Response::ok(), Some(PostResponse::Shutdown)),
     }
 }
@@ -283,82 +255,6 @@ async fn handle_agents_list(daemon: &DaemonState) -> Response {
     Response::ok_with(&agents).unwrap_or_else(|e| Response::err(e.to_string()))
 }
 
-fn handle_local_studio_grants_list() -> Response {
-    match crate::grants::GrantStore::load() {
-        Ok(store) => Response::ok_with(&store.document())
-            .unwrap_or_else(|error| Response::err(error.to_string())),
-        Err(_) => Response::err("Local Studio grant store is invalid"),
-    }
-}
-
-fn handle_local_studio_grant_stats_read(
-    endpoint_id: String,
-    expires_at: Option<String>,
-) -> Response {
-    handle_local_studio_grant_capabilities(endpoint_id, vec![Capability::StatsRead], expires_at)
-}
-
-fn handle_local_studio_grant_capabilities(
-    endpoint_id: String,
-    capabilities: Vec<Capability>,
-    expires_at: Option<String>,
-) -> Response {
-    let endpoint: iroh::EndpointId = match endpoint_id.parse::<iroh::EndpointId>() {
-        Ok(endpoint) if endpoint.to_string() == endpoint_id => endpoint,
-        _ => return Response::err("endpoint ID is invalid or non-canonical"),
-    };
-    let expiry = match expires_at {
-        Some(value) => match chrono::DateTime::parse_from_rfc3339(&value) {
-            Ok(expiry) if value.ends_with('Z') && expiry > Utc::now() => {
-                Some(expiry.with_timezone(&Utc))
-            }
-            _ => return Response::err("expiry must be a future RFC3339 UTC timestamp"),
-        },
-        None => None,
-    };
-    let mut store = match crate::grants::GrantStore::load() {
-        Ok(store) => store,
-        Err(_) => return Response::err("Local Studio grant store is invalid"),
-    };
-    if store
-        .grant_capabilities(endpoint, &capabilities, expiry)
-        .is_err()
-        || store.save().is_err()
-    {
-        return Response::err("could not persist Local Studio grant");
-    }
-    Response::ok_with(&store.document()).unwrap_or_else(|error| Response::err(error.to_string()))
-}
-
-fn handle_local_studio_revoke_stats_read(endpoint_id: String) -> Response {
-    handle_local_studio_revoke_capabilities(endpoint_id, vec![Capability::StatsRead])
-}
-
-fn handle_local_studio_revoke_capabilities(
-    endpoint_id: String,
-    capabilities: Vec<Capability>,
-) -> Response {
-    let endpoint: iroh::EndpointId = match endpoint_id.parse::<iroh::EndpointId>() {
-        Ok(endpoint) if endpoint.to_string() == endpoint_id => endpoint,
-        _ => return Response::err("endpoint ID is invalid or non-canonical"),
-    };
-    let mut store = match crate::grants::GrantStore::load() {
-        Ok(store) => store,
-        Err(_) => return Response::err("Local Studio grant store is invalid"),
-    };
-    match store.revoke_capabilities(&endpoint, &capabilities) {
-        Ok(true) => {}
-        Ok(false) => {
-            return Response::err("paired endpoint does not have the selected capability grant");
-        }
-        Err(_) => return Response::err("capability selection is invalid"),
-    }
-    if store.save().is_err() {
-        return Response::err("could not persist Local Studio revocation");
-    }
-    Response::ok_with(&store.document()).unwrap_or_else(|error| Response::err(error.to_string()))
-}
-
 async fn wait_for_signal(shutdown: Arc<Notify>) {
     #[cfg(unix)]
     {
@@ -393,66 +289,5 @@ struct RemoveOnDrop(PathBuf);
 impl Drop for RemoveOnDrop {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use alleycat_local_studio_proto::Capability;
-
-    use super::*;
-    use crate::test_support::TempHome;
-
-    #[test]
-    fn host_ipc_grant_and_revoke_are_persisted_and_default_deny() {
-        let _home = TempHome::new();
-        let endpoint = iroh::SecretKey::generate().public();
-        let other = iroh::SecretKey::generate().public();
-
-        let granted = handle_local_studio_grant_stats_read(endpoint.to_string(), None);
-        assert!(granted.ok);
-        let store = crate::grants::GrantStore::load().unwrap();
-        assert!(store.allows_capability(&endpoint, Capability::StatsRead, Utc::now()));
-        assert!(!store.allows_capability(&other, Capability::StatsRead, Utc::now()));
-
-        let session_granted = handle_local_studio_grant_capabilities(
-            endpoint.to_string(),
-            vec![Capability::SessionsRead],
-            None,
-        );
-        assert!(session_granted.ok);
-        let store = crate::grants::GrantStore::load().unwrap();
-        assert!(store.allows_capability(&endpoint, Capability::StatsRead, Utc::now()));
-        assert!(store.allows_capability(&endpoint, Capability::SessionsRead, Utc::now()));
-        assert!(!store.allows_capability(&other, Capability::SessionsRead, Utc::now()));
-
-        let listed = handle_local_studio_grants_list();
-        assert!(listed.ok);
-        assert_eq!(listed.data.unwrap()["nodes"].as_array().unwrap().len(), 1);
-
-        let session_revoked = handle_local_studio_revoke_capabilities(
-            endpoint.to_string(),
-            vec![Capability::SessionsRead],
-        );
-        assert!(session_revoked.ok);
-        let store = crate::grants::GrantStore::load().unwrap();
-        assert!(store.allows_capability(&endpoint, Capability::StatsRead, Utc::now()));
-        assert!(!store.allows_capability(&endpoint, Capability::SessionsRead, Utc::now()));
-
-        let revoked = handle_local_studio_revoke_stats_read(endpoint.to_string());
-        assert!(revoked.ok);
-        let store = crate::grants::GrantStore::load().unwrap();
-        assert!(!store.allows_capability(&endpoint, Capability::StatsRead, Utc::now()));
-    }
-
-    #[test]
-    fn malformed_grant_store_blocks_host_mutation() {
-        let _home = TempHome::new();
-        let path = crate::paths::paired_nodes_file().unwrap();
-        std::fs::write(&path, b"not-json").unwrap();
-        let endpoint = iroh::SecretKey::generate().public();
-        let response = handle_local_studio_grant_stats_read(endpoint.to_string(), None);
-        assert!(!response.ok);
-        assert_eq!(std::fs::read(&path).unwrap(), b"not-json");
     }
 }

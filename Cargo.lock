@@ -78,7 +78,6 @@ dependencies = [
  "alleycat-droid-bridge",
  "alleycat-grok-bridge",
  "alleycat-hermes-bridge",
- "alleycat-local-studio-proto",
  "alleycat-opencode-bridge",
  "alleycat-pi-bridge",
  "alleycat-shell-bridge",
@@ -323,17 +322,6 @@ dependencies = [
  "url",
  "uuid",
  "which",
-]
-
-[[package]]
-name = "alleycat-local-studio-proto"
-version = "0.1.0"
-dependencies = [
- "hex",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "thiserror 2.0.18",
 ]
 
 [[package]]
