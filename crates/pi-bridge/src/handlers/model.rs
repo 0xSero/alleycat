@@ -58,10 +58,18 @@ async fn fetch_models_via_pool(state: &Arc<ConnectionState>) -> Vec<PiAvailableM
         }
     };
     match fetch_models_from_handle(&handle).await {
-        Ok(models) => filter_models_by_enabled_models(filter_models_by_provider(
-            models,
-            state.model_provider_prefixes(),
-        )),
+        Ok(models) => {
+            // When a provider prefix is set (Local Studio), the catalog is
+            // already scoped to that provider's models.json. Skip the global
+            // enabledModels filter, which reads the daemon's ~/.pi settings
+            // and would incorrectly gate a foreign controller's catalog.
+            let prefixes = state.model_provider_prefixes();
+            if prefixes.is_empty() {
+                filter_models_by_enabled_models(filter_models_by_provider(models, prefixes))
+            } else {
+                filter_models_by_provider(models, prefixes)
+            }
+        }
         Err(err) => {
             tracing::warn!(%err, "model/list: get_available_models RPC failed");
             Vec::new()

@@ -492,6 +492,7 @@ impl AgentManager {
         match agent {
             "codex" => cfg.agents.codex.enabled,
             "pi" => cfg.agents.pi.enabled,
+            "local-studio" => self.bridges.contains_key(&AgentKind::LocalStudio),
             "amp" => cfg.agents.amp.enabled,
             "opencode" => cfg.agents.opencode.enabled,
             "claude" => cfg.agents.claude.enabled,
@@ -1547,6 +1548,14 @@ impl ProcessLauncher for LocalStudioLauncher {
             spec.env.push((
                 OsString::from("PI_CODING_AGENT_DIR"),
                 self.agent_dir.as_os_str().to_os_string(),
+            ));
+            // Scope the settings filter to Local Studio's own settings so
+            // model/list does not inherit the user's standalone ~/.pi
+            // enabledModels list (which would filter out Local Studio's
+            // controller catalog).
+            spec.env.push((
+                OsString::from("PI_AGENT_SETTINGS_PATH"),
+                self.agent_dir.join("settings.json").into_os_string(),
             ));
             for (key, value) in &self.runtime.env {
                 spec.env.push((key.clone(), value.clone()));
