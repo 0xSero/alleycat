@@ -10,6 +10,7 @@ mod daemon;
 mod framing;
 mod host;
 mod ipc;
+mod local_studio;
 mod paths;
 mod protocol;
 mod service;

@@ -84,6 +84,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "chrono",
  "clap",
  "directories",
  "fd-lock",

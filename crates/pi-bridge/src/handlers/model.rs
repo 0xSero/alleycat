@@ -58,7 +58,10 @@ async fn fetch_models_via_pool(state: &Arc<ConnectionState>) -> Vec<PiAvailableM
         }
     };
     match fetch_models_from_handle(&handle).await {
-        Ok(models) => filter_models_by_enabled_models(models),
+        Ok(models) => filter_models_by_enabled_models(filter_models_by_provider(
+            models,
+            state.model_provider_prefixes(),
+        )),
         Err(err) => {
             tracing::warn!(%err, "model/list: get_available_models RPC failed");
             Vec::new()
@@ -129,6 +132,24 @@ fn translate_pi_model(model: &PiAvailableModel, is_default: bool) -> p::Model {
         service_tiers: standard_service_tiers(),
         is_default,
     }
+}
+
+/// Filter models to those whose provider id starts with one of `prefixes`.
+/// Empty `prefixes` means the full catalog (no filtering).
+fn filter_models_by_provider(
+    models: Vec<PiAvailableModel>,
+    prefixes: &[String],
+) -> Vec<PiAvailableModel> {
+    if prefixes.is_empty() {
+        return models;
+    }
+    models
+        .into_iter()
+        .filter(|model| {
+            let provider = model.provider.as_deref().unwrap_or("");
+            prefixes.iter().any(|prefix| provider == prefix || provider.starts_with(&format!("{prefix}-")))
+        })
+        .collect()
 }
 
 fn filter_models_by_enabled_models(models: Vec<PiAvailableModel>) -> Vec<PiAvailableModel> {
