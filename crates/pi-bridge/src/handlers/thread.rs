@@ -87,7 +87,11 @@ impl ThreadError {
 // thread/start
 // ============================================================================
 
-const INITIAL_SESSION_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+// A running Local Studio process can legitimately spend tens of seconds
+// refreshing a large persisted session index before it services get_state.
+// Keep the correlation slot alive long enough for that valid response instead
+// of discarding it at 30 seconds and leaving thread/start unusable.
+const INITIAL_SESSION_RPC_TIMEOUT: Duration = Duration::from_secs(120);
 const INITIAL_SESSION_CLAIM_ATTEMPTS: usize = 2;
 
 pub async fn handle_thread_start(
