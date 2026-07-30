@@ -128,6 +128,7 @@ pub struct PiBridgeBuilder {
     trust_persisted_cwd: bool,
     hydrator: Option<PiHydrator>,
     rpc_session_listing_only: bool,
+    defer_initial_hydration: bool,
     model_provider_prefixes: Vec<String>,
     model_catalog_path: Option<PathBuf>,
 }
@@ -165,6 +166,16 @@ impl PiBridgeBuilder {
 
     pub fn hydrator(mut self, hydrator: PiHydrator) -> Self {
         self.hydrator = Some(hydrator);
+        self
+    }
+
+    /// Open the persisted thread index immediately and reconcile the full Pi
+    /// session store in the background. Daemon embedders use this so a large
+    /// local history cannot block the control socket or trigger a launchd
+    /// restart loop. Direct bridge consumers retain synchronous hydration by
+    /// default.
+    pub fn defer_initial_hydration(mut self, enabled: bool) -> Self {
+        self.defer_initial_hydration = enabled;
         self
     }
 
@@ -256,8 +267,12 @@ impl PiBridgeBuilder {
                 }
             },
         };
-        let thread_index: Arc<ThreadIndex> =
-            ThreadIndex::open_and_hydrate_with(&codex_home, &hydrator).await?;
+        let defer_initial_hydration = self.defer_initial_hydration && hydrator.sessions.is_none();
+        let thread_index: Arc<ThreadIndex> = if defer_initial_hydration {
+            ThreadIndex::open(&codex_home).await?
+        } else {
+            ThreadIndex::open_and_hydrate_with(&codex_home, &hydrator).await?
+        };
         let scoped_model_provider = self.model_provider_prefixes.first().cloned();
         if let Some(model_provider) = scoped_model_provider.as_deref() {
             thread_index
@@ -286,6 +301,30 @@ impl PiBridgeBuilder {
         } else {
             None
         };
+        if defer_initial_hydration {
+            let index = Arc::clone(&thread_index);
+            let sessions_root = hydrator.override_dir.clone();
+            let model_provider = scoped_model_provider.clone();
+            tokio::spawn(async move {
+                match index.hydrate_from_pi_dir(sessions_root.as_deref()).await {
+                    Ok(added) => {
+                        if let Some(model_provider) = model_provider.as_deref()
+                            && let Err(error) =
+                                index.inner().set_all_model_providers(model_provider).await
+                        {
+                            tracing::warn!(
+                                %error,
+                                "failed to scope deferred pi session hydration"
+                            );
+                        }
+                        tracing::info!(added, "deferred pi session hydration completed");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "deferred pi session hydration failed");
+                    }
+                }
+            });
+        }
         let thread_index_handle: Arc<dyn ThreadIndexHandle> = thread_index;
 
         Ok(Arc::new(PiBridge {
