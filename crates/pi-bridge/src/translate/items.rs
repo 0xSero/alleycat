@@ -35,8 +35,104 @@ use crate::pool::pi_protocol::{
 use crate::translate::tool_call::{CodexToolKind, classify};
 use crate::translate::turn_terminal_state;
 
+#[derive(Debug, Clone)]
+pub(crate) enum SessionHistoryEntry {
+    Message(AgentMessage),
+    Compaction {
+        id: String,
+        timestamp_ms: Option<i64>,
+    },
+}
+
 /// Translate a flat pi message stream into the per-turn codex shape.
 pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
+    translate_messages_from(messages, 0)
+}
+
+/// Translate Pi's persisted JSONL history, preserving compaction markers that
+/// `get_messages` intentionally omits.
+pub(crate) fn translate_session_history(entries: &[SessionHistoryEntry]) -> Vec<Turn> {
+    let mut turns = Vec::new();
+    let mut messages = Vec::new();
+
+    for entry in entries {
+        match entry {
+            SessionHistoryEntry::Message(message) => messages.push(message.clone()),
+            SessionHistoryEntry::Compaction { id, timestamp_ms } => {
+                turns.extend(translate_messages_from(&messages, turns.len()));
+                messages.clear();
+
+                let turn_index = turns.len();
+                turns.push(Turn {
+                    id: format!("turn_{turn_index}"),
+                    items: vec![ThreadItem::ContextCompaction { id: id.clone() }],
+                    items_view: crate::codex_proto::default_items_view(),
+                    status: crate::codex_proto::TurnStatus::Completed,
+                    error: None,
+                    started_at: *timestamp_ms,
+                    completed_at: *timestamp_ms,
+                    duration_ms: Some(0),
+                });
+            }
+        }
+    }
+    turns.extend(translate_messages_from(&messages, turns.len()));
+    turns
+}
+
+/// Reinsert persisted compaction markers into a turn list translated from
+/// Pi's live `get_messages` response.
+///
+/// After compaction, `get_messages` intentionally exposes only the compacted
+/// active context, so its message count no longer matches the append-only
+/// JSONL journal. The journal remains authoritative for the marker itself,
+/// while the RPC response remains authoritative for the visible messages.
+pub(crate) fn merge_compaction_markers(
+    mut turns: Vec<Turn>,
+    entries: &[SessionHistoryEntry],
+) -> Vec<Turn> {
+    for entry in entries {
+        let SessionHistoryEntry::Compaction { id, timestamp_ms } = entry else {
+            continue;
+        };
+        if turns.iter().any(|turn| {
+            turn.items
+                .iter()
+                .any(|item| matches!(item, ThreadItem::ContextCompaction { id: item_id } if item_id == id))
+        }) {
+            continue;
+        }
+
+        let insertion_index = timestamp_ms
+            .and_then(|marker_timestamp| {
+                turns.iter().position(|turn| {
+                    turn.started_at
+                        .is_some_and(|started_at| started_at > marker_timestamp)
+                })
+            })
+            .unwrap_or(turns.len());
+        turns.insert(
+            insertion_index,
+            Turn {
+                id: String::new(),
+                items: vec![ThreadItem::ContextCompaction { id: id.clone() }],
+                items_view: crate::codex_proto::default_items_view(),
+                status: crate::codex_proto::TurnStatus::Completed,
+                error: None,
+                started_at: *timestamp_ms,
+                completed_at: *timestamp_ms,
+                duration_ms: Some(0),
+            },
+        );
+    }
+
+    for (index, turn) in turns.iter_mut().enumerate() {
+        turn.id = format!("turn_{index}");
+    }
+    turns
+}
+
+fn translate_messages_from(messages: &[AgentMessage], turn_offset: usize) -> Vec<Turn> {
     let tool_results = index_tool_results(messages);
 
     let mut turns: Vec<Turn> = Vec::new();
@@ -61,6 +157,7 @@ pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
                 } else {
                     flush_turn(
                         &mut turns,
+                        turn_offset,
                         &mut current_items,
                         &mut current_started_at,
                         &mut current_completed_at,
@@ -73,7 +170,11 @@ pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
                     user_index = 0;
                     saw_assistant_or_tool = false;
                 }
-                current_items.push(user_message_to_item(user, turns.len(), user_index));
+                current_items.push(user_message_to_item(
+                    user,
+                    turn_offset + turns.len(),
+                    user_index,
+                ));
             }
             AgentMessage::Assistant(asst) => {
                 saw_assistant_or_tool = true;
@@ -83,7 +184,7 @@ pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
                 current_completed_at = Some(asst.timestamp);
                 current_stop_reason = Some(asst.stop_reason);
                 current_error_message = asst.error_message.clone();
-                let turn_index = turns.len();
+                let turn_index = turn_offset + turns.len();
                 push_assistant_items(
                     asst,
                     turn_index,
@@ -110,6 +211,7 @@ pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
 
     flush_turn(
         &mut turns,
+        turn_offset,
         &mut current_items,
         &mut current_started_at,
         &mut current_completed_at,
@@ -121,6 +223,7 @@ pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
 
 fn flush_turn(
     turns: &mut Vec<Turn>,
+    turn_offset: usize,
     items: &mut Vec<ThreadItem>,
     started_at: &mut Option<i64>,
     completed_at: &mut Option<i64>,
@@ -139,7 +242,7 @@ fn flush_turn(
     let message = error_message.take();
     let (status, error) = turn_terminal_state(stop_reason.take(), message.as_deref());
     turns.push(Turn {
-        id: format!("turn_{}", turns.len()),
+        id: format!("turn_{}", turn_offset + turns.len()),
         items: std::mem::take(items),
         items_view: crate::codex_proto::default_items_view(),
         status,
@@ -576,6 +679,57 @@ mod tests {
     #[test]
     fn empty_input_yields_no_turns() {
         assert!(translate_messages(&[]).is_empty());
+    }
+
+    #[test]
+    fn persisted_compaction_stays_between_surrounding_turns() {
+        let before = user(UserMessageContent::Text("before".into()), 100);
+        let after = user(UserMessageContent::Text("after".into()), 300);
+        let turns = translate_session_history(&[
+            SessionHistoryEntry::Message(before),
+            SessionHistoryEntry::Compaction {
+                id: "compact-1".into(),
+                timestamp_ms: Some(200),
+            },
+            SessionHistoryEntry::Message(after),
+        ]);
+
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].id, "turn_0");
+        assert_eq!(turns[0].items[0].id(), "user_0");
+        assert_eq!(turns[1].id, "turn_1");
+        assert!(matches!(
+            &turns[1].items[0],
+            ThreadItem::ContextCompaction { id } if id == "compact-1"
+        ));
+        assert_eq!(turns[1].started_at, Some(200));
+        assert_eq!(turns[2].id, "turn_2");
+        assert_eq!(turns[2].items[0].id(), "user_2");
+    }
+
+    #[test]
+    fn compacted_rpc_history_merges_persisted_marker_by_timestamp() {
+        let before = user(UserMessageContent::Text("before".into()), 100);
+        let before_reply = assistant_with_blocks(Vec::new(), 150);
+        let after = user(UserMessageContent::Text("after".into()), 300);
+        let after_reply = assistant_with_blocks(Vec::new(), 350);
+        let rpc_turns = translate_messages(&[before, before_reply, after, after_reply]);
+        let turns = merge_compaction_markers(
+            rpc_turns,
+            &[SessionHistoryEntry::Compaction {
+                id: "compact-1".into(),
+                timestamp_ms: Some(200),
+            }],
+        );
+
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].id, "turn_0");
+        assert_eq!(turns[1].id, "turn_1");
+        assert!(matches!(
+            &turns[1].items[0],
+            ThreadItem::ContextCompaction { id } if id == "compact-1"
+        ));
+        assert_eq!(turns[2].id, "turn_2");
     }
 
     #[test]

@@ -307,6 +307,7 @@ impl AgentManager {
         let mut pi_builder = PiBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.pi.bin))
             .launcher(pi_launcher)
+            .defer_initial_hydration(true)
             .codex_home(bridge_state.pi.clone());
         if let Some(agent_dir) = pi_agent_dir {
             pi_builder = pi_builder.hydrator(PiHydrator::with_override(agent_dir.join("sessions")));
@@ -336,6 +337,7 @@ impl AgentManager {
             let builder = PiBridge::builder()
                 .agent_bin(runtime.program)
                 .launcher(studio_launcher)
+                .defer_initial_hydration(true)
                 .hydrator(PiHydrator::with_override(agent_dir.join("sessions")))
                 .model_provider_prefix("local-studio")
                 .model_catalog_path(agent_dir.join("models.json"))
