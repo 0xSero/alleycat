@@ -42,7 +42,7 @@ use crate::index::{ListFilter, ListSort};
 use crate::pool::pi_protocol as pi;
 use crate::pool::{PiProcessHandle, PoolError};
 use crate::state::ConnectionState;
-use crate::translate::items::translate_messages;
+use crate::translate::items::{SessionHistoryEntry, translate_messages, translate_session_history};
 
 /// Errors a `thread/*` handler can produce. Mapped onto JSON-RPC error
 /// codes by the dispatcher in main.rs.
@@ -270,7 +270,7 @@ pub async fn handle_thread_resume(
 
     let mut thread = thread_from_entry(&entry);
     if !params.exclude_turns {
-        thread.turns = fetch_turns(&handle).await?;
+        thread.turns = fetch_turns(&handle, &entry.metadata.pi_session_path).await?;
     }
     apply_live_turn_state(
         &mut thread,
@@ -389,7 +389,7 @@ pub async fn handle_thread_fork(
 
     let mut thread = thread_from_entry(&entry);
     if !params.exclude_turns {
-        thread.turns = fetch_turns(&handle).await?;
+        thread.turns = fetch_turns(&handle, &entry.metadata.pi_session_path).await?;
     }
     apply_live_turn_state(
         &mut thread,
@@ -545,16 +545,28 @@ pub async fn handle_thread_compact_start(
         .await
         .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
 
-    // Fire pi `compact{}`. Pi runs the compaction asynchronously and
-    // emits `compaction_start` / `compaction_end` events; the turn
-    // pump (#15) translates those into codex `thread/compacted` +
-    // `ContextCompaction` items, so this handler returns success
-    // immediately after pi acks the command preflight.
-    let resp = handle
+    // A normal turn's event pump exits at `agent_end`, so manual compaction
+    // needs its own short-lived subscriber. Subscribe before sending the
+    // command: Pi can emit both lifecycle events before its command response.
+    let events_rx = handle.subscribe_events();
+    let pump = super::turn::spawn_compaction_event_pump(
+        state.clone(),
+        params.thread_id.clone(),
+        Uuid::now_v7().to_string(),
+        events_rx,
+    );
+    let resp = match handle
         .send_request(pi::RpcCommand::Compact(pi::CompactCmd::default()))
         .await
-        .map_err(|e| ThreadError::PiRpc(e.to_string()))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            pump.abort();
+            return Err(ThreadError::PiRpc(error.to_string()));
+        }
+    };
     if !resp.success {
+        pump.abort();
         return Err(ThreadError::PiRpc(
             resp.error.unwrap_or_else(|| "compact failed".into()),
         ));
@@ -654,7 +666,7 @@ pub async fn handle_thread_rollback(
         .map_err(ThreadError::from)?;
 
     let mut thread = thread_from_entry(&updated);
-    thread.turns = fetch_turns(&handle).await?;
+    thread.turns = fetch_turns(&handle, &updated.metadata.pi_session_path).await?;
     apply_live_turn_state(
         &mut thread,
         super::turn::active_turn_id(&params.thread_id).as_deref(),
@@ -819,7 +831,7 @@ pub async fn handle_thread_read(
                 h
             }
         };
-        thread.turns = fetch_turns(&handle).await?;
+        thread.turns = fetch_turns(&handle, &entry.metadata.pi_session_path).await?;
     }
     apply_live_turn_state(
         &mut thread,
@@ -871,7 +883,7 @@ pub async fn handle_thread_turns_list(
         }
     };
 
-    let mut turns = fetch_turns(&handle).await?;
+    let mut turns = fetch_turns(&handle, &entry.metadata.pi_session_path).await?;
     apply_live_turn_to_turns(
         &mut turns,
         super::turn::active_turn_id(&params.thread_id).as_deref(),
@@ -1379,7 +1391,10 @@ async fn leaf_user_entry_id(handle: &Arc<PiProcessHandle>) -> Result<String, Thr
         })
 }
 
-async fn fetch_turns(handle: &Arc<PiProcessHandle>) -> Result<Vec<p::Turn>, ThreadError> {
+async fn fetch_turns(
+    handle: &Arc<PiProcessHandle>,
+    session_path: &Path,
+) -> Result<Vec<p::Turn>, ThreadError> {
     let resp = handle
         .send_request(pi::RpcCommand::GetMessages(pi::BareCmd::default()))
         .await
@@ -1394,7 +1409,48 @@ async fn fetch_turns(handle: &Arc<PiProcessHandle>) -> Result<Vec<p::Turn>, Thre
             .ok_or_else(|| ThreadError::PiRpc("missing messages data".into()))?,
     )
     .map_err(|e| ThreadError::PiRpc(format!("decode messages: {e}")))?;
-    Ok(translate_messages(&data.messages))
+    let fallback = || translate_messages(&data.messages);
+    let Ok(raw) = tokio::fs::read_to_string(session_path).await else {
+        return Ok(fallback());
+    };
+    let history = parse_session_history(&raw);
+    let message_count = history
+        .iter()
+        .filter(|entry| matches!(entry, SessionHistoryEntry::Message(_)))
+        .count();
+    if message_count != data.messages.len() {
+        tracing::warn!(
+            session_path = %session_path.display(),
+            journal_messages = message_count,
+            rpc_messages = data.messages.len(),
+            "persisted session history did not match get_messages; using RPC history"
+        );
+        return Ok(fallback());
+    }
+    Ok(translate_session_history(&history))
+}
+
+fn parse_session_history(raw: &str) -> Vec<SessionHistoryEntry> {
+    raw.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(
+            |entry| match entry.get("type").and_then(|value| value.as_str()) {
+                Some("message") => serde_json::from_value(entry.get("message")?.clone())
+                    .ok()
+                    .map(SessionHistoryEntry::Message),
+                Some("compaction") => {
+                    let id = entry.get("id")?.as_str()?.to_string();
+                    let timestamp_ms = entry
+                        .get("timestamp")
+                        .and_then(|value| value.as_str())
+                        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                        .map(|value| value.timestamp_millis());
+                    Some(SessionHistoryEntry::Compaction { id, timestamp_ms })
+                }
+                _ => None,
+            },
+        )
+        .collect()
 }
 
 /// Default `permissionProfile` value matching codex's stock emission when no
@@ -1445,6 +1501,21 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tokio::sync::mpsc;
+
+    #[test]
+    fn session_history_parser_keeps_compaction_metadata() {
+        let history = parse_session_history(
+            r#"{"type":"compaction","id":"compact-1","timestamp":"2026-07-31T02:18:16.306Z","summary":"done"}"#,
+        );
+        assert_eq!(history.len(), 1);
+        assert!(matches!(
+            &history[0],
+            SessionHistoryEntry::Compaction {
+                id,
+                timestamp_ms: Some(_)
+            } if id == "compact-1"
+        ));
+    }
 
     async fn dummy_state() -> (
         Arc<ConnectionState>,

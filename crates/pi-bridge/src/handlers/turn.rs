@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex as SyncMutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -538,6 +538,55 @@ fn spawn_event_pump(args: EventPumpArgs) {
     tokio::spawn(async move {
         run_event_pump(args).await;
     });
+}
+
+pub(crate) fn spawn_compaction_event_pump(
+    state: Arc<ConnectionState>,
+    thread_id: String,
+    turn_id: String,
+    mut events_rx: broadcast::Receiver<pi::PiEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut translator = EventTranslatorState::new(thread_id.clone(), turn_id);
+        loop {
+            let event = match tokio::time::timeout(Duration::from_secs(300), events_rx.recv()).await
+            {
+                Err(_) => {
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        "compaction event pump timed out waiting for lifecycle completion"
+                    );
+                    return;
+                }
+                Ok(result) => match result {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(count)) => {
+                        tracing::warn!(
+                            thread_id = %thread_id,
+                            "compaction event pump lagged by {count} events"
+                        );
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+            };
+
+            let finished = matches!(event, pi::PiEvent::CompactionEnd { .. });
+            if matches!(
+                event,
+                pi::PiEvent::CompactionStart { .. } | pi::PiEvent::CompactionEnd { .. }
+            ) {
+                for notification in translator.translate(event) {
+                    if state_should_emit(&state, &notification) {
+                        let _ = state.send(notification_frame(notification));
+                    }
+                }
+            }
+            if finished {
+                return;
+            }
+        }
+    })
 }
 
 async fn run_event_pump(mut args: EventPumpArgs) {
