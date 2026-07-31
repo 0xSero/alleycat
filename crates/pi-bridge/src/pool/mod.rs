@@ -221,24 +221,6 @@ impl PiPool {
         self.spawn_with_capacity_check(synthetic_id, &cwd).await
     }
 
-    /// Acquire a short-lived utility process that may safely switch sessions
-    /// without mutating a process still owned by another thread id.
-    ///
-    /// The returned id must be passed to [`Self::release`] when the operation
-    /// ends. The process starts active so capacity enforcement cannot evict it
-    /// while the caller is switching or reading its session.
-    pub async fn acquire_isolated_utility(
-        &self,
-        cwd: impl AsRef<Path>,
-    ) -> Result<(ThreadId, Arc<PiProcessHandle>), PoolError> {
-        let synthetic_id = format!("utility_session_{}", Uuid::now_v7());
-        let handle = self
-            .spawn_with_capacity_check(synthetic_id.clone(), cwd.as_ref())
-            .await?;
-        self.mark_active(&synthetic_id).await;
-        Ok((synthetic_id, handle))
-    }
-
     /// Look up the pi process that owns `thread_id`, refreshing its
     /// last-active timestamp so the reaper won't pick it up immediately.
     pub async fn get(&self, thread_id: &str) -> Option<Arc<PiProcessHandle>> {
@@ -405,37 +387,6 @@ mod tests {
             &pool.get("thread-1").await.expect("retagged process"),
             &warm
         ));
-    }
-
-    #[tokio::test]
-    async fn isolated_utility_release_does_not_touch_thread_process() {
-        let pool = fake_pi_pool(8, Duration::from_secs(60));
-        let thread = track_dummy(&pool, "thread-1", "/repo").await;
-        let (writer_tx, _writer_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (events_tx, _) = tokio::sync::broadcast::channel(1);
-        let isolated = Arc::new(PiProcessHandle::__test_dangling(
-            writer_tx,
-            events_tx,
-            PathBuf::from("/repo"),
-        ));
-        let isolated_id = "utility_session_test".to_string();
-        pool.inner
-            .track_new(
-                isolated_id.clone(),
-                PathBuf::from("/repo"),
-                isolated.clone(),
-            )
-            .await
-            .unwrap();
-        pool.mark_active(&isolated_id).await;
-
-        assert!(!Arc::ptr_eq(&isolated, &thread));
-        assert!(Arc::ptr_eq(
-            &pool.get("thread-1").await.expect("thread remains tracked"),
-            &thread
-        ));
-        pool.release(&isolated_id).await;
-        assert!(pool.get(&isolated_id).await.is_none());
     }
 
     #[tokio::test]
