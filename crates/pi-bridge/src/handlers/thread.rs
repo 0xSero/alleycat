@@ -108,7 +108,10 @@ pub async fn handle_thread_start(
     // down with `new_session`, which repeats runtime/resource initialization.
     let (thread_id, handle, initial_pi_state) = acquire_clean_initial_session(state, &cwd).await?;
 
-    let requested_model = params.model.clone().or_else(|| defaults.model.clone());
+    let requested_model = match params.model.clone().or_else(|| defaults.model.clone()) {
+        Some(model) => Some(model),
+        None => super::model::active_controller_model(state).await,
+    };
     let requested_provider = model_provider_override(
         requested_model.as_deref(),
         params.model_provider.as_deref(),
@@ -334,19 +337,13 @@ pub async fn handle_thread_fork(
         .lookup(&params.thread_id)
         .await
         .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
-    let cwd = PathBuf::from(&source.cwd);
-
     // Acquire (or reuse) a pi process bound to the source's cwd, switch
     // it to the source session, find the leaf user-message entry id, and
     // ask pi to fork. The new session path comes back inside pi's
     // session state — we read it via `get_state` after the fork lands.
     let handle = match state.pi_pool().get(&params.thread_id).await {
         Some(h) => h,
-        None => state
-            .pi_pool()
-            .acquire_utility(Some(&cwd))
-            .await
-            .map_err(ThreadError::pool)?,
+        None => load_or_resume_handle(state, &params.thread_id, &source).await?,
     };
     switch_handle_to(&handle, &source.metadata.pi_session_path).await?;
 
@@ -595,14 +592,9 @@ pub async fn handle_thread_rollback(
         .lookup(&params.thread_id)
         .await
         .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
-    let cwd = PathBuf::from(&entry.cwd);
     let handle = match state.pi_pool().get(&params.thread_id).await {
         Some(h) => h,
-        None => state
-            .pi_pool()
-            .acquire_utility(Some(&cwd))
-            .await
-            .map_err(ThreadError::pool)?,
+        None => load_or_resume_handle(state, &params.thread_id, &entry).await?,
     };
     switch_handle_to(&handle, &entry.metadata.pi_session_path).await?;
 
@@ -816,38 +808,15 @@ pub async fn handle_thread_read(
     if params.include_turns {
         // A live Pi process serializes RPC requests while a prompt is active,
         // so asking it for messages would block a second client until the
-        // turn completed. Read the append-only session through a utility Pi
-        // during an active turn, then project the in-progress state below.
-        let handle = if active_turn_id.is_some() {
-            let cwd =
-                resume_cwd_or_fallback(&entry.cwd, &params.thread_id, state.trust_persisted_cwd());
-            let h = state
-                .pi_pool()
-                .acquire_utility(Some(&cwd))
-                .await
-                .map_err(ThreadError::pool)?;
-            switch_handle_to(&h, &entry.metadata.pi_session_path).await?;
-            h
+        // turn completed. Its journal is append-only, so read that directly
+        // during an active turn instead of switching any other Pi process to
+        // this session.
+        if active_turn_id.is_some() {
+            thread.turns = fetch_persisted_turns(&entry.metadata.pi_session_path).await;
         } else {
-            match state.pi_pool().get(&params.thread_id).await {
-                Some(h) => h,
-                None => {
-                    let cwd = resume_cwd_or_fallback(
-                        &entry.cwd,
-                        &params.thread_id,
-                        state.trust_persisted_cwd(),
-                    );
-                    let h = state
-                        .pi_pool()
-                        .acquire_utility(Some(&cwd))
-                        .await
-                        .map_err(ThreadError::pool)?;
-                    switch_handle_to(&h, &entry.metadata.pi_session_path).await?;
-                    h
-                }
-            }
-        };
-        thread.turns = fetch_turns(&handle, &entry.metadata.pi_session_path).await?;
+            let handle = load_or_resume_handle(state, &params.thread_id, &entry).await?;
+            thread.turns = fetch_turns(&handle, &entry.metadata.pi_session_path).await?;
+        }
     }
     apply_live_turn_state(&mut thread, active_turn_id.as_deref());
     Ok(p::ThreadReadResponse { thread })
@@ -883,17 +852,7 @@ pub async fn handle_thread_turns_list(
 
     let handle = match state.pi_pool().get(&params.thread_id).await {
         Some(h) => h,
-        None => {
-            let cwd =
-                resume_cwd_or_fallback(&entry.cwd, &params.thread_id, state.trust_persisted_cwd());
-            let h = state
-                .pi_pool()
-                .acquire_utility(Some(&cwd))
-                .await
-                .map_err(ThreadError::pool)?;
-            switch_handle_to(&h, &entry.metadata.pi_session_path).await?;
-            h
-        }
+        None => load_or_resume_handle(state, &params.thread_id, &entry).await?,
     };
 
     let mut turns = fetch_turns(&handle, &entry.metadata.pi_session_path).await?;
@@ -1075,13 +1034,24 @@ fn apply_live_turn_state(thread: &mut p::Thread, active_turn_id: Option<&str>) {
     apply_live_turn_to_turns(&mut thread.turns, Some(active_turn_id));
 }
 
-fn apply_live_turn_to_turns(turns: &mut [p::Turn], active_turn_id: Option<&str>) {
+fn apply_live_turn_to_turns(turns: &mut Vec<p::Turn>, active_turn_id: Option<&str>) {
     let Some(active_turn_id) = active_turn_id else {
         return;
     };
-    let Some(turn) = turns.last_mut() else {
+    if turns.is_empty() {
+        turns.push(p::Turn {
+            id: active_turn_id.to_string(),
+            items: Vec::new(),
+            items_view: p::default_items_view(),
+            status: p::TurnStatus::InProgress,
+            error: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+        });
         return;
-    };
+    }
+    let turn = turns.last_mut().expect("turn exists after empty guard");
     turn.id = active_turn_id.to_string();
     turn.status = p::TurnStatus::InProgress;
     turn.error = None;
@@ -1441,6 +1411,13 @@ async fn fetch_turns(
         return Ok(merge_compaction_markers(fallback(), &history));
     }
     Ok(translate_session_history(&history))
+}
+
+async fn fetch_persisted_turns(session_path: &Path) -> Vec<p::Turn> {
+    let Ok(raw) = tokio::fs::read_to_string(session_path).await else {
+        return Vec::new();
+    };
+    translate_session_history(&parse_session_history(&raw))
 }
 
 fn parse_session_history(raw: &str) -> Vec<SessionHistoryEntry> {
@@ -1837,6 +1814,20 @@ mod tests {
         assert!(matches!(turn.status, p::TurnStatus::InProgress));
         assert!(turn.completed_at.is_none());
         assert!(turn.duration_ms.is_none());
+    }
+
+    #[test]
+    fn live_turn_state_synthesizes_an_in_progress_turn_before_journal_flush() {
+        let entry = sample_entry("active-thread");
+        let mut thread = thread_from_entry(&entry);
+
+        apply_live_turn_state(&mut thread, Some("live-turn-id"));
+
+        assert!(matches!(thread.status, p::ThreadStatus::Active { .. }));
+        assert_eq!(thread.turns.len(), 1);
+        let turn = &thread.turns[0];
+        assert_eq!(turn.id, "live-turn-id");
+        assert!(matches!(turn.status, p::TurnStatus::InProgress));
     }
 
     #[test]
