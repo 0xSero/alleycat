@@ -11,8 +11,10 @@
 //!
 //! Identity: reads the daemon's local `host.toml` + `host.key` so the probe
 //! authenticates with the same node id and token a phone holding the QR
-//! payload would. Generates a fresh client iroh identity each run.
+//! payload would. Generates a fresh client iroh identity each run unless a
+//! persistent `--client-key-file` is supplied.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -99,6 +101,12 @@ pub struct ProbeArgs {
     /// existing session and exercise replay/drift paths.
     #[arg(long)]
     pub repeat_resume_from: Option<u64>,
+    /// Persist the probe's client identity at this path. Reusing the same
+    /// file across invocations simulates reconnects from one paired phone;
+    /// without this option each probe invocation intentionally uses a fresh
+    /// identity.
+    #[arg(long, value_name = "PATH")]
+    pub client_key_file: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -143,7 +151,7 @@ pub async fn run(args: ProbeArgs) -> anyhow::Result<()> {
         relay.as_deref().unwrap_or("<iroh default>")
     );
 
-    let endpoint = build_client_endpoint().await?;
+    let endpoint = build_client_endpoint(args.client_key_file.as_deref()).await?;
     let result = probe_with_endpoint(&endpoint, node_id, relay.as_deref(), &token, &args).await;
     endpoint.close().await;
     result
@@ -758,8 +766,15 @@ fn print_inbound(value: &Value) {
     println!("← {pretty}");
 }
 
-async fn build_client_endpoint() -> anyhow::Result<Endpoint> {
-    let secret = SecretKey::generate();
+async fn build_client_endpoint(
+    client_key_file: Option<&std::path::Path>,
+) -> anyhow::Result<Endpoint> {
+    let secret = match client_key_file {
+        Some(path) => crate::state::load_or_create_secret_key_at(path)
+            .await
+            .with_context(|| format!("loading probe client identity {}", path.display()))?,
+        None => SecretKey::generate(),
+    };
     Endpoint::builder(presets::N0)
         .secret_key(secret)
         .alpns(vec![ALLEYCAT_ALPN.to_vec()])
