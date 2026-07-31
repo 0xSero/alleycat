@@ -38,10 +38,13 @@ pub async fn handle_model_list(
     _params: p::ModelListParams,
 ) -> p::ModelListResponse {
     let pi_models = fetch_models_via_pool(state).await;
+    let default_index = pi_models.iter().position(|model| model.active == Some(true));
     let data = pi_models
         .into_iter()
         .enumerate()
-        .map(|(idx, model)| translate_pi_model(&model, idx == 0))
+        .map(|(idx, model)| {
+            translate_pi_model(&model, default_index.map_or(idx == 0, |default| idx == default))
+        })
         .collect();
     p::ModelListResponse {
         data,
@@ -409,6 +412,8 @@ struct PiAvailableModel {
     label: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    active: Option<bool>,
     /// Free-form modalities list pi exposes (`text`, `image`, etc.). We
     /// pass through verbatim and let codex pick what it understands.
     #[serde(default, alias = "input")]
@@ -504,6 +509,35 @@ mod tests {
         assert_eq!(parsed[0].provider.as_deref(), Some("anthropic"));
         assert_eq!(parsed[0].model_id.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(parsed[1].id.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn active_catalog_model_becomes_the_default() {
+        let models = vec![
+            PiAvailableModel {
+                id: Some("inactive".into()),
+                active: Some(false),
+                ..Default::default()
+            },
+            PiAvailableModel {
+                id: Some("running".into()),
+                active: Some(true),
+                ..Default::default()
+            },
+        ];
+        let default_index = models.iter().position(|model| model.active == Some(true));
+        let translated = models
+            .iter()
+            .enumerate()
+            .map(|(index, model)| {
+                translate_pi_model(
+                    model,
+                    default_index.map_or(index == 0, |default| index == default),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!translated[0].is_default);
+        assert!(translated[1].is_default);
     }
 
     #[test]
