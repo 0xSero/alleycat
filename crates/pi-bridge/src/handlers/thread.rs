@@ -334,19 +334,13 @@ pub async fn handle_thread_fork(
         .lookup(&params.thread_id)
         .await
         .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
-    let cwd = PathBuf::from(&source.cwd);
-
     // Acquire (or reuse) a pi process bound to the source's cwd, switch
     // it to the source session, find the leaf user-message entry id, and
     // ask pi to fork. The new session path comes back inside pi's
     // session state — we read it via `get_state` after the fork lands.
     let handle = match state.pi_pool().get(&params.thread_id).await {
         Some(h) => h,
-        None => state
-            .pi_pool()
-            .acquire_utility(Some(&cwd))
-            .await
-            .map_err(ThreadError::pool)?,
+        None => load_or_resume_handle(state, &params.thread_id, &source).await?,
     };
     switch_handle_to(&handle, &source.metadata.pi_session_path).await?;
 
@@ -595,14 +589,9 @@ pub async fn handle_thread_rollback(
         .lookup(&params.thread_id)
         .await
         .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
-    let cwd = PathBuf::from(&entry.cwd);
     let handle = match state.pi_pool().get(&params.thread_id).await {
         Some(h) => h,
-        None => state
-            .pi_pool()
-            .acquire_utility(Some(&cwd))
-            .await
-            .map_err(ThreadError::pool)?,
+        None => load_or_resume_handle(state, &params.thread_id, &entry).await?,
     };
     switch_handle_to(&handle, &entry.metadata.pi_session_path).await?;
 
@@ -818,36 +807,25 @@ pub async fn handle_thread_read(
         // so asking it for messages would block a second client until the
         // turn completed. Read the append-only session through a utility Pi
         // during an active turn, then project the in-progress state below.
-        let handle = if active_turn_id.is_some() {
+        if active_turn_id.is_some() {
             let cwd =
                 resume_cwd_or_fallback(&entry.cwd, &params.thread_id, state.trust_persisted_cwd());
-            let h = state
+            let (utility_id, utility) = state
                 .pi_pool()
-                .acquire_utility(Some(&cwd))
+                .acquire_isolated_utility(&cwd)
                 .await
                 .map_err(ThreadError::pool)?;
-            switch_handle_to(&h, &entry.metadata.pi_session_path).await?;
-            h
-        } else {
-            match state.pi_pool().get(&params.thread_id).await {
-                Some(h) => h,
-                None => {
-                    let cwd = resume_cwd_or_fallback(
-                        &entry.cwd,
-                        &params.thread_id,
-                        state.trust_persisted_cwd(),
-                    );
-                    let h = state
-                        .pi_pool()
-                        .acquire_utility(Some(&cwd))
-                        .await
-                        .map_err(ThreadError::pool)?;
-                    switch_handle_to(&h, &entry.metadata.pi_session_path).await?;
-                    h
-                }
+            let turns = async {
+                switch_handle_to(&utility, &entry.metadata.pi_session_path).await?;
+                fetch_turns(&utility, &entry.metadata.pi_session_path).await
             }
-        };
-        thread.turns = fetch_turns(&handle, &entry.metadata.pi_session_path).await?;
+            .await;
+            state.pi_pool().release(&utility_id).await;
+            thread.turns = turns?;
+        } else {
+            let handle = load_or_resume_handle(state, &params.thread_id, &entry).await?;
+            thread.turns = fetch_turns(&handle, &entry.metadata.pi_session_path).await?;
+        }
     }
     apply_live_turn_state(&mut thread, active_turn_id.as_deref());
     Ok(p::ThreadReadResponse { thread })
@@ -883,17 +861,7 @@ pub async fn handle_thread_turns_list(
 
     let handle = match state.pi_pool().get(&params.thread_id).await {
         Some(h) => h,
-        None => {
-            let cwd =
-                resume_cwd_or_fallback(&entry.cwd, &params.thread_id, state.trust_persisted_cwd());
-            let h = state
-                .pi_pool()
-                .acquire_utility(Some(&cwd))
-                .await
-                .map_err(ThreadError::pool)?;
-            switch_handle_to(&h, &entry.metadata.pi_session_path).await?;
-            h
-        }
+        None => load_or_resume_handle(state, &params.thread_id, &entry).await?,
     };
 
     let mut turns = fetch_turns(&handle, &entry.metadata.pi_session_path).await?;
