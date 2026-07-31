@@ -42,7 +42,9 @@ use crate::index::{ListFilter, ListSort};
 use crate::pool::pi_protocol as pi;
 use crate::pool::{PiProcessHandle, PoolError};
 use crate::state::ConnectionState;
-use crate::translate::items::{SessionHistoryEntry, translate_messages, translate_session_history};
+use crate::translate::items::{
+    SessionHistoryEntry, merge_compaction_markers, translate_messages, translate_session_history,
+};
 
 /// Errors a `thread/*` handler can produce. Mapped onto JSON-RPC error
 /// codes by the dispatcher in main.rs.
@@ -810,33 +812,44 @@ pub async fn handle_thread_read(
         .ok_or_else(|| ThreadError::NotFound(params.thread_id.clone()))?;
 
     let mut thread = thread_from_entry(&entry);
+    let active_turn_id = super::turn::active_turn_id(&params.thread_id);
     if params.include_turns {
-        // Prefer the live process if one is running for this thread —
-        // it has the freshest state. Otherwise spawn a utility pi and
-        // switch it to the persisted JSONL to read the messages.
-        let handle = match state.pi_pool().get(&params.thread_id).await {
-            Some(h) => h,
-            None => {
-                let cwd = resume_cwd_or_fallback(
-                    &entry.cwd,
-                    &params.thread_id,
-                    state.trust_persisted_cwd(),
-                );
-                let h = state
-                    .pi_pool()
-                    .acquire_utility(Some(&cwd))
-                    .await
-                    .map_err(ThreadError::pool)?;
-                switch_handle_to(&h, &entry.metadata.pi_session_path).await?;
-                h
+        // A live Pi process serializes RPC requests while a prompt is active,
+        // so asking it for messages would block a second client until the
+        // turn completed. Read the append-only session through a utility Pi
+        // during an active turn, then project the in-progress state below.
+        let handle = if active_turn_id.is_some() {
+            let cwd =
+                resume_cwd_or_fallback(&entry.cwd, &params.thread_id, state.trust_persisted_cwd());
+            let h = state
+                .pi_pool()
+                .acquire_utility(Some(&cwd))
+                .await
+                .map_err(ThreadError::pool)?;
+            switch_handle_to(&h, &entry.metadata.pi_session_path).await?;
+            h
+        } else {
+            match state.pi_pool().get(&params.thread_id).await {
+                Some(h) => h,
+                None => {
+                    let cwd = resume_cwd_or_fallback(
+                        &entry.cwd,
+                        &params.thread_id,
+                        state.trust_persisted_cwd(),
+                    );
+                    let h = state
+                        .pi_pool()
+                        .acquire_utility(Some(&cwd))
+                        .await
+                        .map_err(ThreadError::pool)?;
+                    switch_handle_to(&h, &entry.metadata.pi_session_path).await?;
+                    h
+                }
             }
         };
         thread.turns = fetch_turns(&handle, &entry.metadata.pi_session_path).await?;
     }
-    apply_live_turn_state(
-        &mut thread,
-        super::turn::active_turn_id(&params.thread_id).as_deref(),
-    );
+    apply_live_turn_state(&mut thread, active_turn_id.as_deref());
     Ok(p::ThreadReadResponse { thread })
 }
 
@@ -1423,9 +1436,9 @@ async fn fetch_turns(
             session_path = %session_path.display(),
             journal_messages = message_count,
             rpc_messages = data.messages.len(),
-            "persisted session history did not match get_messages; using RPC history"
+            "persisted session history did not match get_messages; using RPC messages with persisted compaction markers"
         );
-        return Ok(fallback());
+        return Ok(merge_compaction_markers(fallback(), &history));
     }
     Ok(translate_session_history(&history))
 }
