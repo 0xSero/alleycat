@@ -83,6 +83,8 @@ pub enum TurnError {
     TurnIdMismatch { expected: String, actual: String },
     #[error("no active turn for thread `{0}`")]
     NoActiveTurn(String),
+    #[error("thread `{thread_id}` already has active turn `{turn_id}`")]
+    TurnAlreadyActive { thread_id: String, turn_id: String },
     #[error("input translation failed: {0}")]
     InputTranslation(String),
     #[error("pi rpc error: {0}")]
@@ -98,6 +100,7 @@ impl TurnError {
             | TurnError::TurnIdMismatch { .. }
             | TurnError::ThreadNotLoaded(_)
             | TurnError::NoActiveTurn(_)
+            | TurnError::TurnAlreadyActive { .. }
             | TurnError::InputTranslation(_) => p::error_codes::INVALID_PARAMS,
             TurnError::ReviewUnsupported => p::error_codes::METHOD_NOT_FOUND,
             TurnError::PiRpc(_) => p::error_codes::INTERNAL_ERROR,
@@ -162,7 +165,12 @@ pub async fn handle_turn_start(
         .or(state.defaults().approval_policy)
         .unwrap_or(p::AskForApproval::OnRequest);
 
-    register_active_turn(&params.thread_id, &turn_id, approval_policy.clone());
+    register_active_turn(&params.thread_id, &turn_id, approval_policy.clone()).map_err(
+        |active_turn_id| TurnError::TurnAlreadyActive {
+            thread_id: params.thread_id.clone(),
+            turn_id: active_turn_id,
+        },
+    )?;
 
     // Mark the pool entry active so the LRU reaper doesn't snipe a turn
     // mid-flight. Cleared by the pump on `agent_end`.
@@ -415,14 +423,23 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn register_active_turn(thread_id: &str, turn_id: &str, approval_policy: p::AskForApproval) {
-    ACTIVE_TURNS.lock().unwrap().insert(
+fn register_active_turn(
+    thread_id: &str,
+    turn_id: &str,
+    approval_policy: p::AskForApproval,
+) -> Result<(), String> {
+    let mut active_turns = ACTIVE_TURNS.lock().unwrap();
+    if let Some(active) = active_turns.get(thread_id) {
+        return Err(active.turn_id.clone());
+    }
+    active_turns.insert(
         thread_id.to_string(),
         ActiveTurn {
             turn_id: turn_id.to_string(),
             approval_policy,
         },
     );
+    Ok(())
 }
 
 fn active_turn(thread_id: &str) -> Option<ActiveTurn> {
@@ -1007,7 +1024,7 @@ mod tests {
     #[test]
     fn active_turn_table_round_trip() {
         let thread_id = format!("test-{}", Uuid::now_v7());
-        register_active_turn(&thread_id, "tu1", p::AskForApproval::OnRequest);
+        register_active_turn(&thread_id, "tu1", p::AskForApproval::OnRequest).unwrap();
         let active = active_turn(&thread_id).unwrap();
         assert_eq!(active.turn_id, "tu1");
         assert!(matches!(
@@ -1016,6 +1033,19 @@ mod tests {
         ));
         clear_active_turn(&thread_id);
         assert!(active_turn(&thread_id).is_none());
+    }
+
+    #[test]
+    fn active_turn_registration_rejects_overlapping_turns() {
+        let thread_id = format!("test-{}", Uuid::now_v7());
+        register_active_turn(&thread_id, "turn-one", p::AskForApproval::Never).unwrap();
+
+        let existing =
+            register_active_turn(&thread_id, "turn-two", p::AskForApproval::Never).unwrap_err();
+
+        assert_eq!(existing, "turn-one");
+        assert_eq!(active_turn(&thread_id).unwrap().turn_id, "turn-one");
+        clear_active_turn(&thread_id);
     }
 
     #[test]
