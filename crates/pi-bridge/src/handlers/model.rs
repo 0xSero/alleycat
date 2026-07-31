@@ -38,18 +38,44 @@ pub async fn handle_model_list(
     _params: p::ModelListParams,
 ) -> p::ModelListResponse {
     let pi_models = fetch_models_via_pool(state).await;
-    let default_index = pi_models.iter().position(|model| model.active == Some(true));
+    let default_index = pi_models
+        .iter()
+        .position(|model| model.active == Some(true));
     let data = pi_models
         .into_iter()
         .enumerate()
         .map(|(idx, model)| {
-            translate_pi_model(&model, default_index.map_or(idx == 0, |default| idx == default))
+            translate_pi_model(
+                &model,
+                default_index.map_or(idx == 0, |default| idx == default),
+            )
         })
         .collect();
     p::ModelListResponse {
         data,
         next_cursor: None,
     }
+}
+
+/// Return the controller's currently active model as a provider-qualified id.
+///
+/// A prewarmed Pi process can outlive a model switch in Local Studio. New
+/// threads that omit an explicit model must therefore consult the controller
+/// catalog instead of inheriting the stale model captured when that process
+/// started.
+pub(crate) async fn active_controller_model(state: &ConnectionState) -> Option<String> {
+    let path = state.model_catalog_path()?;
+    let models = fetch_models_from_catalog(path, state.model_provider_prefixes())
+        .await
+        .ok()?;
+    qualified_active_model(&models)
+}
+
+fn qualified_active_model(models: &[PiAvailableModel]) -> Option<String> {
+    let model = models.iter().find(|model| model.active == Some(true))?;
+    let provider = model.provider.as_deref()?.trim();
+    let model_id = model.model_id.as_deref().or(model.id.as_deref())?.trim();
+    (!provider.is_empty() && !model_id.is_empty()).then(|| format!("{provider}/{model_id}"))
 }
 
 /// Fetch `Model[]` via the pool. Returns `Vec::new()` on any spawn or RPC
@@ -538,6 +564,28 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!translated[0].is_default);
         assert!(translated[1].is_default);
+    }
+
+    #[test]
+    fn active_catalog_model_is_provider_qualified_for_thread_start() {
+        let models = vec![
+            PiAvailableModel {
+                provider: Some("local-studio".into()),
+                id: Some("stale".into()),
+                active: Some(false),
+                ..Default::default()
+            },
+            PiAvailableModel {
+                provider: Some("local-studio".into()),
+                model_id: Some("glm-5.2".into()),
+                active: Some(true),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            qualified_active_model(&models).as_deref(),
+            Some("local-studio/glm-5.2")
+        );
     }
 
     #[test]

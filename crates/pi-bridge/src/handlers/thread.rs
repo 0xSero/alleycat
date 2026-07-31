@@ -108,7 +108,10 @@ pub async fn handle_thread_start(
     // down with `new_session`, which repeats runtime/resource initialization.
     let (thread_id, handle, initial_pi_state) = acquire_clean_initial_session(state, &cwd).await?;
 
-    let requested_model = params.model.clone().or_else(|| defaults.model.clone());
+    let requested_model = match params.model.clone().or_else(|| defaults.model.clone()) {
+        Some(model) => Some(model),
+        None => super::model::active_controller_model(state).await,
+    };
     let requested_provider = model_provider_override(
         requested_model.as_deref(),
         params.model_provider.as_deref(),
