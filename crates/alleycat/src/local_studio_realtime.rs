@@ -23,6 +23,14 @@ fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
+fn deserialize_required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 fn validate_identifier(value: &str) -> Result<(), &'static str> {
     if value.is_empty() {
         return Err("identifier must not be empty");
@@ -443,6 +451,7 @@ struct RealtimeCapabilityWire {
     provider: RealtimeProvider,
     model_id: Identifier,
     available: bool,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     unavailable_reason: Option<RealtimeUnavailableReason>,
     #[serde(deserialize_with = "deserialize_unique_modalities")]
     input_modalities: Vec<RealtimeModality>,
@@ -552,6 +561,7 @@ pub(crate) struct RealtimeSession {
     pub(crate) state: RealtimeSessionState,
     pub(crate) created_at: Timestamp,
     pub(crate) expires_at: Timestamp,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) reconnect_token: Option<OpaqueToken>,
 }
 
@@ -566,6 +576,7 @@ pub(crate) struct RealtimeSessionCreateRequest {
     pub(crate) controller_id: Identifier,
     pub(crate) client_session_id: Identifier,
     pub(crate) capability_id: Identifier,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) voice_id: Option<Identifier>,
     pub(crate) offer: RealtimeOffer,
 }
@@ -589,9 +600,12 @@ pub(crate) struct RealtimeSessionCreateResult {
 pub(crate) enum RealtimeSignal {
     IceCandidate {
         candidate: SensitiveWireText,
-        #[serde(rename = "sdpMid")]
+        #[serde(rename = "sdpMid", deserialize_with = "deserialize_required_nullable")]
         sdp_mid: Option<Identifier>,
-        #[serde(rename = "sdpMLineIndex")]
+        #[serde(
+            rename = "sdpMLineIndex",
+            deserialize_with = "deserialize_required_nullable"
+        )]
         sdp_m_line_index: Option<u64>,
     },
     IceComplete,
@@ -618,7 +632,9 @@ pub(crate) struct RealtimeSessionUpdateRequest {
     pub(crate) contract_version: RealtimeContractVersion,
     pub(crate) auth: RealtimeMutationAuth,
     pub(crate) session_id: Identifier,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) voice_id: Option<Identifier>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) instructions: Option<ShortText>,
 }
 
@@ -681,11 +697,17 @@ pub(crate) enum BridgeErrorCode {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct BridgeErrorDetails {
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) field: Option<Identifier>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) section: Option<BridgeSectionName>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) expected_revision: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) current_revision: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) retry_after_ms: Option<u64>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) limit_bytes: Option<u64>,
 }
 
@@ -695,7 +717,9 @@ pub(crate) struct BridgeError {
     pub(crate) code: BridgeErrorCode,
     pub(crate) message: ShortText,
     pub(crate) retriable: bool,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) request_id: Option<Identifier>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) details: Option<BridgeErrorDetails>,
 }
 
@@ -710,8 +734,11 @@ pub(crate) struct RealtimeSessionStatus {
     pub(crate) sequence: u64,
     pub(crate) observed_at: Timestamp,
     pub(crate) session: RealtimeSession,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) broker_latency_ms: Option<NonNegativeNumber>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) media_connection_latency_ms: Option<NonNegativeNumber>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) error: Option<BridgeError>,
 }
 
@@ -851,6 +878,84 @@ mod tests {
         let mut value = fixture_value()["createRequest"].clone();
         value["type"] = json!("realtime_create");
         assert!(serde_json::from_value::<RealtimeSessionCreateRequest>(value).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_fields_that_are_required_even_when_nullable() {
+        let mut value = fixture_value()["capabilitiesResult"]["capabilities"][0].clone();
+        value.as_object_mut().unwrap().remove("unavailableReason");
+        assert!(serde_json::from_value::<RealtimeCapability>(value).is_err());
+
+        let mut value = fixture_value()["createRequest"].clone();
+        value.as_object_mut().unwrap().remove("voiceId");
+        assert!(serde_json::from_value::<RealtimeSessionCreateRequest>(value).is_err());
+
+        let mut value = fixture_value()["signalRequest"].clone();
+        value["signal"].as_object_mut().unwrap().remove("sdpMid");
+        assert!(serde_json::from_value::<RealtimeSignalRequest>(value).is_err());
+
+        let mut value = fixture_value()["updateRequest"].clone();
+        value.as_object_mut().unwrap().remove("instructions");
+        assert!(serde_json::from_value::<RealtimeSessionUpdateRequest>(value).is_err());
+
+        let mut value = fixture_value()["status"].clone();
+        value["session"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reconnectToken");
+        assert!(serde_json::from_value::<RealtimeSessionStatus>(value).is_err());
+
+        let mut value = fixture_value()["status"].clone();
+        value.as_object_mut().unwrap().remove("error");
+        assert!(serde_json::from_value::<RealtimeSessionStatus>(value).is_err());
+    }
+
+    #[test]
+    fn consumes_mutation_ack_and_error_result_variants() {
+        let session = fixture_value()["status"]["session"].clone();
+        let ack = json!({
+            "type": "realtime_mutation_ack",
+            "protocolVersion": 1,
+            "contractVersion": 1,
+            "requestId": "request-update-1",
+            "idempotencyKey": "update-session-1",
+            "session": session,
+        });
+        assert!(matches!(
+            serde_json::from_value::<RealtimeResult>(ack).unwrap(),
+            RealtimeResult::MutationAck(_)
+        ));
+
+        let error = json!({
+            "type": "error",
+            "protocolVersion": 1,
+            "requestId": "request-create-2",
+            "error": {
+                "code": "realtime_unavailable",
+                "message": "Realtime is not available for this model.",
+                "retriable": true,
+                "requestId": "request-create-2",
+                "details": {
+                    "field": null,
+                    "section": null,
+                    "expectedRevision": null,
+                    "currentRevision": null,
+                    "retryAfterMs": 500,
+                    "limitBytes": null
+                }
+            }
+        });
+        assert!(matches!(
+            serde_json::from_value::<RealtimeResult>(error.clone()).unwrap(),
+            RealtimeResult::Error(_)
+        ));
+
+        let mut missing_nullable_error_field = error;
+        missing_nullable_error_field["error"]["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("field");
+        assert!(serde_json::from_value::<RealtimeResult>(missing_nullable_error_field).is_err());
     }
 
     #[test]
