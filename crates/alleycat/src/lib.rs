@@ -10,6 +10,9 @@ mod daemon;
 mod framing;
 mod host;
 mod ipc;
+// Typed Local Studio realtime contract only. This module is intentionally
+// private until the transport and capability policy land together.
+mod local_studio_realtime;
 mod paths;
 mod protocol;
 mod service;
