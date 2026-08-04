@@ -18,6 +18,7 @@ const IDENTIFIER_MAX_UTF16_UNITS: usize = 512;
 const SHORT_TEXT_MAX_UTF16_UNITS: usize = 4_096;
 const WIRE_TEXT_MAX_UTF16_UNITS: usize = 4_000_000;
 const OPAQUE_TOKEN_MAX_UTF16_UNITS: usize = 2_048;
+const JAVASCRIPT_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 
 fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
@@ -301,10 +302,32 @@ impl<'de> Deserialize<'de> for PositiveInteger {
         D: Deserializer<'de>,
     {
         let value = u64::deserialize(deserializer)?;
-        if value > 0 {
+        if value > 0 && value <= JAVASCRIPT_MAX_SAFE_INTEGER {
             Ok(Self(value))
         } else {
-            Err(de::Error::custom("expected a positive integer"))
+            Err(de::Error::custom(
+                "expected a positive JavaScript-safe integer",
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct NonNegativeInteger(u64);
+
+impl<'de> Deserialize<'de> for NonNegativeInteger {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = u64::deserialize(deserializer)?;
+        if value <= JAVASCRIPT_MAX_SAFE_INTEGER {
+            Ok(Self(value))
+        } else {
+            Err(de::Error::custom(
+                "expected a non-negative JavaScript-safe integer",
+            ))
         }
     }
 }
@@ -606,7 +629,7 @@ pub(crate) enum RealtimeSignal {
             rename = "sdpMLineIndex",
             deserialize_with = "deserialize_required_nullable"
         )]
-        sdp_m_line_index: Option<u64>,
+        sdp_m_line_index: Option<NonNegativeInteger>,
     },
     IceComplete,
 }
@@ -702,13 +725,13 @@ pub(crate) struct BridgeErrorDetails {
     #[serde(deserialize_with = "deserialize_required_nullable")]
     pub(crate) section: Option<BridgeSectionName>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
-    pub(crate) expected_revision: Option<u64>,
+    pub(crate) expected_revision: Option<NonNegativeInteger>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
-    pub(crate) current_revision: Option<u64>,
+    pub(crate) current_revision: Option<NonNegativeInteger>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
-    pub(crate) retry_after_ms: Option<u64>,
+    pub(crate) retry_after_ms: Option<NonNegativeInteger>,
     #[serde(deserialize_with = "deserialize_required_nullable")]
-    pub(crate) limit_bytes: Option<u64>,
+    pub(crate) limit_bytes: Option<NonNegativeInteger>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -731,7 +754,7 @@ pub(crate) struct RealtimeSessionStatus {
     pub(crate) protocol_version: ProtocolVersion,
     pub(crate) contract_version: RealtimeContractVersion,
     pub(crate) event_id: Identifier,
-    pub(crate) sequence: u64,
+    pub(crate) sequence: NonNegativeInteger,
     pub(crate) observed_at: Timestamp,
     pub(crate) session: RealtimeSession,
     #[serde(deserialize_with = "deserialize_required_nullable")]
@@ -978,6 +1001,10 @@ mod tests {
         value["maxSignalBytes"] = json!(-1);
         assert!(serde_json::from_value::<RealtimeCapability>(value).is_err());
 
+        let mut value = fixture_value()["capabilitiesResult"]["capabilities"][0].clone();
+        value["maxSignalBytes"] = json!(JAVASCRIPT_MAX_SAFE_INTEGER + 1);
+        assert!(serde_json::from_value::<RealtimeCapability>(value).is_err());
+
         let mut value = fixture_value()["capabilitiesRequest"].clone();
         value["acceptedContractVersions"] = json!([]);
         assert!(serde_json::from_value::<RealtimeCapabilitiesRequest>(value).is_err());
@@ -988,6 +1015,10 @@ mod tests {
 
         let mut value = fixture_value()["status"].clone();
         value["brokerLatencyMs"] = json!(-0.1);
+        assert!(serde_json::from_value::<RealtimeSessionStatus>(value).is_err());
+
+        let mut value = fixture_value()["status"].clone();
+        value["sequence"] = json!(JAVASCRIPT_MAX_SAFE_INTEGER + 1);
         assert!(serde_json::from_value::<RealtimeSessionStatus>(value).is_err());
 
         let mut value = fixture_value()["signalRequest"].clone();
