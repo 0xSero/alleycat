@@ -94,10 +94,10 @@ pub const MANIFESTS: &[AgentManifest] = &[
         title: Some("Amp"),
         is_beta: true,
         sort_order: 2,
-        description: Some("Sourcegraph Amp."),
+        description: Some("Frontier coding agent."),
         aliases: &["ampcode", "amp-code", "amp_code", "amp code"],
-        locks_reasoning_effort_after_activity: true,
-        visible_modes: Some(&["smart", "rush", "deep"]),
+        locks_reasoning_effort_after_activity: false,
+        visible_modes: Some(&["low", "medium", "high", "ultra"]),
         supports_ssh_bridge: false,
         uses_direct_codex_port: false,
         supports_thread_permission_overrides: false,
@@ -219,4 +219,32 @@ pub const MANIFESTS: &[AgentManifest] = &[
 
 pub fn manifest_for(name: &str) -> Option<&'static AgentManifest> {
     MANIFESTS.iter().find(|m| m.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amp_manifest_advertises_current_modes_without_effort_lock() {
+        let amp = manifest_for("amp").unwrap();
+        assert_eq!(amp.description, Some("Frontier coding agent."));
+        assert_eq!(
+            amp.visible_modes,
+            Some(&["low", "medium", "high", "ultra"][..])
+        );
+        assert!(!amp.locks_reasoning_effort_after_activity);
+
+        let capabilities = amp.capabilities();
+        assert_eq!(
+            capabilities.visible_modes,
+            Some(vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "ultra".to_string(),
+            ])
+        );
+        assert!(!capabilities.locks_reasoning_effort_after_activity);
+    }
 }
