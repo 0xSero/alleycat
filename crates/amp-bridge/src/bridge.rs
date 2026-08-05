@@ -26,7 +26,7 @@ use crate::state::{ConnectionState, ThreadDefaults};
 
 const DEFAULT_AMP_BIN: &str = "amp";
 const MODEL_PROVIDER: &str = "amp";
-const DEFAULT_MODEL: &str = "smart";
+const DEFAULT_MODEL: &str = "medium";
 const USER_AGENT: &str = concat!("alleycat-amp-bridge/", env!("CARGO_PKG_VERSION"));
 
 pub type ThreadIndex = CoreThreadIndex<AmpSessionRef>;
@@ -66,7 +66,6 @@ struct ThreadStartShape {
     approval_policy: p::AskForApproval,
     approvals_reviewer: p::ApprovalsReviewer,
     sandbox: p::SandboxPolicy,
-    reasoning_effort: Option<p::ReasoningEffort>,
 }
 
 impl AmpBridge {
@@ -465,20 +464,12 @@ impl AmpBridge {
             .approvals_reviewer
             .unwrap_or(p::ApprovalsReviewer::AutoReview);
         let sandbox_mode = params.sandbox.unwrap_or(p::SandboxMode::WorkspaceWrite);
-        let reasoning_effort = select_amp_reasoning_effort(
-            &model,
-            amp_effort_from_additional(&params.additional),
-            None,
-            None,
-        )?;
-
         state.update_defaults(|defaults| {
             defaults.model = Some(model.clone());
             defaults.model_provider = Some(MODEL_PROVIDER.to_string());
             defaults.approval_policy = Some(approval_policy.clone());
             defaults.approvals_reviewer = Some(approvals_reviewer);
             defaults.sandbox = Some(sandbox_mode);
-            defaults.reasoning_effort = reasoning_effort;
             defaults.service_name = params.service_name.clone();
             defaults.system_prompt = params
                 .developer_instructions
@@ -501,7 +492,7 @@ impl AmpBridge {
                 amp_thread_id: None,
                 amp_thread_path: Some(transcript_path(&self.transcripts_dir, &thread_id)),
                 model: Some(model.clone()),
-                reasoning_effort: reasoning_effort_metadata(reasoning_effort),
+                reasoning_effort: None,
             },
         };
         self.thread_index
@@ -517,7 +508,6 @@ impl AmpBridge {
             approval_policy,
             approvals_reviewer,
             sandbox: sandbox_policy(sandbox_mode),
-            reasoning_effort,
         };
         emit(
             state,
@@ -556,25 +546,8 @@ impl AmpBridge {
                 .or(defaults.model.as_deref()),
         );
         let model_changed = old_model.as_deref() != Some(model.as_str());
-        let stored_effort = (!model_changed)
-            .then(|| {
-                entry
-                    .metadata
-                    .reasoning_effort
-                    .as_deref()
-                    .and_then(parse_amp_reasoning_effort)
-            })
-            .flatten();
-        let reasoning_effort = select_amp_reasoning_effort(
-            &model,
-            amp_effort_from_additional(&params.additional),
-            stored_effort,
-            defaults.reasoning_effort,
-        )?;
-        let reasoning_effort_metadata = reasoning_effort_metadata(reasoning_effort);
-        if model_changed || entry.metadata.reasoning_effort != reasoning_effort_metadata {
+        if model_changed {
             entry.metadata.model = Some(model.clone());
-            entry.metadata.reasoning_effort = reasoning_effort_metadata;
             self.thread_index
                 .insert(entry.clone())
                 .await
@@ -621,7 +594,7 @@ impl AmpBridge {
             sandbox: sandbox_policy(sandbox_mode),
             permission_profile: params.permission_profile,
             active_permission_profile: None,
-            reasoning_effort,
+            reasoning_effort: None,
         })
     }
 
@@ -813,44 +786,10 @@ impl AmpBridge {
                 .or(entry.metadata.model.as_deref())
                 .or(defaults.model.as_deref()),
         );
-        let mut entry_changed = old_model.as_deref() != Some(mode.as_str());
+        let entry_changed = old_model.as_deref() != Some(mode.as_str());
         if entry_changed {
             entry.metadata.model = Some(mode.clone());
         }
-        let prior_turns = self
-            .all_turns(state, &params.thread_id)
-            .await
-            .map_err(|err| internal(err.to_string()))?;
-        let first_amp_message = prior_turns.is_empty() && entry.metadata.amp_thread_id.is_none();
-        let launch_effort = if first_amp_message {
-            let stored_effort = (!entry_changed)
-                .then(|| {
-                    entry
-                        .metadata
-                        .reasoning_effort
-                        .as_deref()
-                        .and_then(parse_amp_reasoning_effort)
-                })
-                .flatten();
-            let effort = select_amp_reasoning_effort(
-                &mode,
-                params.effort,
-                stored_effort,
-                defaults.reasoning_effort,
-            )?;
-            let metadata = reasoning_effort_metadata(effort);
-            if entry.metadata.reasoning_effort != metadata {
-                entry.metadata.reasoning_effort = metadata;
-                entry_changed = true;
-            }
-            if let Some(effort) = effort {
-                Some(reasoning_effort_wire_value(effort).to_string())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         let approval_policy = params
             .approval_policy
             .clone()
@@ -882,7 +821,6 @@ impl AmpBridge {
                 cwd,
                 amp_thread_id: entry.metadata.amp_thread_id.clone(),
                 mode,
-                effort: launch_effort,
                 dangerously_allow_all,
             },
         )
@@ -1913,7 +1851,7 @@ fn thread_start_response(shape: ThreadStartShape) -> p::ThreadStartResponse {
         sandbox: shape.sandbox,
         permission_profile: None,
         active_permission_profile: None,
-        reasoning_effort: shape.reasoning_effort,
+        reasoning_effort: None,
     }
 }
 
@@ -1929,16 +1867,10 @@ fn config_write_response(codex_home: &Path) -> p::ConfigWriteResponse {
     }
 }
 
-fn amp_models(include_hidden: bool) -> Vec<p::Model> {
+fn amp_models(_include_hidden: bool) -> Vec<p::Model> {
     AMP_VISIBLE_MODES
         .into_iter()
         .map(|mode| (mode, false))
-        .chain(
-            AMP_HIDDEN_MODES
-                .into_iter()
-                .filter(move |_| include_hidden)
-                .map(|mode| (mode, true)),
-        )
         .map(|(model, hidden)| p::Model {
             id: model.to_string(),
             model: model.to_string(),
@@ -1948,14 +1880,8 @@ fn amp_models(include_hidden: bool) -> Vec<p::Model> {
             display_name: model.to_string(),
             description: amp_mode_description(model).to_string(),
             hidden,
-            supported_reasoning_efforts: supported_amp_reasoning_efforts(model)
-                .map(|effort| p::ReasoningEffortOption {
-                    reasoning_effort: effort,
-                    description: format!("{effort:?}"),
-                })
-                .collect(),
-            default_reasoning_effort: default_amp_reasoning_effort(model)
-                .unwrap_or(p::ReasoningEffort::None),
+            supported_reasoning_efforts: Vec::new(),
+            default_reasoning_effort: p::ReasoningEffort::None,
             input_modalities: vec![
                 Value::String("text".to_string()),
                 Value::String("image".to_string()),
@@ -1968,8 +1894,7 @@ fn amp_models(include_hidden: bool) -> Vec<p::Model> {
         .collect()
 }
 
-const AMP_VISIBLE_MODES: [&str; 3] = ["smart", "rush", "deep"];
-const AMP_HIDDEN_MODES: [&str; 1] = ["large"];
+const AMP_VISIBLE_MODES: [&str; 4] = ["low", "medium", "high", "ultra"];
 
 fn normalize_model(model: Option<&str>) -> String {
     let mode = model
@@ -1982,119 +1907,27 @@ fn normalize_model(model: Option<&str>) -> String {
         })
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    if is_supported_amp_mode(&mode) {
-        mode
-    } else {
-        DEFAULT_MODEL.to_string()
+    match mode.as_str() {
+        "rush" => "low".to_string(),
+        "smart" | "deep" => "medium".to_string(),
+        "large" => "ultra".to_string(),
+        _ if is_supported_amp_mode(&mode) => mode,
+        _ => DEFAULT_MODEL.to_string(),
     }
 }
 
 fn is_supported_amp_mode(mode: &str) -> bool {
-    AMP_VISIBLE_MODES.contains(&mode) || AMP_HIDDEN_MODES.contains(&mode)
+    AMP_VISIBLE_MODES.contains(&mode)
 }
 
 fn amp_mode_description(mode: &str) -> &'static str {
     match mode {
-        "smart" => "State-of-the-art, unconstrained Amp mode",
-        "rush" => "Faster and cheaper for small, well-defined tasks",
-        "deep" => "Deep reasoning with GPT-5.5",
-        "large" => "Hidden large-context Amp mode",
+        "low" => "Fast responses for simple, well-defined tasks.",
+        "medium" => "Balanced performance for everyday coding tasks.",
+        "high" => "More reasoning for complex coding tasks.",
+        "ultra" => "Maximum capability for the hardest coding tasks.",
         _ => "Amp agent mode",
     }
-}
-
-fn supported_amp_reasoning_efforts(mode: &str) -> impl Iterator<Item = p::ReasoningEffort> {
-    match mode {
-        "smart" => vec![p::ReasoningEffort::High, p::ReasoningEffort::XHigh],
-        "deep" => vec![
-            p::ReasoningEffort::Low,
-            p::ReasoningEffort::Medium,
-            p::ReasoningEffort::XHigh,
-        ],
-        _ => Vec::new(),
-    }
-    .into_iter()
-}
-
-fn default_amp_reasoning_effort(mode: &str) -> Option<p::ReasoningEffort> {
-    match mode {
-        "smart" => Some(p::ReasoningEffort::High),
-        "deep" => Some(p::ReasoningEffort::Medium),
-        _ => None,
-    }
-}
-
-fn parse_amp_reasoning_effort(value: &str) -> Option<p::ReasoningEffort> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "none" => Some(p::ReasoningEffort::None),
-        "minimal" => Some(p::ReasoningEffort::Minimal),
-        "low" => Some(p::ReasoningEffort::Low),
-        "medium" => Some(p::ReasoningEffort::Medium),
-        "high" => Some(p::ReasoningEffort::High),
-        "xhigh" | "x-high" => Some(p::ReasoningEffort::XHigh),
-        "max" => Some(p::ReasoningEffort::Max),
-        _ => None,
-    }
-}
-
-fn amp_effort_from_additional(additional: &HashMap<String, Value>) -> Option<p::ReasoningEffort> {
-    additional
-        .get("effort")
-        .and_then(Value::as_str)
-        .and_then(parse_amp_reasoning_effort)
-}
-
-fn reasoning_effort_metadata(effort: Option<p::ReasoningEffort>) -> Option<String> {
-    effort.map(reasoning_effort_wire_value).map(str::to_string)
-}
-
-fn select_amp_reasoning_effort(
-    mode: &str,
-    requested: Option<p::ReasoningEffort>,
-    stored: Option<p::ReasoningEffort>,
-    default: Option<p::ReasoningEffort>,
-) -> Result<Option<p::ReasoningEffort>, JsonRpcError> {
-    if let Some(effort) = requested {
-        ensure_supported_amp_effort(mode, effort)?;
-        return Ok((effort != p::ReasoningEffort::None).then_some(effort));
-    }
-    if let Some(effort) = stored.filter(|effort| is_supported_amp_effort(mode, *effort)) {
-        return Ok((effort != p::ReasoningEffort::None).then_some(effort));
-    }
-    if let Some(effort) = default.filter(|effort| is_supported_amp_effort(mode, *effort)) {
-        return Ok((effort != p::ReasoningEffort::None).then_some(effort));
-    }
-    Ok(default_amp_reasoning_effort(mode))
-}
-
-fn reasoning_effort_wire_value(effort: p::ReasoningEffort) -> &'static str {
-    match effort {
-        p::ReasoningEffort::None => "none",
-        p::ReasoningEffort::Minimal => "minimal",
-        p::ReasoningEffort::Low => "low",
-        p::ReasoningEffort::Medium => "medium",
-        p::ReasoningEffort::High => "high",
-        p::ReasoningEffort::XHigh => "xhigh",
-        p::ReasoningEffort::Max => "max",
-    }
-}
-
-fn ensure_supported_amp_effort(mode: &str, effort: p::ReasoningEffort) -> Result<(), JsonRpcError> {
-    if is_supported_amp_effort(mode, effort) {
-        Ok(())
-    } else {
-        Err(invalid_params(format!(
-            "amp mode `{mode}` does not support effort `{}`",
-            reasoning_effort_wire_value(effort)
-        )))
-    }
-}
-
-fn is_supported_amp_effort(mode: &str, effort: p::ReasoningEffort) -> bool {
-    if effort == p::ReasoningEffort::None {
-        return supported_amp_reasoning_efforts(mode).next().is_none();
-    }
-    supported_amp_reasoning_efforts(mode).any(|supported| supported == effort)
 }
 
 fn default_approval_policy(dangerously_allow_all: bool) -> p::AskForApproval {
@@ -2192,5 +2025,48 @@ fn method_not_found(method: &str) -> JsonRpcError {
         code: error_codes::METHOD_NOT_FOUND,
         message: format!("method `{method}` is not implemented"),
         data: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_current_and_legacy_amp_modes() {
+        for mode in AMP_VISIBLE_MODES {
+            assert_eq!(normalize_model(Some(mode)), mode);
+        }
+        assert_eq!(normalize_model(None), "medium");
+        assert_eq!(normalize_model(Some("rush")), "low");
+        assert_eq!(normalize_model(Some("smart")), "medium");
+        assert_eq!(normalize_model(Some("deep")), "medium");
+        assert_eq!(normalize_model(Some("large")), "ultra");
+        assert_eq!(normalize_model(Some("amp:SMART")), "medium");
+    }
+
+    #[test]
+    fn stream_input_uses_only_documented_fields() {
+        let envelope = translate_user_input(
+            &[p::UserInput::Text {
+                text: "hello".to_string(),
+                text_elements: Vec::new(),
+            }],
+            false,
+        )
+        .unwrap();
+        let fields = envelope.as_object().unwrap().keys().collect::<Vec<_>>();
+        assert_eq!(fields, vec!["message", "type"]);
+
+        let steered = translate_user_input(
+            &[p::UserInput::Text {
+                text: "more".to_string(),
+                text_elements: Vec::new(),
+            }],
+            true,
+        )
+        .unwrap();
+        let fields = steered.as_object().unwrap().keys().collect::<Vec<_>>();
+        assert_eq!(fields, vec!["message", "steer", "type"]);
     }
 }
