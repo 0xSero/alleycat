@@ -210,12 +210,21 @@ def write_frame(sock_file, frame: dict[str, Any]) -> None:
     sock_file.flush()
 
 
-def read_frame_with_deadline(sock_file, deadline: float) -> dict[str, Any] | None:
-    """Block-read one JSON-RPC frame from the bridge socket. Returns None
-    on EOF or if the deadline has already passed."""
-    if time.monotonic() >= deadline:
+def read_frame_with_deadline(
+    sock: socket.socket, sock_file, deadline: float
+) -> dict[str, Any] | None:
+    """Read one JSON-RPC frame, returning None on EOF or deadline expiry."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
         return None
-    line = sock_file.readline()
+    previous_timeout = sock.gettimeout()
+    sock.settimeout(remaining)
+    try:
+        line = sock_file.readline()
+    except TimeoutError:
+        return None
+    finally:
+        sock.settimeout(previous_timeout)
     if not line:
         return None
     return json.loads(line)
@@ -270,7 +279,7 @@ def main() -> int:
         )
         deadline = time.monotonic() + ns.timeout
         while True:
-            frame = read_frame_with_deadline(sock_file, deadline)
+            frame = read_frame_with_deadline(sock, sock_file, deadline)
             if frame is None:
                 raise SystemExit("bridge closed before responding to initialize")
             if frame.get("id") == init_id:
@@ -294,7 +303,7 @@ def main() -> int:
         deadline = time.monotonic() + ns.timeout
         response: dict[str, Any] | None = None
         while True:
-            frame = read_frame_with_deadline(sock_file, deadline)
+            frame = read_frame_with_deadline(sock, sock_file, deadline)
             if frame is None:
                 if response is None:
                     print(
@@ -309,7 +318,7 @@ def main() -> int:
                     print(json.dumps(response, indent=2))
                     watch_deadline = time.monotonic() + ns.watch_for
                     while True:
-                        more = read_frame_with_deadline(sock_file, watch_deadline)
+                        more = read_frame_with_deadline(sock, sock_file, watch_deadline)
                         if more is None:
                             break
                         print(json.dumps(more, indent=2))
