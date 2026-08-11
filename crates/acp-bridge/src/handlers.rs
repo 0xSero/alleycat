@@ -1428,36 +1428,20 @@ pub fn handle_review_start(_params: p::ReviewStartParams) -> Result<Value, JsonR
 
 /// Handle command/exec/terminate request.
 pub async fn handle_command_exec_terminate(
-    client: &Arc<AcpClient>,
-    params: p::CommandExecTerminateParams,
+    _client: &Arc<AcpClient>,
+    _params: p::CommandExecTerminateParams,
 ) -> Result<p::CommandExecTerminateResponse, JsonRpcError> {
-    // The process_id in Codex maps to terminal_id in ACP
-    let session_id = "default".to_string(); // Would need to track session mapping
-    let terminal_id = params.process_id;
-
-    // Try to kill the terminal
-    let kill_request = json!({
-        "sessionId": session_id,
-        "terminalId": terminal_id,
-    });
-
-    match client.send_request("terminal/kill", kill_request).await {
-        Ok(_) => {
-            // Release the terminal after killing
-            let release_request = json!({
-                "sessionId": session_id,
-                "terminalId": terminal_id,
-            });
-            let _ = client
-                .send_request("terminal/release", release_request)
-                .await;
-            Ok(p::CommandExecTerminateResponse {})
-        }
-        Err(_) => {
-            // Terminal doesn't exist or already terminated, that's fine
-            Ok(p::CommandExecTerminateResponse {})
-        }
-    }
+    // CommandExecTerminateParams has a process id but no thread/session id.
+    // ACP terminal/kill requires both. The old implementation sent every kill
+    // to a fabricated "default" session and reported success even when the
+    // agent rejected it, leaving the real process running.
+    Err(JsonRpcError {
+        code: error_codes::METHOD_NOT_FOUND,
+        message:
+            "command/exec/terminate is not supported by ACP bridges (no session id in request)"
+                .to_string(),
+        data: None,
+    })
 }
 
 /// Handle command/exec/write request.
