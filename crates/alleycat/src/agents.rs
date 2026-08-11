@@ -678,7 +678,7 @@ impl AgentManager {
             }
         }
 
-        self.ensure_codex_unix_running_locked(endpoint, &env, &mut *guard)
+        self.ensure_codex_unix_running_locked(endpoint, &env, &mut guard)
             .await
     }
 
@@ -694,7 +694,7 @@ impl AgentManager {
             return Ok(endpoint);
         }
         let mut guard = self.codex_child.lock().await;
-        self.ensure_codex_unix_running_locked(endpoint, env, &mut *guard)
+        self.ensure_codex_unix_running_locked(endpoint, env, &mut guard)
             .await
     }
 

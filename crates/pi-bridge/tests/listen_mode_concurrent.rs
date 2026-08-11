@@ -20,7 +20,7 @@
 
 mod support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -123,7 +123,7 @@ async fn two_concurrent_connections_share_one_daemon() -> Result<()> {
     Ok(())
 }
 
-fn spawn_daemon(socket_path: &PathBuf, script_path: &PathBuf) -> Result<Child> {
+fn spawn_daemon(socket_path: &Path, script_path: &Path) -> Result<Child> {
     let bin = env!("CARGO_BIN_EXE_alleycat-pi-bridge");
     Command::new(bin)
         .args(["--listen", socket_path.to_str().expect("socket path utf8")])
@@ -146,7 +146,7 @@ fn spawn_daemon(socket_path: &PathBuf, script_path: &PathBuf) -> Result<Child> {
 /// Poll the socket path until it appears, up to `SPAWN_TIMEOUT`. The bridge
 /// emits the socket file synchronously inside `UnixListener::bind`, so the
 /// race window between fork and bind is small but non-zero.
-async fn wait_for_socket(path: &PathBuf) -> Result<()> {
+async fn wait_for_socket(path: &Path) -> Result<()> {
     let deadline = Instant::now() + SPAWN_TIMEOUT;
     while Instant::now() < deadline {
         if tokio::fs::metadata(path).await.is_ok() {
@@ -253,7 +253,7 @@ where
 /// Open a fresh connection, run `initialize`, then call `thread/loaded/list`
 /// and return the visible thread ids. Used to prove pool/index sharing across
 /// connections.
-async fn read_loaded_thread_ids(socket: &PathBuf) -> Result<Vec<String>> {
+async fn read_loaded_thread_ids(socket: &Path) -> Result<Vec<String>> {
     let stream = UnixStream::connect(socket)
         .await
         .with_context(|| format!("connect to {}", socket.display()))?;

@@ -121,7 +121,7 @@ impl EventTranslatorState {
             PiEvent::MessageUpdate {
                 assistant_message_event,
                 ..
-            } => self.translate_message_update(assistant_message_event),
+            } => self.translate_message_update(*assistant_message_event),
             PiEvent::MessageEnd { message } => match message {
                 AgentMessage::Assistant(a) => self.translate_message_end(a),
                 _ => Vec::new(),
@@ -647,15 +647,15 @@ impl EventTranslatorState {
 
     fn translate_agent_end(&mut self) -> Vec<ServerNotification> {
         let mut out = Vec::new();
-        if let Some(item) = self.open_message_item.take() {
-            if item.started {
-                out.push(self.item_completed(ThreadItem::AgentMessage {
-                    id: item.item_id,
-                    text: String::new(),
-                    phase: None,
-                    memory_citation: None,
-                }));
-            }
+        if let Some(item) = self.open_message_item.take()
+            && item.started
+        {
+            out.push(self.item_completed(ThreadItem::AgentMessage {
+                id: item.item_id,
+                text: String::new(),
+                phase: None,
+                memory_citation: None,
+            }));
         }
         if let Some(item) = self.open_reasoning_item.take() {
             out.push(self.item_completed(ThreadItem::Reasoning {
@@ -924,6 +924,7 @@ fn cap_aggregated_output(mut text: String) -> String {
 /// - `{"content": "..."}` or `{"output": "..."}`,
 /// - or a content-array `[{"type":"text","text":"..."}]` (mirrors what
 ///   the model sees in toolResult).
+///
 /// Returns `None` only when no recognizable shape is present.
 fn extract_tool_text_output(result: &Value) -> Option<String> {
     if let Some(s) = result.as_str() {
@@ -1195,11 +1196,11 @@ mod tests {
 
         let out = s.translate(PiEvent::MessageUpdate {
             message: agent_msg(""),
-            assistant_message_event: AssistantMessageEvent::TextDelta {
+            assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "hi".into(),
                 partial: assistant_message(""),
-            },
+            }),
         });
         assert_eq!(out.len(), 2);
         assert!(matches!(out[0], ServerNotification::ItemStarted(_)));
@@ -1233,10 +1234,10 @@ mod tests {
         });
         let thinking = live.translate(PiEvent::MessageUpdate {
             message: AgentMessage::Assistant(message.clone()),
-            assistant_message_event: AssistantMessageEvent::ThinkingStart {
+            assistant_message_event: Box::new(AssistantMessageEvent::ThinkingStart {
                 content_index: 0,
                 partial: message.clone(),
-            },
+            }),
         });
 
         let replay = crate::translate::items::translate_messages(&[
@@ -1271,10 +1272,10 @@ mod tests {
         let mut s = state();
         let started = s.translate(PiEvent::MessageUpdate {
             message: agent_msg(""),
-            assistant_message_event: AssistantMessageEvent::ThinkingStart {
+            assistant_message_event: Box::new(AssistantMessageEvent::ThinkingStart {
                 content_index: 0,
                 partial: assistant_message(""),
-            },
+            }),
         });
         assert_eq!(started.len(), 1);
         match &started[0] {
@@ -1287,11 +1288,11 @@ mod tests {
 
         let delta = s.translate(PiEvent::MessageUpdate {
             message: agent_msg(""),
-            assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+            assistant_message_event: Box::new(AssistantMessageEvent::ThinkingDelta {
                 content_index: 0,
                 delta: "thinking…".into(),
                 partial: assistant_message(""),
-            },
+            }),
         });
         match &delta[0] {
             ServerNotification::ReasoningTextDelta(n) => assert_eq!(n.delta, "thinking…"),
@@ -1300,11 +1301,11 @@ mod tests {
 
         let ended = s.translate(PiEvent::MessageUpdate {
             message: agent_msg(""),
-            assistant_message_event: AssistantMessageEvent::ThinkingEnd {
+            assistant_message_event: Box::new(AssistantMessageEvent::ThinkingEnd {
                 content_index: 0,
                 content: "thinking done".into(),
                 partial: assistant_message(""),
-            },
+            }),
         });
         match &ended[0] {
             ServerNotification::ItemCompleted(n) => match &n.item {

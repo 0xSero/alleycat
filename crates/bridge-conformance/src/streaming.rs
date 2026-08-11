@@ -223,11 +223,11 @@ fn on_delta(
             message: format!("delta for itemId={item_id} arrived with no matching item/started"),
         }),
         Some(st) => {
-            let kind_ok = match (expected, st.kind) {
-                (ItemKindGate::AgentMessage, ItemKind::AgentMessage) => true,
-                (ItemKindGate::Reasoning, ItemKind::Reasoning) => true,
-                _ => false,
-            };
+            let kind_ok = matches!(
+                (expected, st.kind),
+                (ItemKindGate::AgentMessage, ItemKind::AgentMessage)
+                    | (ItemKindGate::Reasoning, ItemKind::Reasoning)
+            );
             if !kind_ok {
                 findings.push(Finding::SchemaError {
                     step: frame.step.clone(),

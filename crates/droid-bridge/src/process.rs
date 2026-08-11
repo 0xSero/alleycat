@@ -151,12 +151,11 @@ impl DroidProcess {
                     tracing::debug!(line = trimmed, "dropping non-json droid stdout line");
                     continue;
                 };
-                if value.get("type").and_then(Value::as_str) == Some("response") {
-                    if let Some(id) = response_id(&value) {
-                        if let Some(tx) = reader_pending.lock().await.remove(&id) {
-                            let _ = tx.send(value.clone());
-                        }
-                    }
+                if value.get("type").and_then(Value::as_str) == Some("response")
+                    && let Some(id) = response_id(&value)
+                    && let Some(tx) = reader_pending.lock().await.remove(&id)
+                {
+                    let _ = tx.send(value.clone());
                 }
                 let _ = reader_events.send(value);
             }

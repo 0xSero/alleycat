@@ -200,11 +200,11 @@ impl EventTranslatorState {
     /// since landed.
     pub fn translate(&mut self, event: ClaudeOutbound) -> Vec<ServerNotification> {
         // Buffer events arriving before their parent `Task` `tool_use` open.
-        if let Some(parent_id) = event_parent_tool_use_id(&event) {
-            if !self.subagent_parents.contains_key(parent_id) {
-                self.buffer_subagent_event(parent_id.to_string(), event);
-                return Vec::new();
-            }
+        if let Some(parent_id) = event_parent_tool_use_id(&event)
+            && !self.subagent_parents.contains_key(parent_id)
+        {
+            self.buffer_subagent_event(parent_id.to_string(), event);
+            return Vec::new();
         }
 
         let mut out = self.translate_one(event);
@@ -557,21 +557,20 @@ impl EventTranslatorState {
                         });
                 }
             }
-            if let Some(call) = self.open_tool_calls.get_mut(&tool_id) {
-                if matches!(call.kind, CodexToolKind::CommandExecution)
-                    && !call.bash_command_terminated
-                {
-                    call.bash_command_terminated = true;
-                    out.push(ServerNotification::CommandExecutionOutputDelta(
-                        CommandExecutionOutputDeltaNotification {
-                            thread_id: self.thread_id.clone(),
-                            turn_id: self.turn_id.clone(),
-                            item_id: call.item_id.clone(),
-                            delta: "\n".to_string(),
-                            parent_item_id: parent_resolved,
-                        },
-                    ));
-                }
+            if let Some(call) = self.open_tool_calls.get_mut(&tool_id)
+                && matches!(call.kind, CodexToolKind::CommandExecution)
+                && !call.bash_command_terminated
+            {
+                call.bash_command_terminated = true;
+                out.push(ServerNotification::CommandExecutionOutputDelta(
+                    CommandExecutionOutputDeltaNotification {
+                        thread_id: self.thread_id.clone(),
+                        turn_id: self.turn_id.clone(),
+                        item_id: call.item_id.clone(),
+                        delta: "\n".to_string(),
+                        parent_item_id: parent_resolved,
+                    },
+                ));
             }
         }
         out
@@ -673,14 +672,14 @@ impl EventTranslatorState {
                 // Use the structured stdout when present; fall back to the
                 // inline text claude embeds in the content[] block.
                 let mut aggregated = stdout.unwrap_or(inline_content);
-                if let Some(stderr) = stderr {
-                    if !stderr.is_empty() {
-                        if !aggregated.is_empty() && !aggregated.ends_with('\n') {
-                            aggregated.push('\n');
-                        }
-                        aggregated.push_str("[stderr] ");
-                        aggregated.push_str(&stderr);
+                if let Some(stderr) = stderr
+                    && !stderr.is_empty()
+                {
+                    if !aggregated.is_empty() && !aggregated.ends_with('\n') {
+                        aggregated.push('\n');
                     }
+                    aggregated.push_str("[stderr] ");
+                    aggregated.push_str(&stderr);
                 }
                 let status = if is_error || interrupted {
                     CommandExecutionStatus::Failed
@@ -987,10 +986,10 @@ impl EventTranslatorState {
 
         // Pull a `model_context_window` out of `result.modelUsage` for future
         // ThreadTokenUsageUpdated notifications; ignored if absent.
-        if let Some(model_usage) = result.model_usage.as_ref() {
-            if let Some(window) = first_context_window(model_usage) {
-                self.model_context_window = Some(window);
-            }
+        if let Some(model_usage) = result.model_usage.as_ref()
+            && let Some(window) = first_context_window(model_usage)
+        {
+            self.model_context_window = Some(window);
         }
 
         // Surface every permission denial as its own error notification, even

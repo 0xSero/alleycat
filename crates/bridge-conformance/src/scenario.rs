@@ -170,7 +170,7 @@ pub async fn run(
         let outcome = client
             .request(method, params(), cfg.default_deadline)
             .await
-            .with_context(|| format!("{method}"))?;
+            .with_context(|| method.to_string())?;
         push_response(&mut t, step, method, &outcome.response);
         let trailing = client.drain_idle(cfg.post_request_idle).await;
         push_notifications(&mut t, step, &outcome.notifications);
@@ -235,15 +235,15 @@ pub async fn run(
         {
             Ok(out) if frame_is_error(&out.response).is_none() => (Some(id), "thread/resume", out),
             other => {
-                if let Ok(out) = &other {
-                    if let Some((code, msg)) = frame_is_error(&out.response) {
-                        tracing::info!(
-                            cached = %id,
-                            code,
-                            msg = %msg,
-                            "cached thread resume failed; will thread/start fresh"
-                        );
-                    }
+                if let Ok(out) = &other
+                    && let Some((code, msg)) = frame_is_error(&out.response)
+                {
+                    tracing::info!(
+                        cached = %id,
+                        code,
+                        msg = %msg,
+                        "cached thread resume failed; will thread/start fresh"
+                    );
                 }
                 let _ = cache::clear_thread_id(target);
                 (
@@ -290,10 +290,11 @@ pub async fn run(
         }
     };
     semantic_ctx.thread_id = Some(thread_id.clone());
-    if cfg.reuse_thread_cache && cached_id.as_deref() != Some(thread_id.as_str()) {
-        if let Err(err) = cache::save_thread_id(target, &thread_id) {
-            tracing::warn!(?err, "failed to persist conformance thread id");
-        }
+    if cfg.reuse_thread_cache
+        && cached_id.as_deref() != Some(thread_id.as_str())
+        && let Err(err) = cache::save_thread_id(target, &thread_id)
+    {
+        tracing::warn!(?err, "failed to persist conformance thread id");
     }
 
     // Step 6: turn/start + drain until turn/completed -----------------------
@@ -437,14 +438,14 @@ pub async fn run(
     push_notifications(&mut t, "thread/name/set", &rename.notifications);
     push_notifications(&mut t, "thread/name/set", &trailing);
 
-    if cfg.exercise_mutations {
-        if let Err(err) = exercise_mutations(client, cfg, &mut t, &mut semantic_ctx).await {
-            if let Some(id) = t.disposable_thread_id.clone() {
-                cleanup_disposable_thread(client, &id, cfg.default_deadline, cfg.post_request_idle)
-                    .await;
-            }
-            return Err(err);
+    if cfg.exercise_mutations
+        && let Err(err) = exercise_mutations(client, cfg, &mut t, &mut semantic_ctx).await
+    {
+        if let Some(id) = t.disposable_thread_id.clone() {
+            cleanup_disposable_thread(client, &id, cfg.default_deadline, cfg.post_request_idle)
+                .await;
         }
+        return Err(err);
     }
 
     // Step 9: command/exec -- a known-deterministic shell command. We

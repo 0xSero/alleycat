@@ -213,10 +213,10 @@ impl TurnStreamEmitter {
         if text.is_empty() {
             return;
         }
-        if let Some(run) = &self.text {
-            if run.kind != kind {
-                self.flush_text();
-            }
+        if let Some(run) = &self.text
+            && run.kind != kind
+        {
+            self.flush_text();
         }
         if self.text.is_none() {
             let now_ms = chrono::Utc::now().timestamp_millis();

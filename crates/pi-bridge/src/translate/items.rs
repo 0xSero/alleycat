@@ -108,7 +108,7 @@ fn flush_turn(
     });
 }
 
-fn index_tool_results<'a>(messages: &'a [AgentMessage]) -> HashMap<&'a str, &'a ToolResultMessage> {
+fn index_tool_results(messages: &[AgentMessage]) -> HashMap<&str, &ToolResultMessage> {
     let mut out = HashMap::new();
     for m in messages {
         if let AgentMessage::ToolResult(t) = m {

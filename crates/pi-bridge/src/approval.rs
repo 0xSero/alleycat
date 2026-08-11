@@ -94,7 +94,7 @@ pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 pub fn should_request_approval(policy: &AskForApproval, kind: ApprovalKind) -> bool {
     match (policy, kind) {
         (AskForApproval::Never, _) => false,
-        (AskForApproval::OnFailure, ApprovalKind::Command { .. }) => false,
+        (AskForApproval::OnFailure, ApprovalKind::Command) => false,
         (AskForApproval::OnFailure, ApprovalKind::FileChange) => false,
         (AskForApproval::OnRequest, _) => true,
         (AskForApproval::UnlessTrusted, _) => true,

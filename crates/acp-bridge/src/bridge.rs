@@ -167,7 +167,7 @@ impl AcpBridge {
     pub fn append_turn(&self, session_id: &str, turn: StoredTurn) {
         self.turns
             .entry(session_id.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(turn);
         debug!(
             "Appended turn (total turns: {})",
@@ -184,13 +184,13 @@ impl AcpBridge {
             return turns.clone();
         }
 
-        if let Some(ref persistence) = self.persistence {
-            if let Ok(Some(disk_turns)) = persistence.load_session(session_id) {
-                debug!("Retrieved turns from disk ({} turns)", disk_turns.len());
-                self.turns
-                    .insert(session_id.to_string(), disk_turns.clone());
-                return disk_turns;
-            }
+        if let Some(ref persistence) = self.persistence
+            && let Ok(Some(disk_turns)) = persistence.load_session(session_id)
+        {
+            debug!("Retrieved turns from disk ({} turns)", disk_turns.len());
+            self.turns
+                .insert(session_id.to_string(), disk_turns.clone());
+            return disk_turns;
         }
 
         debug!("No turn history found for session");
@@ -220,14 +220,14 @@ impl AcpBridge {
     /// Persist current turn history to disk if persistence is enabled.
     #[instrument(skip(self), fields(session_id = %session_id))]
     pub fn save_turns(&self, session_id: &str) {
-        if let Some(ref persistence) = self.persistence {
-            if let Some(turns) = self.turns.get(session_id) {
-                let status = match self.get_session_status(session_id) {
-                    SessionStatus::Idle => "Idle",
-                    SessionStatus::Active => "Active",
-                };
-                let _ = persistence.save_session(session_id, &turns, status);
-            }
+        if let Some(ref persistence) = self.persistence
+            && let Some(turns) = self.turns.get(session_id)
+        {
+            let status = match self.get_session_status(session_id) {
+                SessionStatus::Idle => "Idle",
+                SessionStatus::Active => "Active",
+            };
+            let _ = persistence.save_session(session_id, &turns, status);
         }
     }
 
@@ -309,10 +309,7 @@ impl AcpBridge {
     /// available list untouched. Used by ACP `current_mode_update`
     /// notifications which carry only the new mode id.
     pub fn set_current_mode(&self, session_id: &str, current: String) {
-        let mut entry = self
-            .modes
-            .entry(session_id.to_string())
-            .or_insert_with(ModesSnapshot::default);
+        let mut entry = self.modes.entry(session_id.to_string()).or_default();
         entry.current = Some(current);
     }
 
@@ -431,6 +428,7 @@ impl AcpBridge {
 }
 
 /// Builder for AcpBridge.
+#[derive(Default)]
 pub struct AcpBridgeBuilder {
     agent_bin: Option<PathBuf>,
     agent_args: Option<Vec<String>>,
@@ -442,23 +440,6 @@ pub struct AcpBridgeBuilder {
     retry_backoff: Option<Duration>,
     state_dir: Option<PathBuf>,
     enable_persistence: bool,
-}
-
-impl Default for AcpBridgeBuilder {
-    fn default() -> Self {
-        Self {
-            agent_bin: None,
-            agent_args: None,
-            launcher: None,
-            pool_capacity: None,
-            idle_ttl: None,
-            request_timeout: None,
-            max_retries: None,
-            retry_backoff: None,
-            state_dir: None,
-            enable_persistence: false,
-        }
-    }
 }
 
 impl AcpBridgeBuilder {
@@ -525,56 +506,50 @@ impl AcpBridgeBuilder {
     /// Builder-set values stay; env vars only fill in fields the caller
     /// hasn't already set explicitly.
     pub fn from_env(mut self) -> Self {
-        if self.agent_bin.is_none() {
-            if let Some(bin) = std::env::var_os("ACP_BRIDGE_AGENT_BIN") {
-                self.agent_bin = Some(PathBuf::from(bin));
-            }
+        if self.agent_bin.is_none()
+            && let Some(bin) = std::env::var_os("ACP_BRIDGE_AGENT_BIN")
+        {
+            self.agent_bin = Some(PathBuf::from(bin));
         }
-        if self.agent_args.is_none() {
-            if let Some(args_str) = std::env::var("ACP_BRIDGE_AGENT_ARGS").ok() {
-                self.agent_args =
-                    Some(args_str.split_whitespace().map(|s| s.to_string()).collect());
-            }
+        if self.agent_args.is_none()
+            && let Ok(args_str) = std::env::var("ACP_BRIDGE_AGENT_ARGS")
+        {
+            self.agent_args = Some(args_str.split_whitespace().map(|s| s.to_string()).collect());
         }
-        if self.state_dir.is_none() {
-            if let Some(state_dir) = std::env::var_os("ACP_BRIDGE_STATE_DIR") {
-                self.state_dir = Some(PathBuf::from(state_dir));
-            }
+        if self.state_dir.is_none()
+            && let Some(state_dir) = std::env::var_os("ACP_BRIDGE_STATE_DIR")
+        {
+            self.state_dir = Some(PathBuf::from(state_dir));
         }
-        if self.pool_capacity.is_none() {
-            if let Ok(cap) = std::env::var("ACP_BRIDGE_POOL_CAPACITY") {
-                if let Ok(capacity) = cap.parse::<usize>() {
-                    self.pool_capacity = Some(capacity);
-                }
-            }
+        if self.pool_capacity.is_none()
+            && let Ok(cap) = std::env::var("ACP_BRIDGE_POOL_CAPACITY")
+            && let Ok(capacity) = cap.parse::<usize>()
+        {
+            self.pool_capacity = Some(capacity);
         }
-        if self.idle_ttl.is_none() {
-            if let Ok(ttl) = std::env::var("ACP_BRIDGE_IDLE_TTL_SECS") {
-                if let Ok(secs) = ttl.parse::<u64>() {
-                    self.idle_ttl = Some(Duration::from_secs(secs));
-                }
-            }
+        if self.idle_ttl.is_none()
+            && let Ok(ttl) = std::env::var("ACP_BRIDGE_IDLE_TTL_SECS")
+            && let Ok(secs) = ttl.parse::<u64>()
+        {
+            self.idle_ttl = Some(Duration::from_secs(secs));
         }
-        if self.request_timeout.is_none() {
-            if let Ok(timeout) = std::env::var("ACP_BRIDGE_REQUEST_TIMEOUT_SECS") {
-                if let Ok(secs) = timeout.parse::<u64>() {
-                    self.request_timeout = Some(Duration::from_secs(secs));
-                }
-            }
+        if self.request_timeout.is_none()
+            && let Ok(timeout) = std::env::var("ACP_BRIDGE_REQUEST_TIMEOUT_SECS")
+            && let Ok(secs) = timeout.parse::<u64>()
+        {
+            self.request_timeout = Some(Duration::from_secs(secs));
         }
-        if self.max_retries.is_none() {
-            if let Ok(retries) = std::env::var("ACP_BRIDGE_MAX_RETRIES") {
-                if let Ok(max) = retries.parse::<usize>() {
-                    self.max_retries = Some(max);
-                }
-            }
+        if self.max_retries.is_none()
+            && let Ok(retries) = std::env::var("ACP_BRIDGE_MAX_RETRIES")
+            && let Ok(max) = retries.parse::<usize>()
+        {
+            self.max_retries = Some(max);
         }
-        if self.retry_backoff.is_none() {
-            if let Ok(backoff) = std::env::var("ACP_BRIDGE_RETRY_BACKOFF_MS") {
-                if let Ok(ms) = backoff.parse::<u64>() {
-                    self.retry_backoff = Some(Duration::from_millis(ms));
-                }
-            }
+        if self.retry_backoff.is_none()
+            && let Ok(backoff) = std::env::var("ACP_BRIDGE_RETRY_BACKOFF_MS")
+            && let Ok(ms) = backoff.parse::<u64>()
+        {
+            self.retry_backoff = Some(Duration::from_millis(ms));
         }
         self
     }
@@ -733,7 +708,7 @@ impl Bridge for AcpBridge {
                 };
                 to_value(handlers::handle_model_list(
                     self,
-                    &ctx.session().agent,
+                    ctx.session().agent,
                     typed,
                 ))
             }
@@ -790,13 +765,13 @@ impl Bridge for AcpBridge {
                 let typed: p::TurnSteerParams = decode(params)?;
                 handlers::handle_turn_steer(&client, typed)
                     .await
-                    .and_then(|r| to_value(r))
+                    .and_then(to_value)
             }
             "turn/interrupt" => {
                 let typed: p::TurnInterruptParams = decode(params)?;
                 handlers::handle_turn_interrupt(&client, typed)
                     .await
-                    .and_then(|r| to_value(r))
+                    .and_then(to_value)
             }
             // Review operations
             "review/start" => {
@@ -809,7 +784,7 @@ impl Bridge for AcpBridge {
                 let typed: p::CommandExecTerminateParams = decode(params)?;
                 handlers::handle_command_exec_terminate(&client, typed)
                     .await
-                    .and_then(|r| to_value(r))
+                    .and_then(to_value)
             }
             "command/exec/write" => {
                 let typed: p::CommandExecWriteParams = decode(params)?;

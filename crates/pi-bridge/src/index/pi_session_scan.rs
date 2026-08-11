@@ -56,15 +56,15 @@ pub fn pi_sessions_dir() -> Option<PathBuf> {
 }
 
 fn expand_tilde(input: &str) -> PathBuf {
-    if input == "~" {
-        if let Some(home) = dirs_home() {
-            return home;
-        }
+    if input == "~"
+        && let Some(home) = dirs_home()
+    {
+        return home;
     }
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = dirs_home() {
-            return home.join(rest);
-        }
+    if let Some(rest) = input.strip_prefix("~/")
+        && let Some(home) = dirs_home()
+    {
+        return home.join(rest);
     }
     PathBuf::from(input)
 }
@@ -305,20 +305,19 @@ fn session_modified_date(
             last_activity = Some(last_activity.map_or(ms, |prev| prev.max(ms)));
             continue;
         }
-        if let Some(ts) = entry.get("timestamp").and_then(|v| v.as_str()) {
-            if let Some(dt) = parse_iso8601(ts) {
-                let ms = dt.timestamp_millis();
-                last_activity = Some(last_activity.map_or(ms, |prev| prev.max(ms)));
-            }
+        if let Some(ts) = entry.get("timestamp").and_then(|v| v.as_str())
+            && let Some(dt) = parse_iso8601(ts)
+        {
+            let ms = dt.timestamp_millis();
+            last_activity = Some(last_activity.map_or(ms, |prev| prev.max(ms)));
         }
     }
 
-    if let Some(ms) = last_activity {
-        if ms > 0 {
-            if let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms) {
-                return dt;
-            }
-        }
+    if let Some(ms) = last_activity
+        && ms > 0
+        && let Some(dt) = DateTime::<Utc>::from_timestamp_millis(ms)
+    {
+        return dt;
     }
 
     if header_created.timestamp_millis() > 0 {

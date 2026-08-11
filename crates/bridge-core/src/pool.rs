@@ -384,8 +384,8 @@ mod tests {
     #[tokio::test]
     async fn reap_idle_drops_old_inactive_only() {
         let p = pool(8, Duration::from_millis(50));
-        track(&p, "young".into(), "/a").await;
-        track(&p, "old_active".into(), "/b").await;
+        track(&p, "young", "/a").await;
+        track(&p, "old_active", "/b").await;
         p.mark_active("old_active").await;
         // Backdate "old_active" and "old_inactive" by hand via insert-with-age.
         let (h, _) = FakeHandle::new();

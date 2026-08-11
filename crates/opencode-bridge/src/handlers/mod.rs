@@ -1505,10 +1505,10 @@ fn fold_assistant_into_turn(turn: &mut Value, message: &Value, tool_context: Too
     // Earlier-message errors stay (we only overwrite if the new one is
     // non-null), so a successful assistant after a failed retry doesn't
     // mask the failure history.
-    if let Some(err) = opencode_message_error(message) {
-        if let Some(slot) = turn.get_mut("error") {
-            *slot = err;
-        }
+    if let Some(err) = opencode_message_error(message)
+        && let Some(slot) = turn.get_mut("error")
+    {
+        *slot = err;
     }
 }
 

@@ -290,13 +290,13 @@ pub async fn handle_turn_interrupt(
         .await
         .ok_or_else(|| TurnError::ThreadNotLoaded(params.thread_id.clone()))?;
 
-    if let Some(active) = active_turn(&params.thread_id) {
-        if active.turn_id != params.turn_id {
-            return Err(TurnError::TurnIdMismatch {
-                expected: params.turn_id,
-                actual: active.turn_id,
-            });
-        }
+    if let Some(active) = active_turn(&params.thread_id)
+        && active.turn_id != params.turn_id
+    {
+        return Err(TurnError::TurnIdMismatch {
+            expected: params.turn_id,
+            actual: active.turn_id,
+        });
     }
     // No active turn? Still send pi abort — pi treats it as a no-op when
     // nothing is running, and the codex client may legitimately race
@@ -481,49 +481,47 @@ async fn run_event_pump(mut args: EventPumpArgs) {
             args: tool_args,
             ..
         } = &event
+            && tool_name == "bash"
+            && approval::should_request_approval(
+                &args.approval_policy,
+                approval::ApprovalKind::Command,
+            )
         {
-            if tool_name == "bash"
-                && approval::should_request_approval(
-                    &args.approval_policy,
-                    approval::ApprovalKind::Command,
-                )
-            {
-                let item_id = Uuid::now_v7().to_string();
-                let cmd_str = tool_args
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string);
-                let outcome = approval::request_command_approval(
-                    &args.state,
-                    p::CommandExecutionRequestApprovalParams {
-                        thread_id: args.thread_id.clone(),
-                        turn_id: args.turn_id.clone(),
-                        item_id,
-                        command: cmd_str,
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .await;
-                if let Ok(outcome) = outcome {
-                    if outcome.should_abort_turn() {
-                        let _ = args
-                            .handle
-                            .send_request(pi::RpcCommand::Abort(pi::BareCmd::default()))
-                            .await;
-                    }
-                    // Approve / decline: we still forward pi's events
-                    // since the command is already running. The codex
-                    // client treats `decline` as "let it finish but
-                    // don't auto-trust similar commands later" — that
-                    // matches pi's behavior anyway.
-                    let _ = outcome;
-                } else {
-                    tracing::warn!(
-                        thread_id = %args.thread_id,
-                        "approval request failed; forwarding tool item anyway"
-                    );
+            let item_id = Uuid::now_v7().to_string();
+            let cmd_str = tool_args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let outcome = approval::request_command_approval(
+                &args.state,
+                p::CommandExecutionRequestApprovalParams {
+                    thread_id: args.thread_id.clone(),
+                    turn_id: args.turn_id.clone(),
+                    item_id,
+                    command: cmd_str,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+            if let Ok(outcome) = outcome {
+                if outcome.should_abort_turn() {
+                    let _ = args
+                        .handle
+                        .send_request(pi::RpcCommand::Abort(pi::BareCmd::default()))
+                        .await;
                 }
+                // Approve / decline: we still forward pi's events
+                // since the command is already running. The codex
+                // client treats `decline` as "let it finish but
+                // don't auto-trust similar commands later" — that
+                // matches pi's behavior anyway.
+                let _ = outcome;
+            } else {
+                tracing::warn!(
+                    thread_id = %args.thread_id,
+                    "approval request failed; forwarding tool item anyway"
+                );
             }
         }
 
@@ -536,18 +534,17 @@ async fn run_event_pump(mut args: EventPumpArgs) {
         // Capture agent_end error message before consuming event for
         // translation; the translator emits item/completed for any open
         // items but does not emit turn/completed (that's our job).
-        if let pi::PiEvent::AgentEnd { messages } = &event {
-            if let Some(pi::AgentMessage::Assistant(a)) = messages.last() {
-                if let Some(text) = a.content.iter().find_map(|b| match b {
-                    pi::AssistantContentBlock::Text(t) => Some(t.text.clone()),
-                    _ => None,
-                }) {
-                    // No-op; this is just a hook for richer error
-                    // capture. Real failures show up via auto-retry
-                    // events upstream.
-                    let _ = text;
-                }
-            }
+        if let pi::PiEvent::AgentEnd { messages } = &event
+            && let Some(pi::AgentMessage::Assistant(a)) = messages.last()
+            && let Some(text) = a.content.iter().find_map(|b| match b {
+                pi::AssistantContentBlock::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+        {
+            // No-op; this is just a hook for richer error
+            // capture. Real failures show up via auto-retry
+            // events upstream.
+            let _ = text;
         }
 
         let notifications = translator.translate(event.clone());

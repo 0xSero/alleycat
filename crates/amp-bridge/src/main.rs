@@ -1,4 +1,3 @@
-use std::ffi::OsString;
 use std::path::PathBuf;
 
 use alleycat_amp_bridge::AmpBridge;
@@ -17,11 +16,11 @@ fn transport_from_env_or_args() -> Transport {
     }
     let mut args = std::env::args_os().skip(1);
     while let Some(arg) = args.next() {
-        if arg == OsString::from("--socket") || arg == OsString::from("--listen") {
+        if arg == "--socket" || arg == "--listen" {
             if let Some(path) = args.next() {
                 return Transport::Socket(PathBuf::from(path));
             }
-        } else if arg == OsString::from("--stdio") {
+        } else if arg == "--stdio" {
             return Transport::Stdio;
         }
     }

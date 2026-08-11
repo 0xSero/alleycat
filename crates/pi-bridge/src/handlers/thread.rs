@@ -194,7 +194,7 @@ pub async fn handle_thread_start(
         .additional
         .get("effort")
         .and_then(parse_effort)
-        .or_else(|| Some(p::ReasoningEffort::High));
+        .or(Some(p::ReasoningEffort::High));
 
     Ok(p::ThreadStartResponse {
         thread: thread_from_entry(&entry),
@@ -316,7 +316,7 @@ pub async fn handle_thread_resume(
             .additional
             .get("effort")
             .and_then(parse_effort)
-            .or_else(|| Some(p::ReasoningEffort::High)),
+            .or(Some(p::ReasoningEffort::High)),
     })
 }
 
@@ -505,15 +505,15 @@ pub async fn handle_thread_set_name(
         return Err(ThreadError::NotFound(params.thread_id.clone()));
     }
 
-    if let Some(name) = stored.as_deref() {
-        if let Some(handle) = state.pi_pool().get(&params.thread_id).await {
-            let _ = handle
-                .send_request(pi::RpcCommand::SetSessionName(pi::SetSessionNameCmd {
-                    id: None,
-                    name: name.to_string(),
-                }))
-                .await;
-        }
+    if let Some(name) = stored.as_deref()
+        && let Some(handle) = state.pi_pool().get(&params.thread_id).await
+    {
+        let _ = handle
+            .send_request(pi::RpcCommand::SetSessionName(pi::SetSessionNameCmd {
+                id: None,
+                name: name.to_string(),
+            }))
+            .await;
     }
 
     if state.should_emit("thread/name/updated") {

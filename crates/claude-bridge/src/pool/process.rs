@@ -243,14 +243,15 @@ impl ClaudeProcessHandle {
             bypass_permissions,
         } = config;
 
-        let mut args: Vec<OsString> = Vec::new();
-        args.push("-p".into());
-        args.push("--input-format".into());
-        args.push("stream-json".into());
-        args.push("--output-format".into());
-        args.push("stream-json".into());
-        args.push("--include-partial-messages".into());
-        args.push("--verbose".into());
+        let mut args: Vec<OsString> = vec![
+            "-p".into(),
+            "--input-format".into(),
+            "stream-json".into(),
+            "--output-format".into(),
+            "stream-json".into(),
+            "--include-partial-messages".into(),
+            "--verbose".into(),
+        ];
         if bypass_permissions {
             args.push("--dangerously-skip-permissions".into());
         } else {
