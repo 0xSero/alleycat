@@ -11,7 +11,6 @@ path = "src/lib.rs"
 
 [dependencies]
 alleycat-codex-proto = { workspace = true }
-alleycat-bridge-core = { workspace = true }
 anyhow = { workspace = true }
 # Validates captured frames against the upstream codex-rs JSON schemas. The
 # local `codex-proto` mirror can drift; jsonschema is independent verification.

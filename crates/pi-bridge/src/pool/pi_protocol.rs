@@ -581,7 +581,7 @@ pub enum PiEvent {
     MessageUpdate {
         message: AgentMessage,
         #[serde(rename = "assistantMessageEvent")]
-        assistant_message_event: AssistantMessageEvent,
+        assistant_message_event: Box<AssistantMessageEvent>,
     },
     MessageEnd {
         message: AgentMessage,
@@ -1341,7 +1341,7 @@ mod tests {
             PiEvent::MessageUpdate {
                 assistant_message_event,
                 ..
-            } => match assistant_message_event {
+            } => match &**assistant_message_event {
                 AssistantMessageEvent::TextDelta { delta, .. } => assert_eq!(delta, "hi"),
                 _ => panic!("expected text_delta"),
             },

@@ -138,24 +138,22 @@ impl AmpBridgeBuilder {
     }
 
     pub fn from_env(mut self) -> Self {
-        if self.amp_bin.is_none() {
-            if let Some(bin) = std::env::var_os("AMP_BRIDGE_AMP_BIN")
+        if self.amp_bin.is_none()
+            && let Some(bin) = std::env::var_os("AMP_BRIDGE_AMP_BIN")
                 .or_else(|| std::env::var_os("AMP_BRIDGE_BIN"))
-            {
-                self.amp_bin = Some(PathBuf::from(bin));
-            }
+        {
+            self.amp_bin = Some(PathBuf::from(bin));
         }
-        if self.codex_home.is_none() {
-            if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
-                self.codex_home = Some(PathBuf::from(home));
-            }
+        if self.codex_home.is_none()
+            && let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty())
+        {
+            self.codex_home = Some(PathBuf::from(home));
         }
-        if self.transcripts_dir.is_none() {
-            if let Some(dir) =
+        if self.transcripts_dir.is_none()
+            && let Some(dir) =
                 std::env::var_os("AMP_BRIDGE_TRANSCRIPTS_DIR").filter(|v| !v.is_empty())
-            {
-                self.transcripts_dir = Some(PathBuf::from(dir));
-            }
+        {
+            self.transcripts_dir = Some(PathBuf::from(dir));
         }
         if let Ok(value) = std::env::var("AMP_BRIDGE_DANGEROUSLY_ALLOW_ALL") {
             self.dangerously_allow_all = matches!(
@@ -843,11 +841,7 @@ impl AmpBridge {
                 entry.metadata.reasoning_effort = metadata;
                 entry_changed = true;
             }
-            if let Some(effort) = effort {
-                Some(reasoning_effort_wire_value(effort).to_string())
-            } else {
-                None
-            }
+            effort.map(|effort| reasoning_effort_wire_value(effort).to_string())
         } else {
             None
         };
@@ -867,12 +861,9 @@ impl AmpBridge {
         )
         .await?;
 
-        if entry_changed {
-            if let Err(err) = self.thread_index.insert(entry.clone()).await {
-                remove_active_turn_if_matches(&self.active_turns, &params.thread_id, &turn_id)
-                    .await;
-                return Err(internal(err.to_string()));
-            }
+        if entry_changed && let Err(err) = self.thread_index.insert(entry.clone()).await {
+            remove_active_turn_if_matches(&self.active_turns, &params.thread_id, &turn_id).await;
+            return Err(internal(err.to_string()));
         }
 
         let process = match AmpProcess::launch(

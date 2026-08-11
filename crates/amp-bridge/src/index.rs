@@ -178,15 +178,15 @@ pub fn amp_threads_dir() -> Option<PathBuf> {
 }
 
 fn expand_tilde(input: &str) -> PathBuf {
-    if input == "~" {
-        if let Some(home) = directories::UserDirs::new() {
-            return home.home_dir().to_path_buf();
-        }
+    if input == "~"
+        && let Some(home) = directories::UserDirs::new()
+    {
+        return home.home_dir().to_path_buf();
     }
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = directories::UserDirs::new() {
-            return home.home_dir().join(rest);
-        }
+    if let Some(rest) = input.strip_prefix("~/")
+        && let Some(home) = directories::UserDirs::new()
+    {
+        return home.home_dir().join(rest);
     }
     PathBuf::from(input)
 }

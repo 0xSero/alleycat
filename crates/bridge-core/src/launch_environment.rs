@@ -205,29 +205,29 @@ async fn resolve_uncached(
 ) -> LaunchEnvironment {
     let mut env: EnvMap = std::env::vars_os().collect();
 
-    if policy.load_user_shell {
-        if let Some(shell) = detect_user_shell() {
-            match capture_shell_env(&shell, cwd, &env, policy.provider_timeout).await {
-                Ok(shell_env) => merge_env(&mut env, shell_env),
-                Err(error) => debug!(
-                    shell = %shell.display(),
-                    error = %error,
-                    "launch environment shell snapshot skipped"
-                ),
-            }
+    if policy.load_user_shell
+        && let Some(shell) = detect_user_shell()
+    {
+        match capture_shell_env(&shell, cwd, &env, policy.provider_timeout).await {
+            Ok(shell_env) => merge_env(&mut env, shell_env),
+            Err(error) => debug!(
+                shell = %shell.display(),
+                error = %error,
+                "launch environment shell snapshot skipped"
+            ),
         }
     }
 
-    if policy.load_mise {
-        if let Err(error) = apply_mise_env(cwd, &mut env, policy.provider_timeout).await {
-            debug!(error = %error, "launch environment mise provider skipped");
-        }
+    if policy.load_mise
+        && let Err(error) = apply_mise_env(cwd, &mut env, policy.provider_timeout).await
+    {
+        debug!(error = %error, "launch environment mise provider skipped");
     }
 
-    if policy.load_direnv {
-        if let Err(error) = apply_direnv(cwd, &mut env, policy.provider_timeout).await {
-            debug!(error = %error, "launch environment direnv provider skipped");
-        }
+    if policy.load_direnv
+        && let Err(error) = apply_direnv(cwd, &mut env, policy.provider_timeout).await
+    {
+        debug!(error = %error, "launch environment direnv provider skipped");
     }
 
     LaunchEnvironment { vars: env }

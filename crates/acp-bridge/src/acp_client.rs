@@ -97,11 +97,11 @@ impl Inner {
         }
         // Notification: forward to live subscriber + buffer.
         let buffered = frame.clone();
-        if let Some(tx) = self.notification_tx.lock().await.as_ref() {
-            if tx.send(frame).is_err() {
-                // Subscriber went away — clear it so we stop trying.
-                *self.notification_tx.lock().await = None;
-            }
+        if let Some(tx) = self.notification_tx.lock().await.as_ref()
+            && tx.send(frame).is_err()
+        {
+            // Subscriber went away — clear it so we stop trying.
+            *self.notification_tx.lock().await = None;
         }
         self.pending_notifications.lock().await.push(buffered);
     }
@@ -678,11 +678,11 @@ async fn handle_terminal_kill(
     params: &Value,
 ) -> std::result::Result<Value, String> {
     let id = required_terminal_id(params)?;
-    if let Some(record) = inner.terminals.lock().await.get_mut(id) {
-        if record.exit_code.is_none() {
-            record.exit_code = Some(-1);
-            record.signal = Some("killed".to_string());
-        }
+    if let Some(record) = inner.terminals.lock().await.get_mut(id)
+        && record.exit_code.is_none()
+    {
+        record.exit_code = Some(-1);
+        record.signal = Some("killed".to_string());
     }
     Ok(Value::Null)
 }

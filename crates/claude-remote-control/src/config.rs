@@ -12,18 +12,13 @@ pub const DEFAULT_RUNNER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const CLAUDE_CODE_REMOTE_TRUE: &str = "true";
 pub const CLAUDE_CODE_ENVIRONMENT_KIND_BRIDGE: &str = "bridge";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum EnvironmentKind {
+    #[default]
     Prod,
     Staging,
     Local,
-}
-
-impl Default for EnvironmentKind {
-    fn default() -> Self {
-        Self::Prod
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

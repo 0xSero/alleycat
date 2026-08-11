@@ -42,15 +42,15 @@ pub fn claude_projects_dir() -> Option<PathBuf> {
 }
 
 fn expand_tilde(input: &str) -> PathBuf {
-    if input == "~" {
-        if let Some(home) = directories::UserDirs::new() {
-            return home.home_dir().to_path_buf();
-        }
+    if input == "~"
+        && let Some(home) = directories::UserDirs::new()
+    {
+        return home.home_dir().to_path_buf();
     }
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = directories::UserDirs::new() {
-            return home.home_dir().join(rest);
-        }
+    if let Some(rest) = input.strip_prefix("~/")
+        && let Some(home) = directories::UserDirs::new()
+    {
+        return home.home_dir().join(rest);
     }
     PathBuf::from(input)
 }
@@ -136,34 +136,34 @@ async fn build_session_info(path: &Path) -> Option<ClaudeSessionInfo> {
             Ok(v) => v,
             Err(_) => continue,
         };
-        if cwd.is_empty() {
-            if let Some(c) = value.get("cwd").and_then(|v| v.as_str()) {
-                cwd = c.to_string();
-            }
+        if cwd.is_empty()
+            && let Some(c) = value.get("cwd").and_then(|v| v.as_str())
+        {
+            cwd = c.to_string();
         }
-        if first_message.is_empty() && value.get("type").and_then(|v| v.as_str()) == Some("user") {
-            if let Some(content) = value.get("message").and_then(|m| m.get("content")) {
-                if let Some(s) = content.as_str() {
-                    first_message = s.lines().next().unwrap_or("").to_string();
-                } else if let Some(arr) = content.as_array() {
-                    for entry in arr {
-                        if entry.get("type").and_then(|t| t.as_str()) == Some("text") {
-                            if let Some(t) = entry.get("text").and_then(|v| v.as_str()) {
-                                first_message = t.lines().next().unwrap_or("").to_string();
-                                break;
-                            }
-                        }
-                    }
-                }
-                if first_message_ts.is_none() {
-                    if let Some(ts) = value
-                        .get("timestamp")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        if first_message.is_empty()
+            && value.get("type").and_then(|v| v.as_str()) == Some("user")
+            && let Some(content) = value.get("message").and_then(|m| m.get("content"))
+        {
+            if let Some(s) = content.as_str() {
+                first_message = s.lines().next().unwrap_or("").to_string();
+            } else if let Some(arr) = content.as_array() {
+                for entry in arr {
+                    if entry.get("type").and_then(|t| t.as_str()) == Some("text")
+                        && let Some(t) = entry.get("text").and_then(|v| v.as_str())
                     {
-                        first_message_ts = Some(ts.with_timezone(&Utc));
+                        first_message = t.lines().next().unwrap_or("").to_string();
+                        break;
                     }
                 }
+            }
+            if first_message_ts.is_none()
+                && let Some(ts) = value
+                    .get("timestamp")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            {
+                first_message_ts = Some(ts.with_timezone(&Utc));
             }
         }
         if !cwd.is_empty() && !first_message.is_empty() {
@@ -200,14 +200,12 @@ mod tests {
         let mut f = std::fs::File::create(&session_path).unwrap();
         writeln!(
             f,
-            "{}",
-            r#"{"type":"permission-mode","sessionId":"abc-123","permissionMode":"bypassPermissions"}"#
+            "{{\"type\":\"permission-mode\",\"sessionId\":\"abc-123\",\"permissionMode\":\"bypassPermissions\"}}"
         )
         .unwrap();
         writeln!(
             f,
-            "{}",
-            r#"{"type":"user","cwd":"/private/tmp","message":{"role":"user","content":"hello world"},"timestamp":"2026-04-27T10:00:00Z"}"#
+            "{{\"type\":\"user\",\"cwd\":\"/private/tmp\",\"message\":{{\"role\":\"user\",\"content\":\"hello world\"}},\"timestamp\":\"2026-04-27T10:00:00Z\"}}"
         )
         .unwrap();
         drop(f);

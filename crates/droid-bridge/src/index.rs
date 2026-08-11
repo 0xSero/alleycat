@@ -1054,10 +1054,10 @@ fn source_kind_to_session_source(kind: p::ThreadSourceKind) -> p::SessionSource 
 }
 
 fn expand_tilde(input: &str) -> PathBuf {
-    if input == "~" {
-        if let Some(home) = directories::UserDirs::new() {
-            return home.home_dir().to_path_buf();
-        }
+    if input == "~"
+        && let Some(home) = directories::UserDirs::new()
+    {
+        return home.home_dir().to_path_buf();
     }
     if let Some(rest) = input.strip_prefix("~/")
         && let Some(home) = directories::UserDirs::new()
@@ -1091,20 +1091,17 @@ mod tests {
         let mut file = std::fs::File::create(&session_path).unwrap();
         writeln!(
             file,
-            "{}",
-            r#"{"type":"session_start","id":"abc","title":"hi","sessionTitle":"Greeting","cwd":"/Users/test/work"}"#
+            "{{\"type\":\"session_start\",\"id\":\"abc\",\"title\":\"hi\",\"sessionTitle\":\"Greeting\",\"cwd\":\"/Users/test/work\"}}"
         )
         .unwrap();
         writeln!(
             file,
-            "{}",
-            r#"{"type":"message","id":"u1","timestamp":"2026-05-09T22:52:02.922Z","message":{"role":"user","content":[{"type":"text","text":"hello droid"}]}}"#
+            "{{\"type\":\"message\",\"id\":\"u1\",\"timestamp\":\"2026-05-09T22:52:02.922Z\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"hello droid\"}}]}}}}"
         )
         .unwrap();
         writeln!(
             file,
-            "{}",
-            r#"{"type":"message","id":"a1","timestamp":"2026-05-09T22:52:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}"#
+            "{{\"type\":\"message\",\"id\":\"a1\",\"timestamp\":\"2026-05-09T22:52:05.000Z\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"hi\"}}]}}}}"
         )
         .unwrap();
 

@@ -31,18 +31,14 @@ alleycat-bridge-core = { workspace = true }
 alleycat-codex-proto = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-chrono = { workspace = true }
 futures = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-url = { workspace = true }
-uuid = { workspace = true }
 directories = { workspace = true }
 which = { workspace = true }
 

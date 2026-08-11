@@ -139,7 +139,7 @@ enum Command {
     Agents(cli::agents::AgentsArgs),
     /// Connect to the daemon over iroh like a phone client and run JSON-RPC
     /// methods directly. Defaults to invoking `thread/list` on the chosen agent.
-    Probe(cli::probe::ProbeArgs),
+    Probe(Box<cli::probe::ProbeArgs>),
     /// Restart any running daemon onto the version of *this* binary. Designed
     /// for `npx <wrapper>@latest upgrade` — npm fetches the new tarball, then
     /// this subcommand bounces a stale daemon onto it.
@@ -203,7 +203,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
         Some(Command::Probe(args)) => {
             init_cli_logging();
-            cli::probe::run(args).await
+            cli::probe::run(*args).await
         }
         Some(Command::Upgrade) => {
             init_cli_logging();

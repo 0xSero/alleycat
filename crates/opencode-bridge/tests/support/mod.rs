@@ -43,9 +43,9 @@ pub type SseInjector = Arc<Mutex<Option<TcpStream>>>;
 /// thread reads from this map and serves them.
 #[derive(Default)]
 pub struct FakeServerState {
-    /// Each entry is `(URL prefix, body Value)`. The first entry whose prefix
-    /// matches the request line wins. Order matters — put more-specific
-    /// prefixes first.
+    /// Each entry is `(URL prefix, body Value)`. The longest prefix matching
+    /// the request line wins, so a generic collection route can coexist with
+    /// a more-specific item route.
     pub routes: Vec<(String, Value)>,
     /// Captured request lines (the literal first line, e.g. `POST /foo HTTP/1.1`).
     pub seen: Vec<String>,
@@ -387,7 +387,8 @@ fn handle_conn(mut stream: TcpStream, state: FakeState, injector: SseInjector) {
         let st = state.lock().unwrap();
         st.routes
             .iter()
-            .find(|(prefix, _)| request_line.starts_with(prefix.as_str()))
+            .filter(|(prefix, _)| request_line.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
             .map(|(_, body)| body.clone())
     };
 
@@ -397,7 +398,8 @@ fn handle_conn(mut stream: TcpStream, state: FakeState, injector: SseInjector) {
         let matching_prefix = st
             .routes
             .iter()
-            .find(|(prefix, _)| request_line.starts_with(prefix.as_str()))
+            .filter(|(prefix, _)| request_line.starts_with(prefix.as_str()))
+            .max_by_key(|(prefix, _)| prefix.len())
             .map(|(prefix, _)| prefix.clone());
         if let Some(prefix) = matching_prefix {
             st.bodies.insert(prefix, body_value);

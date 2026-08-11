@@ -138,15 +138,14 @@ pub async fn handle_turn_start(
     let normalized_model_override = params.model.as_deref().map(normalize_claude_model_id);
     let model_override = normalized_model_override.as_deref();
     let thinking_override = params.effort.map(effort_to_thinking_tokens);
-    if model_override.is_some() || thinking_override.is_some() {
-        if let Err(err) = handle
+    if (model_override.is_some() || thinking_override.is_some())
+        && let Err(err) = handle
             .apply_runtime_overrides(model_override, thinking_override, None, CONTROL_SET_TIMEOUT)
             .await
-        {
-            return Err(TurnError::ClaudeRpc(format!(
-                "applying runtime overrides: {err}"
-            )));
-        }
+    {
+        return Err(TurnError::ClaudeRpc(format!(
+            "applying runtime overrides: {err}"
+        )));
     }
 
     let turn_id = Uuid::now_v7().to_string();
@@ -278,13 +277,13 @@ pub async fn handle_turn_interrupt(
         .get(&params.thread_id)
         .await
         .ok_or_else(|| TurnError::ThreadNotLoaded(params.thread_id.clone()))?;
-    if let Some(active) = active_turn(&params.thread_id) {
-        if active.turn_id != params.turn_id {
-            return Err(TurnError::TurnIdMismatch {
-                expected: params.turn_id,
-                actual: active.turn_id,
-            });
-        }
+    if let Some(active) = active_turn(&params.thread_id)
+        && active.turn_id != params.turn_id
+    {
+        return Err(TurnError::TurnIdMismatch {
+            expected: params.turn_id,
+            actual: active.turn_id,
+        });
     }
     interrupt_handle(&handle).await;
     Ok(p::TurnInterruptResponse::default())
@@ -467,17 +466,20 @@ async fn run_event_pump(mut args: EventPumpArgs) {
             _ => {}
         }
         let is_terminal = matches!(payload, ClaudeOutbound::Result(_));
-        if let ClaudeOutbound::Result(ref r) = payload {
-            if r.is_error || r.subtype != "success" {
-                error_message = Some(r.result.clone().filter(|s| !s.is_empty()).unwrap_or_else(
-                    || {
+        if let ClaudeOutbound::Result(ref r) = payload
+            && (r.is_error || r.subtype != "success")
+        {
+            error_message = Some(
+                r.result
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
                         format!(
                             "claude turn ended with subtype {} (terminal_reason={:?})",
                             r.subtype, r.terminal_reason
                         )
-                    },
-                ));
-            }
+                    }),
+            );
         }
 
         let notifications = translator.translate(payload);

@@ -456,9 +456,8 @@ async fn deliver_response(pending: &ResponseTable, mut response: RpcResponse) {
         None => {
             let matches = guard
                 .iter()
-                .filter_map(|(id, pending)| {
-                    (pending.command == response.command).then(|| id.clone())
-                })
+                .filter(|(_, pending)| pending.command == response.command)
+                .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>();
             match matches.as_slice() {
                 [id] => {

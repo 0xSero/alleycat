@@ -89,24 +89,22 @@ impl DroidBridgeBuilder {
     }
 
     pub fn from_env(mut self) -> Self {
-        if self.agent_bin.is_none() {
-            if let Some(bin) = std::env::var_os("DROID_BRIDGE_DROID_BIN")
+        if self.agent_bin.is_none()
+            && let Some(bin) = std::env::var_os("DROID_BRIDGE_DROID_BIN")
                 .or_else(|| std::env::var_os("DROID_BRIDGE_BIN"))
-            {
-                self.agent_bin = Some(PathBuf::from(bin));
-            }
+        {
+            self.agent_bin = Some(PathBuf::from(bin));
         }
-        if self.codex_home.is_none() {
-            if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
-                self.codex_home = Some(PathBuf::from(home));
-            }
+        if self.codex_home.is_none()
+            && let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty())
+        {
+            self.codex_home = Some(PathBuf::from(home));
         }
-        if self.factory_sessions_dir.is_none() {
-            if let Some(dir) =
+        if self.factory_sessions_dir.is_none()
+            && let Some(dir) =
                 std::env::var_os("DROID_BRIDGE_FACTORY_SESSIONS_DIR").filter(|v| !v.is_empty())
-            {
-                self.factory_sessions_dir = Some(PathBuf::from(dir));
-            }
+        {
+            self.factory_sessions_dir = Some(PathBuf::from(dir));
         }
         self
     }
@@ -1026,7 +1024,7 @@ impl DroidBridge {
                 .approval_policy
                 .clone()
                 .unwrap_or(p::AskForApproval::OnRequest),
-            sandbox: sandbox_value(params.sandbox.clone()),
+            sandbox: sandbox_value(params.sandbox),
             turns: Vec::new(),
         }
     }

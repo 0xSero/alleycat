@@ -100,15 +100,14 @@ impl SessionPersistence {
         let mut sessions = Vec::new();
         for entry in fs::read_dir(&self.state_dir)? {
             let entry = entry?;
-            if entry.path().extension().map_or(false, |ext| ext == "json") {
-                if let Some(session_id) = entry
+            if entry.path().extension().is_some_and(|ext| ext == "json")
+                && let Some(session_id) = entry
                     .path()
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .map(|s| s.to_string())
-                {
-                    sessions.push(session_id);
-                }
+            {
+                sessions.push(session_id);
             }
         }
         debug!("Listed {} persisted sessions", sessions.len());
@@ -119,7 +118,7 @@ impl SessionPersistence {
     pub fn clear_all(&self) -> Result<()> {
         for entry in fs::read_dir(&self.state_dir)? {
             let entry = entry?;
-            if entry.path().extension().map_or(false, |ext| ext == "json") {
+            if entry.path().extension().is_some_and(|ext| ext == "json") {
                 fs::remove_file(entry.path())?;
             }
         }

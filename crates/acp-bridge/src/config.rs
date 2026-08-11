@@ -56,36 +56,36 @@ impl AcpBridgeConfig {
         if let Some(bin) = std::env::var_os("ACP_BRIDGE_AGENT_BIN") {
             self.agent_bin = PathBuf::from(bin);
         }
-        if let Some(args_str) = std::env::var("ACP_BRIDGE_AGENT_ARGS").ok() {
+        if let Ok(args_str) = std::env::var("ACP_BRIDGE_AGENT_ARGS") {
             self.agent_args = args_str.split_whitespace().map(|s| s.to_string()).collect();
         }
         if let Some(state_dir) = std::env::var_os("ACP_BRIDGE_STATE_DIR") {
             self.state_dir = Some(PathBuf::from(state_dir));
         }
-        if let Ok(capacity) = std::env::var("ACP_BRIDGE_POOL_CAPACITY") {
-            if let Ok(cap) = capacity.parse::<usize>() {
-                self.pool_capacity = Some(cap);
-            }
+        if let Ok(capacity) = std::env::var("ACP_BRIDGE_POOL_CAPACITY")
+            && let Ok(cap) = capacity.parse::<usize>()
+        {
+            self.pool_capacity = Some(cap);
         }
-        if let Ok(ttl) = std::env::var("ACP_BRIDGE_IDLE_TTL_SECS") {
-            if let Ok(secs) = ttl.parse::<u64>() {
-                self.idle_ttl_secs = Some(secs);
-            }
+        if let Ok(ttl) = std::env::var("ACP_BRIDGE_IDLE_TTL_SECS")
+            && let Ok(secs) = ttl.parse::<u64>()
+        {
+            self.idle_ttl_secs = Some(secs);
         }
-        if let Ok(timeout) = std::env::var("ACP_BRIDGE_REQUEST_TIMEOUT_SECS") {
-            if let Ok(secs) = timeout.parse::<u64>() {
-                self.request_timeout_secs = Some(secs);
-            }
+        if let Ok(timeout) = std::env::var("ACP_BRIDGE_REQUEST_TIMEOUT_SECS")
+            && let Ok(secs) = timeout.parse::<u64>()
+        {
+            self.request_timeout_secs = Some(secs);
         }
-        if let Ok(retries) = std::env::var("ACP_BRIDGE_MAX_RETRIES") {
-            if let Ok(max) = retries.parse::<usize>() {
-                self.max_retries = Some(max);
-            }
+        if let Ok(retries) = std::env::var("ACP_BRIDGE_MAX_RETRIES")
+            && let Ok(max) = retries.parse::<usize>()
+        {
+            self.max_retries = Some(max);
         }
-        if let Ok(backoff) = std::env::var("ACP_BRIDGE_RETRY_BACKOFF_MS") {
-            if let Ok(ms) = backoff.parse::<u64>() {
-                self.retry_backoff_ms = Some(ms);
-            }
+        if let Ok(backoff) = std::env::var("ACP_BRIDGE_RETRY_BACKOFF_MS")
+            && let Ok(ms) = backoff.parse::<u64>()
+        {
+            self.retry_backoff_ms = Some(ms);
         }
         self
     }

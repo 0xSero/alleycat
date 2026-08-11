@@ -19,7 +19,7 @@ async fn thread_resume_then_read_returns_persisted_turns() {
         let mut guard = state.lock().unwrap();
         // The session lookup served by `thread/list { cwd }`.
         guard.route(
-            "GET /session?directory=%2Ftmp%2Fv3r",
+            "GET /session",
             json!([{
                 "id":"ses_resume",
                 "directory":"/tmp/v3r",
@@ -105,7 +105,7 @@ async fn thread_resume_with_bash_history_keeps_command_actions_field() {
     {
         let mut guard = state.lock().unwrap();
         guard.route(
-            "GET /session?directory=%2Ftmp%2Fv3r-bash",
+            "GET /session",
             json!([{
                 "id":"ses_resume_bash",
                 "directory":"/tmp/v3r-bash",

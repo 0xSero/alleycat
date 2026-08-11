@@ -7,7 +7,7 @@
 //!   print the agent table.
 //! - With `--agent <name>`: open a `connect`-style stream, send `initialize`
 //!   + `initialized` + the user-supplied method, and dump every JSON-RPC frame
-//!   in/out.
+//!     in/out.
 //!
 //! Identity: reads the daemon's local `host.toml` + `host.key` so the probe
 //! authenticates with the same node id and token a phone holding the QR
@@ -283,37 +283,28 @@ async fn probe_agent(
         )),
         None => None,
     };
+    let request = AgentProbeRequest {
+        args,
+        resume_from,
+        start_thread_params,
+        before,
+        method,
+        params,
+    };
 
     match wire {
-        AgentWire::Jsonl => {
-            probe_agent_jsonl(
-                conn,
-                token,
-                agent,
-                args,
-                resume_from,
-                start_thread_params,
-                before,
-                method,
-                params,
-            )
-            .await
-        }
-        AgentWire::Websocket => {
-            probe_agent_websocket(
-                conn,
-                token,
-                agent,
-                args,
-                resume_from,
-                start_thread_params,
-                before,
-                method,
-                params,
-            )
-            .await
-        }
+        AgentWire::Jsonl => probe_agent_jsonl(conn, token, agent, request).await,
+        AgentWire::Websocket => probe_agent_websocket(conn, token, agent, request).await,
     }
+}
+
+struct AgentProbeRequest<'a> {
+    args: &'a ProbeArgs,
+    resume_from: Option<u64>,
+    start_thread_params: Option<Value>,
+    before: Option<(String, Value)>,
+    method: String,
+    params: Value,
 }
 
 async fn open_agent_stream(
@@ -364,13 +355,16 @@ async fn probe_agent_jsonl(
     conn: &iroh::endpoint::Connection,
     token: &str,
     agent: &str,
-    args: &ProbeArgs,
-    resume_from: Option<u64>,
-    start_thread_params: Option<Value>,
-    before: Option<(String, Value)>,
-    method: String,
-    mut params: Value,
+    request: AgentProbeRequest<'_>,
 ) -> anyhow::Result<()> {
+    let AgentProbeRequest {
+        args,
+        resume_from,
+        start_thread_params,
+        before,
+        method,
+        mut params,
+    } = request;
     let (mut send, recv) = open_agent_stream(conn, token, agent, resume_from, "JSONL").await?;
     let mut reader = BufReader::new(recv);
 
@@ -424,13 +418,16 @@ async fn probe_agent_websocket(
     conn: &iroh::endpoint::Connection,
     token: &str,
     agent: &str,
-    args: &ProbeArgs,
-    resume_from: Option<u64>,
-    start_thread_params: Option<Value>,
-    before: Option<(String, Value)>,
-    method: String,
-    mut params: Value,
+    request: AgentProbeRequest<'_>,
 ) -> anyhow::Result<()> {
+    let AgentProbeRequest {
+        args,
+        resume_from,
+        start_thread_params,
+        before,
+        method,
+        mut params,
+    } = request;
     let (send, recv) = open_agent_stream(conn, token, agent, resume_from, "WebSocket").await?;
     let stream = tokio::io::join(recv, send);
     let websocket_url = format!("ws://alleycat/{agent}");

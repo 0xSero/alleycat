@@ -212,15 +212,15 @@ impl ClaudeBridgeBuilder {
     /// Builder-set values stay; env vars only fill in fields the caller
     /// hasn't already set explicitly.
     pub fn from_env(mut self) -> Self {
-        if self.agent_bin.is_none() {
-            if let Some(bin) = std::env::var_os("CLAUDE_BRIDGE_CLAUDE_BIN") {
-                self.agent_bin = Some(PathBuf::from(bin));
-            }
+        if self.agent_bin.is_none()
+            && let Some(bin) = std::env::var_os("CLAUDE_BRIDGE_CLAUDE_BIN")
+        {
+            self.agent_bin = Some(PathBuf::from(bin));
         }
-        if self.codex_home.is_none() {
-            if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
-                self.codex_home = Some(PathBuf::from(home));
-            }
+        if self.codex_home.is_none()
+            && let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty())
+        {
+            self.codex_home = Some(PathBuf::from(home));
         }
         if let Ok(value) = std::env::var("CLAUDE_BRIDGE_BYPASS_PERMISSIONS") {
             self.bypass_permissions = matches!(

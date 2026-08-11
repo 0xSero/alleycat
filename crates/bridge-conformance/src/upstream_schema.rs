@@ -34,6 +34,7 @@ const DEFAULT_REL: &str = "dev/codex/codex-rs/app-server-protocol/schema/json/v2
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaSkipReason {
     ExplicitSkip,
+    UnitTest,
 }
 
 /// Directory holding the upstream v2 JSON schema files.
@@ -49,16 +50,23 @@ pub fn schema_dir() -> Result<PathBuf, SchemaSkipReason> {
         }
         panic_missing(Some(p));
     }
-    let candidate = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join(DEFAULT_REL));
-    if let Some(candidate) = candidate {
-        if candidate.is_dir() {
-            return Ok(candidate);
-        }
-        panic_missing(Some(candidate));
+    #[cfg(test)]
+    {
+        Err(SchemaSkipReason::UnitTest)
     }
-    panic_missing(None);
+    #[cfg(not(test))]
+    {
+        let candidate = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(DEFAULT_REL));
+        if let Some(candidate) = candidate {
+            if candidate.is_dir() {
+                return Ok(candidate);
+            }
+            panic_missing(Some(candidate));
+        }
+        panic_missing(None);
+    }
 }
 
 /// Validate a single captured frame against its upstream schema. Returns
@@ -144,7 +152,7 @@ fn is_known_stale_schema_miss(frame: &Frame, target: TargetId, errors: &[String]
 fn path_for_frame(frame: &Frame) -> Option<PathBuf> {
     let dir = match schema_dir() {
         Ok(dir) => dir,
-        Err(SchemaSkipReason::ExplicitSkip) => return None,
+        Err(SchemaSkipReason::ExplicitSkip | SchemaSkipReason::UnitTest) => return None,
     };
     let stem = match frame.kind {
         FrameKind::Response => format!("{}Response", method_to_pascal(&frame.method)),

@@ -525,7 +525,7 @@ impl ClaudeCredentialStore {
             if trimmed.is_empty() {
                 return Ok(None);
             }
-            return Ok(Some(serde_json::from_str(trimmed)?));
+            Ok(Some(serde_json::from_str(trimmed)?))
         }
         #[cfg(not(target_os = "macos"))]
         {

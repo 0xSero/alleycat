@@ -40,17 +40,16 @@ impl ShellBridgeBuilder {
     }
 
     pub fn from_env(mut self) -> Self {
-        if self.shell_bin.is_none() {
-            if let Ok(shell) = std::env::var("ALLEYCAT_SHELL_BIN") {
-                if !shell.trim().is_empty() {
-                    self.shell_bin = Some(shell);
-                }
-            }
+        if self.shell_bin.is_none()
+            && let Ok(shell) = std::env::var("ALLEYCAT_SHELL_BIN")
+            && !shell.trim().is_empty()
+        {
+            self.shell_bin = Some(shell);
         }
-        if self.default_cwd.is_none() {
-            if let Some(cwd) = std::env::var_os("ALLEYCAT_SHELL_CWD") {
-                self.default_cwd = Some(PathBuf::from(cwd));
-            }
+        if self.default_cwd.is_none()
+            && let Some(cwd) = std::env::var_os("ALLEYCAT_SHELL_CWD")
+        {
+            self.default_cwd = Some(PathBuf::from(cwd));
         }
         self
     }

@@ -40,7 +40,7 @@ async fn local_launcher_round_trip_stdout() {
     let status = child.wait().await.expect("wait");
     assert!(status.success(), "child exited with {status:?}");
 
-    let trimmed = buf.trim_end_matches(|c| c == '\n' || c == '\r');
+    let trimmed = buf.trim_end_matches(['\n', '\r']);
     assert_eq!(trimmed, "hello");
 }
 

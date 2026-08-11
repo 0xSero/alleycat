@@ -120,7 +120,7 @@ async fn connection_honors_opt_out_notifications() {
             .unwrap()
             .unwrap()
             .unwrap();
-    let methods = vec![
+    let methods = [
         first
             .get("method")
             .and_then(Value::as_str)

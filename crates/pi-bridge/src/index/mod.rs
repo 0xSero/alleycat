@@ -69,8 +69,7 @@ impl ThreadIndex {
             // Safety: `ThreadIndex` is `#[repr(transparent)]` over
             // `bridge_core::ThreadIndex<PiSessionRef>`, so the `Arc` layout
             // is identical and we can transmute the pointer type.
-            let raw = Arc::into_raw(inner) as *const alleycat_bridge_core::ThreadIndex<PiSessionRef>
-                as *const Self;
+            let raw = Arc::into_raw(inner) as *const Self;
             Arc::from_raw(raw)
         })
     }
@@ -134,8 +133,7 @@ impl ThreadIndex {
         }
 
         Ok(unsafe {
-            let raw = Arc::into_raw(inner) as *const alleycat_bridge_core::ThreadIndex<PiSessionRef>
-                as *const Self;
+            let raw = Arc::into_raw(inner) as *const Self;
             Arc::from_raw(raw)
         })
     }

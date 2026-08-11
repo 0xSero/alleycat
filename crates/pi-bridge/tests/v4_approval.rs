@@ -315,11 +315,11 @@ async fn cancel_decision_triggers_pi_abort() {
     // initial setup, if any), prompt, abort. The bridge issues abort when
     // the approval bucket is `Cancel`.
     assert!(
-        cmds.iter().any(|c| *c == "abort"),
+        cmds.contains(&"abort"),
         "expected pi to receive `abort` on cancel; got: {cmds:?}",
     );
     assert!(
-        cmds.iter().any(|c| *c == "prompt"),
+        cmds.contains(&"prompt"),
         "expected pi to receive `prompt` (the turn started); got: {cmds:?}",
     );
 
@@ -345,11 +345,11 @@ async fn accept_decision_does_not_send_abort() {
 
     let cmds = pi_commands(&scenario.command_log);
     assert!(
-        cmds.iter().any(|c| *c == "prompt"),
+        cmds.contains(&"prompt"),
         "expected pi to receive `prompt`; got: {cmds:?}",
     );
     assert!(
-        !cmds.iter().any(|c| *c == "abort"),
+        !cmds.contains(&"abort"),
         "expected NO `abort` on accept; got: {cmds:?}",
     );
 
@@ -373,7 +373,7 @@ async fn decline_does_not_abort_per_codex_decline_semantics() {
 
     let cmds = pi_commands(&scenario.command_log);
     assert!(
-        !cmds.iter().any(|c| *c == "abort"),
+        !cmds.contains(&"abort"),
         "decline must NOT trigger pi abort (only cancel does); got: {cmds:?}",
     );
 
