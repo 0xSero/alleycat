@@ -1,9 +1,9 @@
 //! `ClaudeBridge` — the unified `Bridge` impl.
 //!
 //! Owns the [`ClaudePool`], the disk-backed thread index, the launcher seam,
-//! and per-connection state keyed by session id. Replaces the legacy
-//! [`crate::server::run_connection_with_session`] free function (which is kept
-//! as a thin compat shim during the migration).
+//! and per-connection state keyed by session id. Production traffic uses the
+//! shared bridge-core server; [`crate::server::run_connection`] remains only as
+//! an in-process test helper.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -113,7 +113,7 @@ impl ClaudeBridge {
     }
 
     /// Internal: assemble a bridge from already-built parts. Used by the
-    /// legacy `run_connection_with_session` compat shim (see `server.rs`).
+    /// in-process `server::run_connection` test helper.
     #[doc(hidden)]
     pub fn __assemble(
         pool: Arc<ClaudePool>,

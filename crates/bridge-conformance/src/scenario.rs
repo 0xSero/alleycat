@@ -344,9 +344,8 @@ pub async fn run(
     // Step 7a: turn/start with a tool-using prompt --------------------------
     //
     // Exercises the CommandExecution / DynamicToolCall item shapes that the
-    // simple-reply turn doesn't reach. Prompt is engineered so any of the
-    // four agents picks their shell tool (claude→Bash, opencode→bash,
-    // pi→shell, codex→shell) without a thinking detour. The bridges'
+    // simple-reply turn doesn't reach. Prompt is engineered so every
+    // supported target picks its shell tool without a thinking detour. The bridges'
     // `approvalPolicy: "never"` (set on thread/start) lets the call run
     // without surfacing a server→client permission request.
     let tool_turn = client

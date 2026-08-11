@@ -9,7 +9,7 @@ a paired client, and the client picks an agent over the same stream multiplexer.
 
 ## Install
 
-End-user packages are published from the [`kittylitter`](https://github.com/dnakov/litter) project, which wraps this daemon under the `kittylitter` command. The currently enabled published channel is npm/bun; Homebrew, shell installer, PowerShell installer, and MSI publishing are not enabled in the release config right now. Source installs from this repo expose the daemon as `alleycat`.
+End-user packages are published from the [`kittylitter`](https://github.com/0xSero/litter) project, which wraps this daemon under the `kittylitter` command. The currently enabled published channel is npm/bun; Homebrew, shell installer, PowerShell installer, and MSI publishing are not enabled in the release config right now. Source installs from this repo expose the daemon as `alleycat`.
 
 | Platform | Install |
 |---|---|
@@ -58,6 +58,9 @@ The command surface is the same for `kittylitter` packaged installs and `alleyca
 | `alleycat agents list` | List configured agents and their availability. |
 | `alleycat logs [-f]` | Tail the daemon log files. |
 | `alleycat stop` | Graceful shutdown via the control socket. |
+| `alleycat restart` | Restart the daemon using the current binary and refresh its autostart entry. |
+| `alleycat probe [OPTIONS]` | Connect over iroh like a phone client and exercise an agent's JSON-RPC surface. |
+| `alleycat upgrade` | Restart a stale daemon onto the version of the currently running CLI. |
 
 The daemon talks to the CLI over a Unix domain socket on macOS/Linux and a per-user named pipe on Windows. `status`, `pair`, and `rotate` round-trip through it when the daemon is up and fall back to file-only operations when it isn't, so first-run flows still work.
 
@@ -113,6 +116,12 @@ The daemon answers with `{ok, agents?, error?}`. On `connect`, after the respons
 token = "..."          # 32 bytes hex; rotate via `alleycat rotate`
 # relay = "https://..." # optional iroh relay override
 
+[session]
+replay_max_msgs = 2048
+replay_max_bytes = 16777216
+idle_ttl_secs = 600
+pending_grace_secs = 60
+
 [agents.codex]
 enabled = true
 bin = "codex"
@@ -136,6 +145,7 @@ bin = "opencode"
 [agents.claude]
 enabled = true
 bin = "claude"
+bypass_permissions = true # false forwards tool approvals to the client
 
 [agents.droid]
 enabled = true
@@ -219,7 +229,7 @@ The workspace crates are:
 - `crates/shell-bridge` — interactive shell process adapter.
 - `crates/claude-remote-control` — auxiliary Claude remote-control protocol support.
 
-Releases are produced from the [`litter`](https://github.com/dnakov/litter)
+Releases are produced from the [`litter`](https://github.com/0xSero/litter)
 repo. Litter consumes selected bridge crates through revision-pinned Git
 dependencies and packages the daemon through its `kittylitter` wrapper. A
 change on Alleycat `main` is therefore not shipped until Litter updates and
