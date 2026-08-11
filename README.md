@@ -2,7 +2,10 @@
 
 ![Alleycat logo](assets/alleycat-logo.png)
 
-Iroh-backed bridge that multiplexes a few local coding agents — Codex, Pi, Amp, OpenCode, Claude, Factory Droid, and Hermes — onto a single QUIC connection. Run the daemon on your machine, scan a QR with a paired client, and the client picks an agent over the same stream multiplexer.
+Iroh-backed bridge that multiplexes local coding agents — Codex, Pi, Amp,
+OpenCode, Claude, Factory Droid, Hermes, Devin, Grok, and an interactive shell —
+onto a single QUIC connection. Run the daemon on your machine, scan a QR with
+a paired client, and the client picks an agent over the same stream multiplexer.
 
 ## Install
 
@@ -36,6 +39,9 @@ The daemon spawns external coding-agent CLIs on demand — install whichever one
 | `codex` | Install the `codex` CLI ([codex docs](https://github.com/openai/codex)). The daemon spawns `codex app-server` on demand. |
 | `droid` | Install Factory Droid, then either run `droid login` once or set `FACTORY_API_KEY` in the daemon environment. |
 | `hermes` | Install stock [Hermes Agent](https://github.com/NousResearch/hermes-agent). Alleycat prefers the Hermes gateway API on loopback and falls back to `hermes -z`; set `API_SERVER_KEY` or `HERMES_API_KEY` only in the daemon environment if your API server requires it. |
+| `devin` | Install and authenticate the Devin CLI. Alleycat starts its ACP stdio mode on demand. |
+| `grok` | Install and authenticate the Grok CLI. Alleycat starts `grok agent stdio` on demand. |
+| `shell` | Uses the configured local shell (`$SHELL` by default); no separate agent install is required. |
 
 ## Commands
 
@@ -66,6 +72,9 @@ The daemon talks to the CLI over a Unix domain socket on macOS/Linux and a per-u
 | `claude` | Yes, per codex thread | `ClaudePool` spawns `claude -p --input-format stream-json --output-format stream-json --session-id <thread_id> --dangerously-skip-permissions` on demand. Same 16-cap, 10-minute idle reap, LRU eviction as pi. Sessions resume on next access via `--resume <thread_id>`. |
 | `droid` | Yes, per codex thread | Spawns `droid exec --input-format stream-jsonrpc --output-format stream-jsonrpc --cwd <cwd>` and translates Factory session notifications into the codex app-server wire. |
 | `hermes` | Yes, one turn per request | Uses stock Hermes gateway API (`/health`, `/v1/runs`, `/v1/runs/{id}/events`, `/v1/runs/{id}/stop`) when available, otherwise spawns `hermes -z <prompt>` and `--resume <session>` with argv-only process creation. API keys stay inside the daemon process and are never sent to paired clients. |
+| `devin` | Yes, per ACP session | Starts the configured Devin CLI through the generic ACP bridge and uses Devin's local session database for thread discovery. |
+| `grok` | Yes, per ACP session | Starts `grok agent stdio`; model, leader, approval, and reasoning settings come from `host.toml`. |
+| `shell` | Yes, per thread | Starts an interactive local shell through the shell bridge. Environment passthrough is disabled by default. |
 
 ## Pair payload
 
@@ -137,9 +146,33 @@ api_key_env = "FACTORY_API_KEY"
 enabled = true
 bin = "hermes"
 api_base = "http://127.0.0.1:8642"
+
+[agents.devin]
+enabled = true
+bin = "devin"
+
+[agents.grok]
+enabled = true
+bin = "grok"
+no_leader = true
+always_approve = false
+reasoning_effort = "medium"
+
+[agents.shell]
+enabled = true
+shell_bin = "/bin/zsh"
+# default_cwd = "/path/to/workspace"
+allow_env_passthrough = false
 ```
 
-Reload swaps config that's read per-request (token, agent enable flags). Codex's `bin`/`host`/`port`, pi's `bin`, Amp's `bin`/permission mode, OpenCode's `bin`/runtime port, Droid's `bin`, and Hermes's `bin`/`api_base` are pinned at first spawn; changing those requires `alleycat stop` + `serve`. Codex `host`/`port` are only used by the legacy websocket fallback. For Hermes API mode, bind the Hermes gateway to loopback and put `API_SERVER_KEY`/`HERMES_API_KEY` only in the Alleycat daemon environment; mobile clients authenticate through Alleycat pairing and never receive the Hermes key.
+Reload swaps config that's read per-request (token, agent enable flags). Bridge
+process configuration is pinned when each bridge starts; changing binaries,
+launch arguments, or the shell requires `alleycat stop` + `serve`. Codex
+`host`/`port` are only used by the legacy websocket fallback. For Hermes API
+mode, bind the Hermes gateway to loopback and put
+`API_SERVER_KEY`/`HERMES_API_KEY` only in the Alleycat daemon environment;
+mobile clients authenticate through Alleycat pairing and never receive the
+Hermes key.
 
 ## File layout
 
@@ -157,7 +190,7 @@ The Unix control socket falls through `XDG_RUNTIME_DIR` → state dir → `TMPDI
 
 ## Notes
 
-- Codex, Pi, Amp, OpenCode, Claude, Droid, and Hermes children inherit `kill_on_drop` semantics, so they exit when the daemon does.
+- Agent child processes inherit `kill_on_drop` semantics, so they exit when the daemon does.
 - `alleycat stop` shuts the iroh endpoint and the daemon process; launchd / systemd will restart it under their normal supervision.
 
 ## Building from source
@@ -172,6 +205,7 @@ target/release/alleycat install
 The workspace crates are:
 
 - `crates/alleycat` — `alleycat` daemon binary. Owns the iroh endpoint, the persistent identity, the agent dispatcher, and an OS-native control socket so the CLI can talk to the running daemon.
+- `crates/acp-bridge` — generic Agent Client Protocol adapter used by ACP-compatible agents.
 - `crates/amp-bridge` — Amp `--stream-json` process wrapper plus codex-shaped turn/tool translation and Alleycat-owned Amp thread records.
 - `crates/bridge-conformance` — live conformance harness for comparing bridge behavior against codex app-server wire shapes.
 - `crates/bridge-core` — shared JSON-RPC framing, server scaffolding, and notification plumbing used by the bridges.
@@ -180,7 +214,14 @@ The workspace crates are:
 - `crates/opencode-bridge` — single shared `opencode serve` backend wrapped in the same JSON-RPC surface.
 - `crates/claude-bridge` — `claude -p --output-format stream-json` process pool wrapped in the same JSON-RPC surface (one claude process per codex thread).
 - `crates/droid-bridge` — Factory Droid `stream-jsonrpc` process wrapper plus codex-shaped turn/tool translation (one droid process per codex thread).
+- `crates/devin-bridge` and `crates/grok-bridge` — configured ACP bridge frontends for those agents.
 - `crates/hermes-bridge` — stock-Hermes API/CLI adapter that exposes Hermes as the codex app-server JSON-RPC surface for Alleycat clients.
+- `crates/shell-bridge` — interactive shell process adapter.
 - `crates/claude-remote-control` — auxiliary Claude remote-control protocol support.
 
-Releases are produced from the [`litter`](https://github.com/dnakov/litter) repo, which carries this repo as a submodule under `shared/third_party/alleycat` and runs [`dist`](https://github.com/axodotdev/cargo-dist) against the `kittylitter` wrapper to build platform release artifacts and publish the npm package. Homebrew, shell installer, PowerShell installer, and MSI publishing are disabled in litter's release config right now. To cut a release: bump `version` in the root `Cargo.toml` here, push, then bump the submodule pin in litter and tag `vX.Y.Z` there.
+Releases are produced from the [`litter`](https://github.com/dnakov/litter)
+repo. Litter consumes selected bridge crates through revision-pinned Git
+dependencies and packages the daemon through its `kittylitter` wrapper. A
+change on Alleycat `main` is therefore not shipped until Litter updates and
+verifies its pinned revision. Homebrew, shell installer, PowerShell installer,
+and MSI publishing are currently disabled in Litter's release configuration.
