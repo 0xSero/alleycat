@@ -20,9 +20,15 @@ use dashmap::DashMap;
 use serde_json::Value;
 
 use crate::handlers;
-use crate::index::{ClaudeHydrator, ClaudeSessionRef};
+use crate::index::{
+    ClaudeHydrator, ClaudeSessionInfo, ClaudeSessionRef, claude_session_scan, entry_from_claude,
+};
 use crate::pool::{ClaudePool, PoolPolicy};
 use crate::state::{ConnectionState, ThreadDefaults};
+
+/// Default interval between background rescans of the claude `projects/`
+/// directory. See [`ClaudeBridgeBuilder::rescan_interval`].
+pub const DEFAULT_RESCAN_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Concrete handle type stored on the bridge. Uses [`crate::state::ThreadIndexHandle`]
 /// (a marker subtrait of `bridge_core::ThreadIndexHandle<ClaudeSessionRef>`)
@@ -145,6 +151,10 @@ pub struct ClaudeBridgeBuilder {
     /// Override for the claude `projects/` directory (test hook). `None`
     /// uses [`crate::index::claude_projects_dir`].
     projects_dir_override: Option<PathBuf>,
+    /// How often the background task rescans `projects/` for sessions created
+    /// or updated outside this bridge. `None` uses
+    /// [`DEFAULT_RESCAN_INTERVAL`]; `Duration::ZERO` disables the rescan.
+    rescan_interval: Option<Duration>,
 }
 
 impl Default for ClaudeBridgeBuilder {
@@ -158,6 +168,7 @@ impl Default for ClaudeBridgeBuilder {
             bypass_permissions: PoolPolicy::default().bypass_permissions,
             trust_persisted_cwd: false,
             projects_dir_override: None,
+            rescan_interval: None,
         }
     }
 }
@@ -200,6 +211,15 @@ impl ClaudeBridgeBuilder {
 
     pub fn projects_dir_override(mut self, dir: PathBuf) -> Self {
         self.projects_dir_override = Some(dir);
+        self
+    }
+
+    /// Set how often the bridge rescans the claude `projects/` directory for
+    /// sessions created while the daemon is running (defaults to
+    /// [`DEFAULT_RESCAN_INTERVAL`]). Pass `Duration::ZERO` to disable the
+    /// background rescan entirely.
+    pub fn rescan_interval(mut self, interval: Duration) -> Self {
+        self.rescan_interval = Some(interval);
         self
     }
 
@@ -256,7 +276,8 @@ impl ClaudeBridgeBuilder {
             idle_ttl,
         ));
 
-        let hydrator = match self.projects_dir_override {
+        let projects_dir_override = self.projects_dir_override;
+        let hydrator = match projects_dir_override.clone() {
             Some(dir) => ClaudeHydrator::with_override_dir(dir),
             None => ClaudeHydrator::new(),
         };
@@ -265,6 +286,30 @@ impl ClaudeBridgeBuilder {
             &hydrator,
         )
         .await?;
+
+        // Hydration only runs here at startup, so sessions created while the
+        // daemon is running (e.g. a terminal `claude` session) never show up
+        // in `thread/list` until a restart. Re-run the JSONL scan
+        // periodically so the index tracks new on-disk sessions live.
+        let rescan_interval = self.rescan_interval.unwrap_or(DEFAULT_RESCAN_INTERVAL);
+        if !rescan_interval.is_zero() {
+            let rescan_index = Arc::clone(&index);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(rescan_interval).await;
+                    let scanned = match projects_dir_override.as_deref() {
+                        Some(dir) => claude_session_scan::list_sessions_from_dir(dir).await,
+                        None => claude_session_scan::list_all().await,
+                    };
+                    let (added, refreshed) =
+                        merge_scanned_sessions(rescan_index.as_ref(), &scanned).await;
+                    if added > 0 || refreshed > 0 {
+                        tracing::info!(added, refreshed, "claude projects rescan updated index");
+                    }
+                }
+            });
+        }
+
         let thread_index: ThreadIndexHandle = index;
 
         Ok(Arc::new(ClaudeBridge {
@@ -276,6 +321,49 @@ impl ClaudeBridgeBuilder {
             trust_persisted_cwd: self.trust_persisted_cwd,
         }))
     }
+}
+
+/// Merge one `projects/` scan into the index: insert sessions the index has
+/// never seen and bump `updated_at` for known sessions whose transcript was
+/// modified after the row was last touched. Returns `(added, refreshed)`.
+///
+/// A refresh keeps the row's existing preview: the scan's preview is the
+/// transcript's first user message, which never changes, while handlers may
+/// have already stored something fresher on the row.
+async fn merge_scanned_sessions(
+    index: &CoreThreadIndex<ClaudeSessionRef>,
+    scanned: &[ClaudeSessionInfo],
+) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut refreshed = 0usize;
+    for info in scanned {
+        let entry = entry_from_claude(info);
+        match index.lookup(&entry.thread_id).await {
+            None => match index.insert(entry).await {
+                Ok(()) => added += 1,
+                Err(err) => {
+                    tracing::warn!(thread_id = %info.session_id, %err, "rescan: insert failed");
+                }
+            },
+            Some(existing) if entry.updated_at > existing.updated_at => {
+                match index
+                    .update_preview_and_updated_at(
+                        &entry.thread_id,
+                        existing.preview,
+                        info.modified,
+                    )
+                    .await
+                {
+                    Ok(()) => refreshed += 1,
+                    Err(err) => {
+                        tracing::warn!(thread_id = %info.session_id, %err, "rescan: refresh failed");
+                    }
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    (added, refreshed)
 }
 
 #[async_trait]
@@ -623,5 +711,71 @@ fn turn_to_rpc(err: handlers::turn::TurnError) -> JsonRpcError {
         code: err.rpc_code(),
         message: err.to_string(),
         data: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::DateTime;
+    use tempfile::TempDir;
+
+    fn info(id: &str, modified_ms: i64) -> ClaudeSessionInfo {
+        ClaudeSessionInfo {
+            path: PathBuf::from(format!("/sessions/{id}.jsonl")),
+            session_id: id.to_string(),
+            cwd: "/work".to_string(),
+            created: DateTime::from_timestamp_millis(0).unwrap(),
+            modified: DateTime::from_timestamp_millis(modified_ms).unwrap(),
+            first_message: format!("first message {id}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn merge_inserts_new_refreshes_stale_skips_current() {
+        let dir = TempDir::new().unwrap();
+        let index = CoreThreadIndex::<ClaudeSessionRef>::open_at(dir.path().join("threads.json"))
+            .await
+            .unwrap();
+
+        // "known-stale": indexed at t=1000, on disk modified at t=2000.
+        index
+            .insert(crate::index::entry_from_claude(&info("known-stale", 1_000)))
+            .await
+            .unwrap();
+        index
+            .update_preview_and_updated_at(
+                "known-stale",
+                "live preview".to_string(),
+                DateTime::from_timestamp_millis(1_000).unwrap(),
+            )
+            .await
+            .unwrap();
+        // "known-current": indexed at t=5000, on disk unchanged.
+        index
+            .insert(crate::index::entry_from_claude(&info(
+                "known-current",
+                5_000,
+            )))
+            .await
+            .unwrap();
+
+        let scanned = vec![
+            info("brand-new", 3_000),
+            info("known-stale", 2_000),
+            info("known-current", 5_000),
+        ];
+        let (added, refreshed) = merge_scanned_sessions(&index, &scanned).await;
+
+        assert_eq!((added, refreshed), (1, 1));
+        assert!(index.lookup("brand-new").await.is_some());
+        let stale = index.lookup("known-stale").await.unwrap();
+        assert_eq!(stale.updated_at, 2_000);
+        // Refresh must not clobber a preview set after insert.
+        assert_eq!(stale.preview, "live preview");
+        assert_eq!(
+            index.lookup("known-current").await.unwrap().updated_at,
+            5_000
+        );
     }
 }
