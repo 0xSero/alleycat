@@ -77,8 +77,7 @@ async fn conformance_hermes() {
 }
 
 #[tokio::test]
-// Temporarily un-ignored to test real Grok ACP
-// #[ignore = "live conformance — requires ACP agent (e.g. `devin` or `grok`) on PATH"]
+#[ignore = "live conformance — requires ACP agent (e.g. `devin` or `grok`) on PATH"]
 async fn conformance_acp() {
     let _guard = live_test_guard().await;
     run_target(TargetId::Acp).await;
@@ -220,7 +219,7 @@ async fn method_surface_runtime() {
 // ============================================================================
 
 enum DriveOutcome {
-    Ran(Transcript),
+    Ran(Box<Transcript>),
     Skipped(String),
     Failed(anyhow::Error),
 }
@@ -294,12 +293,12 @@ async fn drive_with_options(
         )
         .await;
     }
-    if let Some(dir) = std::env::var_os("BRIDGE_CONFORMANCE_DUMP_DIR") {
-        if let Err(err) = dump_transcript(std::path::Path::new(&dir), &transcript) {
-            eprintln!("conformance({target}): dump failed: {err:#}");
-        }
+    if let Some(dir) = std::env::var_os("BRIDGE_CONFORMANCE_DUMP_DIR")
+        && let Err(err) = dump_transcript(std::path::Path::new(&dir), &transcript)
+    {
+        eprintln!("conformance({target}): dump failed: {err:#}");
     }
-    DriveOutcome::Ran(transcript)
+    DriveOutcome::Ran(Box::new(transcript))
 }
 
 fn standalone_findings(transcript: &Transcript) -> Vec<Finding> {
@@ -404,8 +403,8 @@ async fn probe_method_surface(target: TargetId) -> DriveOutcome {
         process_id: None,
     };
     let probe_deadline = Duration::from_secs(5);
-    if let Some(thread_id) = ctx.thread_id.as_deref() {
-        if let Ok(seed) = handle
+    if let Some(thread_id) = ctx.thread_id.as_deref()
+        && let Ok(seed) = handle
             .client
             .request(
                 "turn/start",
@@ -418,17 +417,16 @@ async fn probe_method_surface(target: TargetId) -> DriveOutcome {
                 cfg.turn_deadline,
             )
             .await
-        {
-            let _ = handle
-                .client
-                .drain_notifications_until(&["turn/completed"], cfg.turn_deadline)
-                .await;
-            ctx.turn_id = seed
-                .response
-                .pointer("/result/turn/id")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-        }
+    {
+        let _ = handle
+            .client
+            .drain_notifications_until(&["turn/completed"], cfg.turn_deadline)
+            .await;
+        ctx.turn_id = seed
+            .response
+            .pointer("/result/turn/id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
     }
 
     for method in method_surface::STANDARD_REQUEST_METHODS {
@@ -485,7 +483,7 @@ async fn probe_method_surface(target: TargetId) -> DriveOutcome {
         .await;
     }
 
-    DriveOutcome::Ran(transcript)
+    DriveOutcome::Ran(Box::new(transcript))
 }
 
 async fn start_probe_process(

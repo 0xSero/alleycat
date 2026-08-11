@@ -43,8 +43,10 @@ fn test_acp_to_codex_initialize_result() {
     assert!(codex_result.is_ok());
 
     let codex_result = codex_result.unwrap();
-    assert_eq!(codex_result["serverInfo"]["name"], "TestAgent");
-    assert_eq!(codex_result["serverInfo"]["version"], "2.0.0");
+    assert_eq!(
+        codex_result["userAgent"],
+        "alleycat-acp-bridge/0.1.0 (TestAgent 2.0.0)"
+    );
 }
 
 #[test]

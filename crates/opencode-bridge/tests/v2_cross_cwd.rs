@@ -31,22 +31,21 @@ async fn two_threads_in_different_cwds_remain_separate() {
             }),
         );
         guard.route(
-            "GET /session?directory=%2Ftmp%2Fa",
-            json!([{
-                "id":"ses_a",
-                "directory":"/tmp/a",
-                "title":"V2-A",
-                "time":{"created":1_000,"updated":1_000}
-            }]),
-        );
-        guard.route(
-            "GET /session?directory=%2Ftmp%2Fb",
-            json!([{
-                "id":"ses_b",
-                "directory":"/tmp/b",
-                "title":"V2-B",
-                "time":{"created":1_001,"updated":1_001}
-            }]),
+            "GET /session",
+            json!([
+                {
+                    "id":"ses_a",
+                    "directory":"/tmp/a",
+                    "title":"V2-A",
+                    "time":{"created":1_000,"updated":1_000}
+                },
+                {
+                    "id":"ses_b",
+                    "directory":"/tmp/b",
+                    "title":"V2-B",
+                    "time":{"created":1_001,"updated":1_001}
+                }
+            ]),
         );
     }
 
@@ -123,18 +122,20 @@ async fn two_threads_in_different_cwds_remain_separate() {
     assert_eq!(data_b[0]["id"].as_str(), Some(thread_b.as_str()));
     assert_eq!(data_b[0]["cwd"], "/tmp/b");
 
-    // Confirm the bridge actually filtered at the upstream level (not just
-    // post-filtered locally) by inspecting the captured request paths.
+    // Codex cwd overrides live in the bridge index and may differ from the
+    // directory opencode persisted. The bridge must fetch the collection
+    // without an upstream directory filter, then apply the filter locally.
     let seen = fx.seen();
     assert!(
         seen.iter()
-            .any(|line| line.contains("GET /session?directory=%2Ftmp%2Fa")),
-        "expected /tmp/a directory filter on upstream GET /session: {seen:?}"
+            .filter(|line| line.starts_with("GET /session?"))
+            .count()
+            >= 2,
+        "expected collection fetches for both thread/list calls: {seen:?}"
     );
     assert!(
-        seen.iter()
-            .any(|line| line.contains("GET /session?directory=%2Ftmp%2Fb")),
-        "expected /tmp/b directory filter on upstream GET /session: {seen:?}"
+        seen.iter().all(|line| !line.contains("directory=")),
+        "thread/list must not forward Codex cwd overrides upstream: {seen:?}"
     );
 
     // Drain any queued response bodies just to keep the mutex's `bodies` map

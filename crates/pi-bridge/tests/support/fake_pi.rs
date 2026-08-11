@@ -68,16 +68,14 @@ fn main() -> ExitCode {
         // to assert "the bridge sent pi command X". When `FAKE_PI_COMMAND_LOG`
         // is set, append the inbound command's `type` to that file (one per
         // line). Best-effort — write errors are ignored.
-        if let Ok(log_path) = env::var("FAKE_PI_COMMAND_LOG") {
-            if !log_path.is_empty() {
-                if let Ok(mut f) = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                {
-                    let _ = writeln!(f, "{cmd_type}");
-                }
-            }
+        if let Ok(log_path) = env::var("FAKE_PI_COMMAND_LOG")
+            && !log_path.is_empty()
+            && let Ok(mut f) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+        {
+            let _ = writeln!(f, "{cmd_type}");
         }
 
         match cmd_type {
@@ -169,6 +167,17 @@ fn main() -> ExitCode {
                                 "outputModalities": ["text"],
                             }]
                         })),
+                    ),
+                );
+            }
+            "list_sessions" => {
+                emit(
+                    &mut out,
+                    &response(
+                        id.as_deref(),
+                        cmd_type,
+                        true,
+                        Some(json!({ "sessions": [] })),
                     ),
                 );
             }
@@ -402,10 +411,10 @@ fn response(id: Option<&str>, command: &str, success: bool, data: Option<Value>)
                 obj.insert("data".into(), Value::Null);
             }
         }
-    } else if let Some(err) = data {
-        if let Some(msg) = err.get("error").and_then(|v| v.as_str()) {
-            obj.insert("error".into(), json!(msg));
-        }
+    } else if let Some(err) = data
+        && let Some(msg) = err.get("error").and_then(|v| v.as_str())
+    {
+        obj.insert("error".into(), json!(msg));
     }
     Value::Object(obj)
 }
