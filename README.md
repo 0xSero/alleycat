@@ -1,6 +1,6 @@
 # Alleycat
 
-![Alleycat logo](assets/alleycat-logo.png)
+![Alleycat logo](assets/alleycat-logo.webp)
 
 Iroh-backed bridge that multiplexes local coding agents — Codex, Pi, Amp,
 OpenCode, Claude, Factory Droid, Hermes, Devin, Grok, and an interactive shell —
