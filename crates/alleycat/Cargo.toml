@@ -64,6 +64,3 @@ libc.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 mslnk = "0.1"
-
-[dev-dependencies]
-tempfile.workspace = true

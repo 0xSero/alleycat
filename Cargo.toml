@@ -64,7 +64,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 which = "6"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
-tokio-util = { version = "0.7", features = ["codec", "io"] }
 uuid = { version = "1", features = ["serde", "v7"] }
 pretty_assertions = "1"
 tempfile = "3"
