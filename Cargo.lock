@@ -83,7 +83,6 @@ dependencies = [
  "alleycat-shell-bridge",
  "anyhow",
  "arc-swap",
- "async-trait",
  "clap",
  "directories",
  "fd-lock",
@@ -120,13 +119,10 @@ dependencies = [
  "base64",
  "chrono",
  "dashmap",
- "futures",
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -137,7 +133,6 @@ name = "alleycat-amp-bridge"
 version = "0.1.0"
 dependencies = [
  "alleycat-bridge-core",
- "alleycat-claude-bridge",
  "alleycat-codex-proto",
  "anyhow",
  "async-trait",
@@ -159,7 +154,6 @@ dependencies = [
 name = "alleycat-bridge-conformance"
 version = "0.1.0"
 dependencies = [
- "alleycat-bridge-core",
  "alleycat-codex-proto",
  "anyhow",
  "jsonschema",
@@ -181,7 +175,6 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
- "dashmap",
  "futures",
  "serde",
  "serde_json",
@@ -203,14 +196,12 @@ dependencies = [
  "chrono",
  "dashmap",
  "directories",
- "futures",
  "pretty_assertions",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -241,10 +232,8 @@ dependencies = [
 name = "alleycat-codex-proto"
 version = "0.1.0"
 dependencies = [
- "chrono",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -304,7 +293,6 @@ dependencies = [
  "alleycat-codex-proto",
  "anyhow",
  "async-trait",
- "chrono",
  "directories",
  "futures",
  "rand 0.8.6",
@@ -312,13 +300,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
- "url",
- "uuid",
  "which",
 ]
 
@@ -365,7 +350,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -383,7 +367,6 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",
