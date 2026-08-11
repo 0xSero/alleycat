@@ -33,7 +33,6 @@ alleycat-bridge-core = { path = "crates/bridge-core", version = "0.1" }
 alleycat-amp-bridge = { path = "crates/amp-bridge", version = "0.1" }
 alleycat-codex-proto = { path = "crates/codex-proto", version = "0.1" }
 alleycat-claude-bridge = { path = "crates/claude-bridge", version = "0.1" }
-alleycat-claude-remote-control = { path = "crates/claude-remote-control", version = "0.1" }
 alleycat-devin-bridge = { path = "crates/devin-bridge", version = "0.1" }
 alleycat-grok-bridge = { path = "crates/grok-bridge", version = "0.1" }
 alleycat-droid-bridge = { path = "crates/droid-bridge", version = "0.1" }
@@ -52,10 +51,7 @@ hex = "0.4"
 hostname = "0.4"
 iroh = "0.98.1"
 libc = "0.2"
-pin-project-lite = "0.2"
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.8"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
