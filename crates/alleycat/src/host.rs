@@ -5,7 +5,7 @@ use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use iroh::endpoint::QuicTransportConfig;
 use iroh::endpoint::{IdleTimeout, presets};
-use iroh::{Endpoint, SecretKey};
+use iroh::{Endpoint, RelayMap, RelayMode, SecretKey};
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
@@ -18,7 +18,15 @@ use crate::stream::IrohStream;
 /// Bind the iroh endpoint with the given identity and ALPN, returning it
 /// ready to be passed to [`accept_loop`]. Spawns a background "online" probe
 /// that logs when the endpoint reports relay connectivity.
-pub async fn bind_endpoint(secret_key: SecretKey) -> anyhow::Result<Endpoint> {
+///
+/// When `relay` is `Some`, the endpoint is pinned to that single relay
+/// (`RelayMode::Custom`) instead of the default number0 relays. This lets an
+/// operator point the daemon at a closer / self-hosted relay via the `relay`
+/// field in `host.toml`.
+pub async fn bind_endpoint(
+    secret_key: SecretKey,
+    relay: Option<&str>,
+) -> anyhow::Result<Endpoint> {
     // iroh defaults already PING every 5s (HEARTBEAT_INTERVAL) which would
     // normally keep the connection alive — but the connection-wide
     // `max_idle_timeout` is still 30s by default, and once the holepunched
@@ -34,10 +42,23 @@ pub async fn bind_endpoint(secret_key: SecretKey) -> anyhow::Result<Endpoint> {
         .max_idle_timeout(Some(idle_timeout))
         .build();
 
-    let endpoint = Endpoint::builder(presets::N0)
+    let mut builder = Endpoint::builder(presets::N0)
         .secret_key(secret_key)
         .alpns(vec![ALLEYCAT_ALPN.to_vec()])
-        .transport_config(transport)
+        .transport_config(transport);
+
+    // Honor a relay pinned in host.toml (`relay = "https://..."`). Without an
+    // explicit override, presets::N0 always uses the number0 relays, which may
+    // be geographically distant and add latency on relayed paths; pinning a
+    // closer self-hosted relay lets operators cut that latency.
+    if let Some(relay_url) = relay {
+        let relay_map = RelayMap::try_from_iter([relay_url])
+            .with_context(|| format!("parsing configured relay URL {relay_url:?}"))?;
+        builder = builder.relay_mode(RelayMode::Custom(relay_map));
+        info!(relay = %relay_url, "using custom relay from host.toml");
+    }
+
+    let endpoint = builder
         .bind()
         .await
         .context("binding iroh endpoint")?;

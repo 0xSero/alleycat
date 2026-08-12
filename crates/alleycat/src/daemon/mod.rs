@@ -64,7 +64,8 @@ pub async fn run() -> anyhow::Result<()> {
     let node_id = secret_key.public().to_string();
     info!(node_id = %node_id, "loaded persistent identity");
 
-    let endpoint = host::bind_endpoint(secret_key.clone()).await?;
+    let relay = config.load().relay.clone();
+    let endpoint = host::bind_endpoint(secret_key.clone(), relay.as_deref()).await?;
     let agents = AgentManager::new(Arc::clone(&config))
         .await
         .context("initializing agent manager")?;
