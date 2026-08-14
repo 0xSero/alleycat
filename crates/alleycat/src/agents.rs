@@ -531,7 +531,19 @@ impl AgentManager {
 
     async fn serve_codex_unix_proxy(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
         let endpoint = if self.codex_mode == CodexMode::UnixDaemon {
-            self.ensure_codex_daemon_running().await?
+            match self.ensure_codex_daemon_running().await {
+                Ok(endpoint) => endpoint,
+                Err(daemon_error) => {
+                    warn!(
+                        "codex app-server daemon lifecycle failed; falling back to unix listen/proxy mode: {daemon_error:#}"
+                    );
+                    self.ensure_codex_unix_running().await.with_context(|| {
+                        format!(
+                            "codex app-server daemon lifecycle failed and unix listen/proxy fallback also failed: {daemon_error:#}"
+                        )
+                    })?
+                }
+            }
         } else {
             self.ensure_codex_unix_running().await?
         };
