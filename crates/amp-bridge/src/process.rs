@@ -21,7 +21,6 @@ pub struct AmpSpawnConfig {
     pub cwd: PathBuf,
     pub amp_thread_id: Option<String>,
     pub mode: String,
-    pub effort: Option<String>,
     pub dangerously_allow_all: bool,
 }
 
@@ -85,7 +84,6 @@ impl AmpProcess {
             cwd,
             amp_thread_id,
             mode,
-            effort,
             dangerously_allow_all,
         } = config;
 
@@ -101,10 +99,6 @@ impl AmpProcess {
         if !mode.trim().is_empty() {
             args.push("--mode".into());
             args.push(mode.into());
-        }
-        if let Some(effort) = effort.filter(|value| !value.trim().is_empty()) {
-            args.push("--effort".into());
-            args.push(effort.into());
         }
         args.push("--execute".into());
         args.push("--stream-json".into());

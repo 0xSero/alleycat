@@ -96,8 +96,8 @@ pub const MANIFESTS: &[AgentManifest] = &[
         sort_order: 2,
         description: Some("Sourcegraph Amp."),
         aliases: &["ampcode", "amp-code", "amp_code", "amp code"],
-        locks_reasoning_effort_after_activity: true,
-        visible_modes: Some(&["smart", "rush", "deep"]),
+        locks_reasoning_effort_after_activity: false,
+        visible_modes: Some(&["low", "medium", "high", "ultra"]),
         supports_ssh_bridge: false,
         uses_direct_codex_port: false,
         supports_thread_permission_overrides: false,
@@ -219,4 +219,19 @@ pub const MANIFESTS: &[AgentManifest] = &[
 
 pub fn manifest_for(name: &str) -> Option<&'static AgentManifest> {
     MANIFESTS.iter().find(|m| m.name == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amp_manifest_advertises_current_modes_without_effort_lock() {
+        let amp = manifest_for("amp").unwrap();
+        assert_eq!(
+            amp.visible_modes,
+            Some(&["low", "medium", "high", "ultra"][..])
+        );
+        assert!(!amp.locks_reasoning_effort_after_activity);
+    }
 }

@@ -305,6 +305,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn legacy_session_metadata_with_reasoning_effort_remains_readable() {
+        let metadata: AmpSessionRef = serde_json::from_value(json!({
+            "ampThreadId": "T-legacy",
+            "model": "smart",
+            "reasoningEffort": "xhigh"
+        }))
+        .unwrap();
+
+        assert_eq!(metadata.amp_thread_id.as_deref(), Some("T-legacy"));
+        assert_eq!(metadata.model.as_deref(), Some("smart"));
+        assert_eq!(metadata.reasoning_effort.as_deref(), Some("xhigh"));
+    }
+
     async fn write_native_amp_thread(dir: &Path, id: &str, title: &str) -> PathBuf {
         let path = dir.join(format!("{id}.json"));
         tokio::fs::write(

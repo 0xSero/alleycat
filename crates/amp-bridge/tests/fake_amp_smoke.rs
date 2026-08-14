@@ -39,19 +39,12 @@ case " $* " in
   *" threads continue T-fake-amp "*) continuing=1 ;;
 esac
 case " $* " in
-  *" --mode smart "*) ;;
-  *) echo "missing --mode smart in amp argv: $*" >&2; exit 7 ;;
+  *" --mode medium "*) ;;
+  *) echo "missing --mode medium in amp argv: $*" >&2; exit 7 ;;
 esac
-if [[ "$continuing" == "1" ]]; then
-  case " $* " in
-    *" --effort "*) echo "unexpected --effort on continued amp thread argv: $*" >&2; exit 8 ;;
-  esac
-else
-  case " $* " in
-    *" --effort high "*) ;;
-    *) echo "missing --effort high in amp argv: $*" >&2; exit 8 ;;
-  esac
-fi
+case " $* " in
+  *" --effort "*) echo "unexpected --effort in amp argv: $*" >&2; exit 8 ;;
+esac
 case " $* " in
   *" --stream-json-thinking "*) ;;
   *) echo "missing --stream-json-thinking in amp argv: $*" >&2; exit 9 ;;
@@ -112,18 +105,31 @@ printf '{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"
         .iter()
         .map(|model| model["id"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(model_ids, vec!["smart", "rush", "deep"]);
-    let smart = &models["result"]["data"][0];
-    assert_eq!(smart["displayName"], "smart");
+    assert_eq!(model_ids, vec!["low", "medium", "high", "ultra"]);
     assert_eq!(
-        smart["supportedReasoningEfforts"]
+        models["result"]["data"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|option| option["reasoningEffort"].as_str().unwrap())
+            .map(|model| model["description"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec!["high", "xhigh"]
+        vec![
+            "Fast, low-cost mode for small, well-defined tasks",
+            "Balanced intelligence, speed, and cost for most tasks",
+            "Deep reasoning for hard tasks",
+            "The most capable mode for hard, open-ended tasks",
+        ]
     );
+    for model in models["result"]["data"].as_array().unwrap() {
+        assert_eq!(model["defaultReasoningEffort"], "none");
+        assert!(
+            model["supportedReasoningEfforts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    assert_eq!(models["result"]["data"][1]["isDefault"], true);
 
     send_request(
         &mut writer,
@@ -139,13 +145,13 @@ printf '{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"
         .iter()
         .map(|model| model["id"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(hidden_model_ids, vec!["smart", "rush", "deep", "large"]);
-    let large = hidden_models["result"]["data"].as_array().unwrap()[3].clone();
-    assert_eq!(large["hidden"], true);
-    assert_eq!(large["defaultReasoningEffort"], "none");
-    assert_eq!(
-        large["supportedReasoningEfforts"].as_array().unwrap().len(),
-        0
+    assert_eq!(hidden_model_ids, vec!["low", "medium", "high", "ultra"]);
+    assert!(
+        hidden_models["result"]["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|model| model["hidden"] == false)
     );
 
     send_request(
@@ -153,14 +159,13 @@ printf '{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"
         3,
         "thread/start",
         json!({
-            "cwd": temp.path().to_string_lossy(),
-            "model": "smart"
+            "cwd": temp.path().to_string_lossy()
         }),
     )
     .await;
     let thread_start = assert_response(&mut lines, 3).await;
-    assert_eq!(thread_start["result"]["model"], "smart");
-    assert_eq!(thread_start["result"]["reasoningEffort"], "high");
+    assert_eq!(thread_start["result"]["model"], "medium");
+    assert!(thread_start["result"]["reasoningEffort"].is_null());
     let thread_id = thread_start["result"]["thread"]["id"]
         .as_str()
         .unwrap()
@@ -280,7 +285,7 @@ printf '{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"
 }
 
 #[tokio::test]
-async fn fake_amp_hidden_large_mode_launches_without_effort() {
+async fn fake_amp_legacy_large_mode_normalizes_to_ultra() {
     let temp = TempDir::new().unwrap();
     let fake_amp = temp.path().join("fake-amp-large.sh");
     std::fs::write(
@@ -288,8 +293,8 @@ async fn fake_amp_hidden_large_mode_launches_without_effort() {
         r#"#!/usr/bin/env bash
 set -euo pipefail
 case " $* " in
-  *" --mode large "*) ;;
-  *) echo "missing --mode large in amp argv: $*" >&2; exit 7 ;;
+  *" --mode ultra "*) ;;
+  *) echo "missing --mode ultra in amp argv: $*" >&2; exit 7 ;;
 esac
 case " $* " in
   *" --effort "*) echo "unexpected --effort for large mode argv: $*" >&2; exit 8 ;;
@@ -347,7 +352,7 @@ printf '{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"
     )
     .await;
     let thread_start = assert_response(&mut lines, 2).await;
-    assert_eq!(thread_start["result"]["model"], "large");
+    assert_eq!(thread_start["result"]["model"], "ultra");
     assert!(thread_start["result"]["reasoningEffort"].is_null());
     let thread_id = thread_start["result"]["thread"]["id"]
         .as_str()
@@ -391,7 +396,7 @@ printf '{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"
 }
 
 #[tokio::test]
-async fn fake_amp_mode_change_clears_incompatible_effort_before_first_turn() {
+async fn fake_amp_legacy_modes_normalize_without_effort() {
     let temp = TempDir::new().unwrap();
     let fake_amp = temp.path().join("fake-amp-rush.sh");
     std::fs::write(
@@ -399,8 +404,8 @@ async fn fake_amp_mode_change_clears_incompatible_effort_before_first_turn() {
         r#"#!/usr/bin/env bash
 set -euo pipefail
 case " $* " in
-  *" --mode rush "*) ;;
-  *) echo "missing --mode rush in amp argv: $*" >&2; exit 7 ;;
+  *" --mode low "*) ;;
+  *) echo "missing --mode low in amp argv: $*" >&2; exit 7 ;;
 esac
 case " $* " in
   *" --effort "*) echo "unexpected --effort for rush mode argv: $*" >&2; exit 8 ;;
@@ -458,7 +463,8 @@ printf '{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"
     )
     .await;
     let thread_start = assert_response(&mut lines, 2).await;
-    assert_eq!(thread_start["result"]["reasoningEffort"], "high");
+    assert_eq!(thread_start["result"]["model"], "medium");
+    assert!(thread_start["result"]["reasoningEffort"].is_null());
     let thread_id = thread_start["result"]["thread"]["id"]
         .as_str()
         .unwrap()
@@ -475,7 +481,7 @@ printf '{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"
     )
     .await;
     let thread_resume = assert_response(&mut lines, 3).await;
-    assert_eq!(thread_resume["result"]["model"], "rush");
+    assert_eq!(thread_resume["result"]["model"], "low");
     assert!(thread_resume["result"]["reasoningEffort"].is_null());
 
     send_request(
@@ -568,7 +574,7 @@ exit 12
         "thread/start",
         json!({
             "cwd": temp.path().to_string_lossy(),
-            "model": "smart"
+            "model": "medium"
         }),
     )
     .await;
@@ -782,7 +788,7 @@ printf '{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"
         "thread/start",
         json!({
             "cwd": temp.path().to_string_lossy(),
-            "model": "smart"
+            "model": "medium"
         }),
     )
     .await;
@@ -874,7 +880,7 @@ async fn fake_amp_initial_write_failure_clears_active_turn() {
         "thread/start",
         json!({
             "cwd": temp.path().to_string_lossy(),
-            "model": "smart"
+            "model": "medium"
         }),
     )
     .await;
@@ -956,7 +962,7 @@ sleep 30
         "thread/start",
         json!({
             "cwd": temp.path().to_string_lossy(),
-            "model": "smart"
+            "model": "medium"
         }),
     )
     .await;
@@ -1085,7 +1091,7 @@ printf '{"type":"result","subtype":"success","duration_ms":42,"is_error":false,"
         "thread/start",
         json!({
             "cwd": temp.path().to_string_lossy(),
-            "model": "smart"
+            "model": "medium"
         }),
     )
     .await;
