@@ -692,22 +692,9 @@ impl OpencodeBridge {
     /// thread. iOS uses this on thread open as the canonical way to hydrate
     /// the conversation when a `thread/read` round-trip would be too big.
     /// Upstream pagination is by `cursor` + `limit`; opencode has no native
-    /// per-message cursor, so we emit the full turn list in one page and
-    /// echo any non-empty cursor back as "no more results".
+    /// per-message cursor, so we page over the deterministically ordered
+    /// collapsed turn list using an offset cursor.
     async fn handle_thread_turns_list(&self, params: Value) -> Result<Value, JsonRpcError> {
-        // Non-empty cursor means the client is asking for "next page" —
-        // we already returned everything in page 1, so report empty.
-        let cursor = params
-            .get("cursor")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty());
-        if cursor.is_some() {
-            return Ok(json!({
-                "data": [],
-                "nextCursor": null,
-                "backwardsCursor": null,
-            }));
-        }
         let binding = binding_from_params(&self.index, &params)?;
         let messages = self
             .client
@@ -730,12 +717,30 @@ impl OpencodeBridge {
         if descending {
             turns.reverse();
         }
-        if let Some(limit) = params.get("limit").and_then(Value::as_u64) {
-            turns.truncate(limit as usize);
-        }
+
+        // Slice the ordered turn list into bounded pages so large
+        // conversations don't materialize every turn (and its items) in a
+        // single response. The offset cursor is authoritative for this
+        // snapshot; the client passes it back verbatim for the next page.
+        let total = turns.len();
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize)
+            .unwrap_or(50);
+        let offset = params
+            .get("cursor")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+            .min(total);
+        let end = (offset + limit).min(total);
+        let page = turns[offset..end].to_vec();
+        let next_cursor = if end < total { Some(end.to_string()) } else { None };
         Ok(json!({
-            "data": turns,
-            "nextCursor": null,
+            "data": page,
+            "nextCursor": next_cursor,
             "backwardsCursor": null,
         }))
     }
