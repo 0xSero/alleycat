@@ -483,7 +483,55 @@ impl OpencodeBridge {
             .get(&upstream_path)
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
-        let raw_sessions = sessions.as_array().cloned().unwrap_or_default();
+        let mut raw_sessions = sessions.as_array().cloned().unwrap_or_default();
+
+        // Aggregate sessions across every project worktree. Opencode scopes
+        // sessions by project (each non-default project gets a hashed
+        // `projectID`), so a bare `GET /session` only returns the default
+        // project's sessions — sessions created in other worktrees (e.g.
+        // `/srv/agents/workspaces/opencode`) would never appear in the list.
+        // Enumerate projects via `GET /project` and union each project's
+        // `GET /session?directory=<worktree>` page with the default list.
+        let mut seen_ids: std::collections::HashSet<String> = raw_sessions
+            .iter()
+            .filter_map(|session| session.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let query_suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("&{}", query.join("&"))
+        };
+        if let Ok(projects) = self.client.get("/project").await
+            && let Some(project_list) = projects.as_array()
+        {
+            for project in project_list {
+                let Some(worktree) = project.get("worktree").and_then(Value::as_str) else {
+                    continue;
+                };
+                if worktree.trim().is_empty() {
+                    continue;
+                }
+                let path = format!(
+                    "/session?directory={}{}",
+                    encode_query(worktree),
+                    query_suffix
+                );
+                if let Ok(page) = self.client.get(&path).await
+                    && let Some(page_array) = page.as_array()
+                {
+                    for session in page_array {
+                        let id = session
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        if id.is_empty() || seen_ids.insert(id.clone()) {
+                            raw_sessions.push(session.clone());
+                        }
+                    }
+                }
+            }
+        }
         let upstream_count = raw_sessions.len();
 
         // Bind every fetched session into the local thread index so the
