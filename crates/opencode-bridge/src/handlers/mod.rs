@@ -716,7 +716,7 @@ impl OpencodeBridge {
         // `notLoaded` (which the client maps to a perpetual "connecting" state
         // and breaks the conversation UI). Tail in-progress turn => active.
         thread["status"] = if is_active {
-            json!({"type": "active", "active_flags": []})
+            json!({"type": "active", "activeFlags": []})
         } else {
             json!({"type": "idle"})
         };
