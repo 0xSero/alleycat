@@ -649,27 +649,58 @@ impl OpencodeBridge {
             .index
             .by_thread(thread_id)
             .ok_or_else(|| JsonRpcError::invalid_params("unknown thread"))?;
-        let messages = self
-            .client
-            .get(&format!("/session/{}/message", binding.session_id))
-            .await
-            .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
-        let turns = collapse_messages_to_turns(
-            messages.as_array().cloned().unwrap_or_default(),
-            Some(&binding.directory),
-            Some(&binding.thread_id),
-        );
+        let exclude_turns = params
+            .get("excludeTurns")
+            .or_else(|| params.get("exclude_turns"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let (turns, is_active) = if exclude_turns {
+            // Paginated hydration path (`excludeTurns: true`): return an empty
+            // turn list so the client pages history via `thread/turns/list`
+            // instead of us embedding the entire archive. Derive the concrete
+            // status from a bounded window of the latest messages rather than
+            // pulling every turn.
+            let (window, _) = self
+                .client
+                .list_messages_page(&binding.session_id, Some(4), None)
+                .await
+                .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+            let window_turns = collapse_messages_to_turns(
+                window,
+                Some(&binding.directory),
+                Some(&binding.thread_id),
+            );
+            let is_active = window_turns
+                .last()
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str)
+                .map(|status| status == "inProgress")
+                .unwrap_or(false);
+            (Vec::new(), is_active)
+        } else {
+            let messages = self
+                .client
+                .get(&format!("/session/{}/message", binding.session_id))
+                .await
+                .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+            let turns = collapse_messages_to_turns(
+                messages.as_array().cloned().unwrap_or_default(),
+                Some(&binding.directory),
+                Some(&binding.thread_id),
+            );
+            let is_active = turns
+                .last()
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str)
+                .map(|status| status == "inProgress")
+                .unwrap_or(false);
+            (turns, is_active)
+        };
         let mut thread = binding_to_thread(&binding);
         thread["turns"] = json!(turns);
         // A loaded thread must report a concrete status, not the list default
         // `notLoaded` (which the client maps to a perpetual "connecting" state
         // and breaks the conversation UI). Tail in-progress turn => active.
-        let is_active = turns
-            .last()
-            .and_then(|turn| turn.get("status"))
-            .and_then(Value::as_str)
-            .map(|status| status == "inProgress")
-            .unwrap_or(false);
         thread["status"] = if is_active {
             json!({"type": "active", "active_flags": []})
         } else {
@@ -704,25 +735,39 @@ impl OpencodeBridge {
 
     /// `thread/turns/list` — paginated turn-by-turn history for a single
     /// thread. iOS uses this on thread open as the canonical way to hydrate
-    /// the conversation when a `thread/read` round-trip would be too big.
-    /// Upstream pagination is by `cursor` + `limit`; opencode has no native
-    /// per-message cursor, so we page over the deterministically ordered
-    /// collapsed turn list using an offset cursor.
+    /// the conversation. Upstream pagination is by `cursor` + `limit`; we
+    /// translate it onto opencode's native message pagination (legacy
+    /// `GET /session/:id/message?limit=&before=` with the `x-next-cursor`
+    /// response header) instead of materializing the whole archive and
+    /// slicing locally.
     async fn handle_thread_turns_list(&self, params: Value) -> Result<Value, JsonRpcError> {
         let binding = binding_from_params(&self.index, &params)?;
-        let messages = self
+        let turn_limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
+        let cursor = params
+            .get("cursor")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        // Fetch a bounded window of messages using opencode's native message
+        // pagination, then collapse into turns. A turn is a user message plus
+        // its assistant follow-ups, so request a multiple of the turn count to
+        // cover a page without retrieving the entire conversation.
+        let message_limit = turn_limit.map(|t| t.saturating_mul(4).max(4)).unwrap_or(50);
+        let (messages, next_cursor) = self
             .client
-            .get(&format!("/session/{}/message", binding.session_id))
+            .list_messages_page(&binding.session_id, Some(message_limit), cursor.as_deref())
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
         let mut turns = collapse_messages_to_turns(
-            messages.as_array().cloned().unwrap_or_default(),
+            messages,
             Some(&binding.directory),
             Some(&binding.thread_id),
         );
         // Default sort direction is `desc` (newest first) per the codex
-        // wire spec — `ThreadSortKey::UpdatedAt` + `SortDirection::Desc`
-        // is the iOS hydration pattern.
+        // wire spec.
         let descending = params
             .get("sortDirection")
             .and_then(Value::as_str)
@@ -731,29 +776,11 @@ impl OpencodeBridge {
         if descending {
             turns.reverse();
         }
-
-        // Slice the ordered turn list into bounded pages so large
-        // conversations don't materialize every turn (and its items) in a
-        // single response. The offset cursor is authoritative for this
-        // snapshot; the client passes it back verbatim for the next page.
-        let total = turns.len();
-        let limit = params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|v| v as usize)
-            .unwrap_or(50);
-        let offset = params
-            .get("cursor")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
-            .min(total);
-        let end = (offset + limit).min(total);
-        let page = turns[offset..end].to_vec();
-        let next_cursor = if end < total { Some(end.to_string()) } else { None };
+        if let Some(limit) = turn_limit {
+            turns.truncate(limit as usize);
+        }
         Ok(json!({
-            "data": page,
+            "data": turns,
             "nextCursor": next_cursor,
             "backwardsCursor": null,
         }))
