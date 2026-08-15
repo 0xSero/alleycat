@@ -755,11 +755,37 @@ impl OpencodeBridge {
         // its assistant follow-ups, so request a multiple of the turn count to
         // cover a page without retrieving the entire conversation.
         let message_limit = turn_limit.map(|t| t.saturating_mul(4).max(4)).unwrap_or(50);
-        let (messages, upstream_has_more) = self
+        let (mut messages, mut upstream_has_more) = self
             .client
             .list_messages_page(&binding.session_id, Some(message_limit), cursor.as_deref())
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+        // OpenCode can persist several assistant messages for one tool-heavy
+        // user turn. If the bounded window starts inside such a turn, keep
+        // walking native pages only until we have enough user boundaries to
+        // build the requested Codex turns. This remains bounded by the actual
+        // content of those turns rather than materializing the whole session.
+        while upstream_has_more
+            && turn_limit.is_some_and(|limit| user_message_count(&messages) < limit as usize)
+        {
+            let Some(oldest) = messages.first() else {
+                break;
+            };
+            let before = message_before_cursor(oldest)
+                .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+            let (mut older, has_more) = self
+                .client
+                .list_messages_page(&binding.session_id, Some(message_limit), Some(&before))
+                .await
+                .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+            if older.is_empty() {
+                upstream_has_more = false;
+                break;
+            }
+            older.append(&mut messages);
+            messages = older;
+            upstream_has_more = has_more;
+        }
         let (page_messages, next_cursor) =
             select_message_turn_page(messages, turn_limit, upstream_has_more)
                 .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
@@ -912,6 +938,13 @@ fn select_message_turn_page(
         None
     };
     Ok((messages.into_iter().skip(start).collect(), next_cursor))
+}
+
+fn user_message_count(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("user"))
+        .count()
 }
 
 #[async_trait]
@@ -1824,5 +1857,16 @@ mod tests {
             Some("u1")
         );
         assert!(cursor.is_some());
+    }
+
+    #[test]
+    fn user_message_count_ignores_multi_step_assistant_messages() {
+        let messages = vec![
+            message("u1", "user", 1),
+            message("a1", "assistant", 2),
+            message("a2", "assistant", 3),
+            message("u2", "user", 4),
+        ];
+        assert_eq!(user_message_count(&messages), 2);
     }
 }
