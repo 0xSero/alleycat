@@ -661,6 +661,20 @@ impl OpencodeBridge {
         );
         let mut thread = binding_to_thread(&binding);
         thread["turns"] = json!(turns);
+        // A loaded thread must report a concrete status, not the list default
+        // `notLoaded` (which the client maps to a perpetual "connecting" state
+        // and breaks the conversation UI). Tail in-progress turn => active.
+        let is_active = turns
+            .last()
+            .and_then(|turn| turn.get("status"))
+            .and_then(Value::as_str)
+            .map(|status| status == "inProgress")
+            .unwrap_or(false);
+        thread["status"] = if is_active {
+            json!({"type": "active", "active_flags": []})
+        } else {
+            json!({"type": "idle"})
+        };
         if method == "thread/read" {
             Ok(json!({ "thread": thread }))
         } else {
