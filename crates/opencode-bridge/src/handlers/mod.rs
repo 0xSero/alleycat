@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::index::{OpencodeBinding, ThreadIndex};
-use crate::opencode_client::OpencodeClient;
+use crate::opencode_client::{OpencodeClient, message_before_cursor};
 use crate::opencode_proc::OpencodeRuntime;
 use crate::pty::PtyState;
 use crate::sse::SseConsumer;
@@ -737,9 +737,8 @@ impl OpencodeBridge {
     /// thread. iOS uses this on thread open as the canonical way to hydrate
     /// the conversation. Upstream pagination is by `cursor` + `limit`; we
     /// translate it onto opencode's native message pagination (legacy
-    /// `GET /session/:id/message?limit=&before=` with the `x-next-cursor`
-    /// response header) instead of materializing the whole archive and
-    /// slicing locally.
+    /// `GET /session/:id/message?limit=&before=`) instead of materializing
+    /// the whole archive and slicing locally.
     async fn handle_thread_turns_list(&self, params: Value) -> Result<Value, JsonRpcError> {
         let binding = binding_from_params(&self.index, &params)?;
         let turn_limit = params
@@ -756,13 +755,16 @@ impl OpencodeBridge {
         // its assistant follow-ups, so request a multiple of the turn count to
         // cover a page without retrieving the entire conversation.
         let message_limit = turn_limit.map(|t| t.saturating_mul(4).max(4)).unwrap_or(50);
-        let (messages, next_cursor) = self
+        let (messages, upstream_has_more) = self
             .client
             .list_messages_page(&binding.session_id, Some(message_limit), cursor.as_deref())
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+        let (page_messages, next_cursor) =
+            select_message_turn_page(messages, turn_limit, upstream_has_more)
+                .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
         let mut turns = collapse_messages_to_turns(
-            messages,
+            page_messages,
             Some(&binding.directory),
             Some(&binding.thread_id),
         );
@@ -775,9 +777,6 @@ impl OpencodeBridge {
             .unwrap_or(true);
         if descending {
             turns.reverse();
-        }
-        if let Some(limit) = turn_limit {
-            turns.truncate(limit as usize);
         }
         Ok(json!({
             "data": turns,
@@ -874,6 +873,45 @@ impl OpencodeBridge {
         let raw = self.client.get("/mcp").await.unwrap_or(json!([]));
         Ok(json!({"data":mcp_statuses(raw),"nextCursor":null}))
     }
+}
+
+/// Select the newest requested user-anchored turns from a bounded opencode
+/// message window and return a cursor at the exact oldest emitted boundary.
+///
+/// A message page can contain more turns than requested. Truncating collapsed
+/// turns while forwarding the page's oldest-message cursor would skip the
+/// omitted turns permanently. Anchoring the continuation to the oldest user
+/// message we actually return avoids both gaps and split assistant-only turns.
+fn select_message_turn_page(
+    messages: Vec<Value>,
+    turn_limit: Option<u32>,
+    upstream_has_more: bool,
+) -> anyhow::Result<(Vec<Value>, Option<String>)> {
+    if messages.is_empty() || turn_limit == Some(0) {
+        return Ok((Vec::new(), None));
+    }
+
+    let user_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (message.pointer("/info/role").and_then(Value::as_str) == Some("user")).then_some(index)
+        })
+        .collect();
+    let start = match (turn_limit, user_indices.first()) {
+        (Some(limit), Some(_)) if user_indices.len() > limit as usize => {
+            user_indices[user_indices.len() - limit as usize]
+        }
+        (_, Some(first)) => *first,
+        _ => 0,
+    };
+    let has_older = start > 0 || upstream_has_more;
+    let next_cursor = if has_older {
+        Some(message_before_cursor(&messages[start])?)
+    } else {
+        None
+    };
+    Ok((messages.into_iter().skip(start).collect(), next_cursor))
 }
 
 #[async_trait]
@@ -1721,6 +1759,7 @@ fn cursor_after_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     fn sample_binding() -> OpencodeBinding {
         OpencodeBinding {
@@ -1740,5 +1779,50 @@ mod tests {
     fn binding_to_thread_emits_tagged_status() {
         let projected = binding_to_thread(&sample_binding());
         assert_eq!(projected["status"], json!({"type": "notLoaded"}));
+    }
+
+    fn message(id: &str, role: &str, created: i64) -> Value {
+        json!({
+            "info": {"id": id, "role": role, "time": {"created": created}},
+            "parts": []
+        })
+    }
+
+    #[test]
+    fn turn_page_cursor_is_anchored_to_oldest_emitted_user_message() {
+        let messages = vec![
+            message("u1", "user", 1),
+            message("a1", "assistant", 2),
+            message("u2", "user", 3),
+            message("a2", "assistant", 4),
+            message("u3", "user", 5),
+            message("a3", "assistant", 6),
+        ];
+        let (page, cursor) = select_message_turn_page(messages, Some(2), false).expect("page");
+        assert_eq!(
+            page[0].pointer("/info/id").and_then(Value::as_str),
+            Some("u2")
+        );
+
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cursor.expect("older cursor"))
+            .expect("base64url cursor");
+        let value: Value = serde_json::from_slice(&decoded).expect("cursor json");
+        assert_eq!(value, json!({"id": "u2", "time": 3}));
+    }
+
+    #[test]
+    fn turn_page_drops_leading_assistant_fragment_without_losing_cursor() {
+        let messages = vec![
+            message("a0", "assistant", 1),
+            message("u1", "user", 2),
+            message("a1", "assistant", 3),
+        ];
+        let (page, cursor) = select_message_turn_page(messages, Some(5), false).expect("page");
+        assert_eq!(
+            page[0].pointer("/info/id").and_then(Value::as_str),
+            Some("u1")
+        );
+        assert!(cursor.is_some());
     }
 }
