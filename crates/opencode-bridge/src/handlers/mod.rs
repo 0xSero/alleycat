@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::index::{OpencodeBinding, ThreadIndex};
-use crate::opencode_client::OpencodeClient;
+use crate::opencode_client::{OpencodeClient, message_before_cursor};
 use crate::opencode_proc::OpencodeRuntime;
 use crate::pty::PtyState;
 use crate::sse::SseConsumer;
@@ -483,7 +483,60 @@ impl OpencodeBridge {
             .get(&upstream_path)
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
-        let raw_sessions = sessions.as_array().cloned().unwrap_or_default();
+        let mut raw_sessions = sessions.as_array().cloned().unwrap_or_default();
+
+        // Aggregate sessions across every project worktree. Opencode scopes
+        // sessions by project (each non-default project gets a hashed
+        // `projectID`), so a bare `GET /session` only returns the default
+        // project's sessions — sessions created in other worktrees (e.g.
+        // `/srv/agents/workspaces/opencode`) would never appear in the list.
+        // Enumerate projects via `GET /project` and union each project's
+        // `GET /session?directory=<worktree>` page with the default list.
+        let mut seen_ids: std::collections::HashSet<String> = raw_sessions
+            .iter()
+            .filter_map(|session| {
+                session
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
+        let query_suffix = if query.is_empty() {
+            String::new()
+        } else {
+            format!("&{}", query.join("&"))
+        };
+        if let Ok(projects) = self.client.get("/project").await
+            && let Some(project_list) = projects.as_array()
+        {
+            for project in project_list {
+                let Some(worktree) = project.get("worktree").and_then(Value::as_str) else {
+                    continue;
+                };
+                if worktree.trim().is_empty() {
+                    continue;
+                }
+                let path = format!(
+                    "/session?directory={}{}",
+                    encode_query(worktree),
+                    query_suffix
+                );
+                if let Ok(page) = self.client.get(&path).await
+                    && let Some(page_array) = page.as_array()
+                {
+                    for session in page_array {
+                        let id = session
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                            .unwrap_or_default();
+                        if id.is_empty() || seen_ids.insert(id.clone()) {
+                            raw_sessions.push(session.clone());
+                        }
+                    }
+                }
+            }
+        }
         let upstream_count = raw_sessions.len();
 
         // Bind every fetched session into the local thread index so the
@@ -601,18 +654,72 @@ impl OpencodeBridge {
             .index
             .by_thread(thread_id)
             .ok_or_else(|| JsonRpcError::invalid_params("unknown thread"))?;
-        let messages = self
-            .client
-            .get(&format!("/session/{}/message", binding.session_id))
-            .await
-            .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
-        let turns = collapse_messages_to_turns(
-            messages.as_array().cloned().unwrap_or_default(),
-            Some(&binding.directory),
-            Some(&binding.thread_id),
-        );
+        let omit_turns = if method == "thread/read" {
+            !params
+                .get("includeTurns")
+                .or_else(|| params.get("include_turns"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        } else {
+            params
+                .get("excludeTurns")
+                .or_else(|| params.get("exclude_turns"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        let (turns, is_active) = if omit_turns {
+            // Paginated hydration and metadata-only read paths
+            // (`excludeTurns: true` / `includeTurns: false`) return an empty
+            // turn list so the client pages history via `thread/turns/list`
+            // instead of us embedding the entire archive. Derive the concrete
+            // status from a bounded window of the latest messages rather than
+            // pulling every turn.
+            let (window, _) = self
+                .client
+                .list_messages_page(&binding.session_id, Some(4), None)
+                .await
+                .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+            let window_turns = collapse_messages_to_turns(
+                window,
+                Some(&binding.directory),
+                Some(&binding.thread_id),
+            );
+            let is_active = window_turns
+                .last()
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str)
+                .map(|status| status == "inProgress")
+                .unwrap_or(false);
+            (Vec::new(), is_active)
+        } else {
+            let messages = self
+                .client
+                .get(&format!("/session/{}/message", binding.session_id))
+                .await
+                .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+            let turns = collapse_messages_to_turns(
+                messages.as_array().cloned().unwrap_or_default(),
+                Some(&binding.directory),
+                Some(&binding.thread_id),
+            );
+            let is_active = turns
+                .last()
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str)
+                .map(|status| status == "inProgress")
+                .unwrap_or(false);
+            (turns, is_active)
+        };
         let mut thread = binding_to_thread(&binding);
         thread["turns"] = json!(turns);
+        // A loaded thread must report a concrete status, not the list default
+        // `notLoaded` (which the client maps to a perpetual "connecting" state
+        // and breaks the conversation UI). Tail in-progress turn => active.
+        thread["status"] = if is_active {
+            json!({"type": "active", "activeFlags": []})
+        } else {
+            json!({"type": "idle"})
+        };
         if method == "thread/read" {
             Ok(json!({ "thread": thread }))
         } else {
@@ -642,38 +749,67 @@ impl OpencodeBridge {
 
     /// `thread/turns/list` — paginated turn-by-turn history for a single
     /// thread. iOS uses this on thread open as the canonical way to hydrate
-    /// the conversation when a `thread/read` round-trip would be too big.
-    /// Upstream pagination is by `cursor` + `limit`; opencode has no native
-    /// per-message cursor, so we emit the full turn list in one page and
-    /// echo any non-empty cursor back as "no more results".
+    /// the conversation. Upstream pagination is by `cursor` + `limit`; we
+    /// translate it onto opencode's native message pagination (legacy
+    /// `GET /session/:id/message?limit=&before=`) instead of materializing
+    /// the whole archive and slicing locally.
     async fn handle_thread_turns_list(&self, params: Value) -> Result<Value, JsonRpcError> {
-        // Non-empty cursor means the client is asking for "next page" —
-        // we already returned everything in page 1, so report empty.
+        let binding = binding_from_params(&self.index, &params)?;
+        let turn_limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|v| v as u32);
         let cursor = params
             .get("cursor")
             .and_then(Value::as_str)
-            .filter(|s| !s.is_empty());
-        if cursor.is_some() {
-            return Ok(json!({
-                "data": [],
-                "nextCursor": null,
-                "backwardsCursor": null,
-            }));
-        }
-        let binding = binding_from_params(&self.index, &params)?;
-        let messages = self
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        // Fetch a bounded window of messages using opencode's native message
+        // pagination, then collapse into turns. A turn is a user message plus
+        // its assistant follow-ups, so request a multiple of the turn count to
+        // cover a page without retrieving the entire conversation.
+        let message_limit = turn_limit.map(|t| t.saturating_mul(4).max(4)).unwrap_or(50);
+        let (mut messages, mut upstream_has_more) = self
             .client
-            .get(&format!("/session/{}/message", binding.session_id))
+            .list_messages_page(&binding.session_id, Some(message_limit), cursor.as_deref())
             .await
             .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+        // OpenCode can persist several assistant messages for one tool-heavy
+        // user turn. If the bounded window starts inside such a turn, keep
+        // walking native pages only until we have enough user boundaries to
+        // build the requested Codex turns. This remains bounded by the actual
+        // content of those turns rather than materializing the whole session.
+        while upstream_has_more
+            && turn_limit.is_some_and(|limit| user_message_count(&messages) < limit as usize)
+        {
+            let Some(oldest) = messages.first() else {
+                break;
+            };
+            let before = message_before_cursor(oldest)
+                .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+            let (mut older, has_more) = self
+                .client
+                .list_messages_page(&binding.session_id, Some(message_limit), Some(&before))
+                .await
+                .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
+            if older.is_empty() {
+                upstream_has_more = false;
+                break;
+            }
+            older.append(&mut messages);
+            messages = older;
+            upstream_has_more = has_more;
+        }
+        let (page_messages, next_cursor) =
+            select_message_turn_page(messages, turn_limit, upstream_has_more)
+                .map_err(|err| JsonRpcError::internal(format!("{err:#}")))?;
         let mut turns = collapse_messages_to_turns(
-            messages.as_array().cloned().unwrap_or_default(),
+            page_messages,
             Some(&binding.directory),
             Some(&binding.thread_id),
         );
         // Default sort direction is `desc` (newest first) per the codex
-        // wire spec — `ThreadSortKey::UpdatedAt` + `SortDirection::Desc`
-        // is the iOS hydration pattern.
+        // wire spec.
         let descending = params
             .get("sortDirection")
             .and_then(Value::as_str)
@@ -682,12 +818,9 @@ impl OpencodeBridge {
         if descending {
             turns.reverse();
         }
-        if let Some(limit) = params.get("limit").and_then(Value::as_u64) {
-            turns.truncate(limit as usize);
-        }
         Ok(json!({
             "data": turns,
-            "nextCursor": null,
+            "nextCursor": next_cursor,
             "backwardsCursor": null,
         }))
     }
@@ -780,6 +913,52 @@ impl OpencodeBridge {
         let raw = self.client.get("/mcp").await.unwrap_or(json!([]));
         Ok(json!({"data":mcp_statuses(raw),"nextCursor":null}))
     }
+}
+
+/// Select the newest requested user-anchored turns from a bounded opencode
+/// message window and return a cursor at the exact oldest emitted boundary.
+///
+/// A message page can contain more turns than requested. Truncating collapsed
+/// turns while forwarding the page's oldest-message cursor would skip the
+/// omitted turns permanently. Anchoring the continuation to the oldest user
+/// message we actually return avoids both gaps and split assistant-only turns.
+fn select_message_turn_page(
+    messages: Vec<Value>,
+    turn_limit: Option<u32>,
+    upstream_has_more: bool,
+) -> anyhow::Result<(Vec<Value>, Option<String>)> {
+    if messages.is_empty() || turn_limit == Some(0) {
+        return Ok((Vec::new(), None));
+    }
+
+    let user_indices: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            (message.pointer("/info/role").and_then(Value::as_str) == Some("user")).then_some(index)
+        })
+        .collect();
+    let start = match (turn_limit, user_indices.first()) {
+        (Some(limit), Some(_)) if user_indices.len() > limit as usize => {
+            user_indices[user_indices.len() - limit as usize]
+        }
+        (_, Some(first)) => *first,
+        _ => 0,
+    };
+    let has_older = start > 0 || upstream_has_more;
+    let next_cursor = if has_older {
+        Some(message_before_cursor(&messages[start])?)
+    } else {
+        None
+    };
+    Ok((messages.into_iter().skip(start).collect(), next_cursor))
+}
+
+fn user_message_count(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("user"))
+        .count()
 }
 
 #[async_trait]
@@ -1627,6 +1806,7 @@ fn cursor_after_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     fn sample_binding() -> OpencodeBinding {
         OpencodeBinding {
@@ -1646,5 +1826,61 @@ mod tests {
     fn binding_to_thread_emits_tagged_status() {
         let projected = binding_to_thread(&sample_binding());
         assert_eq!(projected["status"], json!({"type": "notLoaded"}));
+    }
+
+    fn message(id: &str, role: &str, created: i64) -> Value {
+        json!({
+            "info": {"id": id, "role": role, "time": {"created": created}},
+            "parts": []
+        })
+    }
+
+    #[test]
+    fn turn_page_cursor_is_anchored_to_oldest_emitted_user_message() {
+        let messages = vec![
+            message("u1", "user", 1),
+            message("a1", "assistant", 2),
+            message("u2", "user", 3),
+            message("a2", "assistant", 4),
+            message("u3", "user", 5),
+            message("a3", "assistant", 6),
+        ];
+        let (page, cursor) = select_message_turn_page(messages, Some(2), false).expect("page");
+        assert_eq!(
+            page[0].pointer("/info/id").and_then(Value::as_str),
+            Some("u2")
+        );
+
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cursor.expect("older cursor"))
+            .expect("base64url cursor");
+        let value: Value = serde_json::from_slice(&decoded).expect("cursor json");
+        assert_eq!(value, json!({"id": "u2", "time": 3}));
+    }
+
+    #[test]
+    fn turn_page_drops_leading_assistant_fragment_without_losing_cursor() {
+        let messages = vec![
+            message("a0", "assistant", 1),
+            message("u1", "user", 2),
+            message("a1", "assistant", 3),
+        ];
+        let (page, cursor) = select_message_turn_page(messages, Some(5), false).expect("page");
+        assert_eq!(
+            page[0].pointer("/info/id").and_then(Value::as_str),
+            Some("u1")
+        );
+        assert!(cursor.is_some());
+    }
+
+    #[test]
+    fn user_message_count_ignores_multi_step_assistant_messages() {
+        let messages = vec![
+            message("u1", "user", 1),
+            message("a1", "assistant", 2),
+            message("a2", "assistant", 3),
+            message("u2", "user", 4),
+        ];
+        assert_eq!(user_message_count(&messages), 2);
     }
 }

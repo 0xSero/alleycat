@@ -1,3 +1,4 @@
+use base64::Engine;
 use reqwest::{Method, Response};
 use serde_json::{Value, json};
 
@@ -160,6 +161,39 @@ impl OpencodeClient {
         self.get(&format!("/session/{session_id}/message")).await
     }
 
+    /// Fetch a bounded page of session messages using opencode's native
+    /// message pagination (`GET /session/:id/message?limit=&before=`).
+    ///
+    /// The legacy endpoint deliberately returns only the message array; it
+    /// does not expose the continuation cursor that `MessageV2.page` creates
+    /// internally. `has_more` is therefore conservative when a full page is
+    /// returned. Callers construct the next `before` cursor from the oldest
+    /// message boundary they actually emit.
+    pub async fn list_messages_page(
+        &self,
+        session_id: &str,
+        limit: Option<u32>,
+        before: Option<&str>,
+    ) -> anyhow::Result<(Vec<Value>, bool)> {
+        let mut query = Vec::new();
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        if let Some(before) = before.filter(|s| !s.is_empty()) {
+            query.push(format!("before={before}"));
+        }
+        let path = if query.is_empty() {
+            format!("/session/{session_id}/message")
+        } else {
+            format!("/session/{session_id}/message?{}", query.join("&"))
+        };
+        let resp = self.raw_get(&path).await?;
+        let body: Value = resp.json().await?;
+        let messages = body.as_array().cloned().unwrap_or_default();
+        let has_more = limit.is_some_and(|limit| messages.len() >= limit as usize);
+        Ok((messages, has_more))
+    }
+
     /// `POST /session/:id/prompt_async` — opencode accepts the prompt and
     /// returns 204 immediately; the actual model work is driven over SSE.
     pub async fn prompt_async(&self, session_id: &str, body: Value) -> anyhow::Result<()> {
@@ -197,5 +231,38 @@ impl OpencodeClient {
         )
         .await?;
         Ok(())
+    }
+}
+
+/// Encode the cursor accepted by opencode's legacy `before` query. This is
+/// the same base64url JSON shape used by `MessageV2.cursor.encode`.
+pub(crate) fn message_before_cursor(message: &Value) -> anyhow::Result<String> {
+    let id = message
+        .pointer("/info/id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("message is missing info.id"))?;
+    let time = message
+        .pointer("/info/time/created")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("message is missing info.time.created"))?;
+    let encoded = serde_json::to_vec(&json!({"id": id, "time": time}))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(encoded))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn message_before_cursor_matches_opencode_shape() {
+        let cursor = message_before_cursor(&json!({
+            "info": {"id": "msg_123", "time": {"created": 456}}
+        }))
+        .expect("cursor");
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(cursor)
+            .expect("base64url cursor");
+        let value: Value = serde_json::from_slice(&decoded).expect("cursor json");
+        assert_eq!(value, json!({"id": "msg_123", "time": 456}));
     }
 }
