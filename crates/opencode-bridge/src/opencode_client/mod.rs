@@ -160,6 +160,40 @@ impl OpencodeClient {
         self.get(&format!("/session/{session_id}/message")).await
     }
 
+    /// Fetch a bounded page of session messages using opencode's native
+    /// message pagination (`GET /session/:id/message?limit=&before=`). Returns
+    /// the messages plus the opaque continuation cursor from the
+    /// `x-next-cursor` response header, if present. This avoids materializing
+    /// the entire archive when the client only wants a window.
+    pub async fn list_messages_page(
+        &self,
+        session_id: &str,
+        limit: Option<u32>,
+        before: Option<&str>,
+    ) -> anyhow::Result<(Vec<Value>, Option<String>)> {
+        let mut query = Vec::new();
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        if let Some(before) = before.filter(|s| !s.is_empty()) {
+            query.push(format!("before={before}"));
+        }
+        let path = if query.is_empty() {
+            format!("/session/{session_id}/message")
+        } else {
+            format!("/session/{session_id}/message?{}", query.join("&"))
+        };
+        let resp = self.raw_get(&path).await?;
+        let next_cursor = resp
+            .headers()
+            .get("x-next-cursor")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let body: Value = resp.json().await?;
+        let messages = body.as_array().cloned().unwrap_or_default();
+        Ok((messages, next_cursor))
+    }
+
     /// `POST /session/:id/prompt_async` — opencode accepts the prompt and
     /// returns 204 immediately; the actual model work is driven over SSE.
     pub async fn prompt_async(&self, session_id: &str, body: Value) -> anyhow::Result<()> {
