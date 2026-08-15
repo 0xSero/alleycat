@@ -494,7 +494,12 @@ impl OpencodeBridge {
         // `GET /session?directory=<worktree>` page with the default list.
         let mut seen_ids: std::collections::HashSet<String> = raw_sessions
             .iter()
-            .filter_map(|session| session.get("id").and_then(Value::as_str).map(str::to_string))
+            .filter_map(|session| {
+                session
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
             .collect();
         let query_suffix = if query.is_empty() {
             String::new()
@@ -649,13 +654,22 @@ impl OpencodeBridge {
             .index
             .by_thread(thread_id)
             .ok_or_else(|| JsonRpcError::invalid_params("unknown thread"))?;
-        let exclude_turns = params
-            .get("excludeTurns")
-            .or_else(|| params.get("exclude_turns"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let (turns, is_active) = if exclude_turns {
-            // Paginated hydration path (`excludeTurns: true`): return an empty
+        let omit_turns = if method == "thread/read" {
+            !params
+                .get("includeTurns")
+                .or_else(|| params.get("include_turns"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        } else {
+            params
+                .get("excludeTurns")
+                .or_else(|| params.get("exclude_turns"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
+        let (turns, is_active) = if omit_turns {
+            // Paginated hydration and metadata-only read paths
+            // (`excludeTurns: true` / `includeTurns: false`) return an empty
             // turn list so the client pages history via `thread/turns/list`
             // instead of us embedding the entire archive. Derive the concrete
             // status from a bounded window of the latest messages rather than

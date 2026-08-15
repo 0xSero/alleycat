@@ -100,6 +100,67 @@ async fn thread_resume_then_read_returns_persisted_turns() {
 }
 
 #[tokio::test]
+async fn thread_read_without_turns_does_not_embed_persisted_history() {
+    let state = std::sync::Arc::new(std::sync::Mutex::new(FakeServerState::default()));
+    {
+        let mut guard = state.lock().unwrap();
+        guard.route(
+            "GET /session/ses_read_metadata/message",
+            json!([
+                {
+                    "info": {"id":"msg_user","role":"user","sessionID":"ses_read_metadata"},
+                    "parts": [{"id":"p1","type":"text","text":"large history"}]
+                },
+                {
+                    "info": {"id":"msg_asst","role":"assistant","sessionID":"ses_read_metadata"},
+                    "parts": [{"id":"p2","type":"text","text":"must stay paginated"}]
+                }
+            ]),
+        );
+        guard.route(
+            "GET /session",
+            json!([{
+                "id":"ses_read_metadata",
+                "directory":"/tmp/v3r-metadata",
+                "title":"V3 Read Metadata",
+                "time":{"created":1_000,"updated":1_000}
+            }]),
+        );
+    }
+
+    let mut fx = bring_up_bridge("v3r-metadata", state.clone()).await;
+
+    send(
+        &mut fx.write,
+        2,
+        "thread/list",
+        json!({"cwd":"/tmp/v3r-metadata"}),
+    )
+    .await;
+    let list = read_until_response(&mut fx.read, 2).await;
+    let thread_id = list["result"]["data"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    send(
+        &mut fx.write,
+        3,
+        "thread/read",
+        json!({"threadId":thread_id,"includeTurns":false}),
+    )
+    .await;
+    let read = read_until_response(&mut fx.read, 3).await;
+    assert_eq!(
+        read["result"]["thread"]["turns"],
+        json!([]),
+        "metadata-only reads must not bypass thread/turns/list pagination"
+    );
+
+    fx.shutdown().await;
+}
+
+#[tokio::test]
 async fn thread_resume_with_bash_history_keeps_command_actions_field() {
     let state = std::sync::Arc::new(std::sync::Mutex::new(FakeServerState::default()));
     {
