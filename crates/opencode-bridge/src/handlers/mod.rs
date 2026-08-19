@@ -471,6 +471,12 @@ impl OpencodeBridge {
         // `directory=` would make a valid Codex thread disappear.
         let mut upstream_path = "/session".to_string();
         let mut query = Vec::new();
+        // Never fetch subagent/agent sessions for the session list. They are
+        // conversation-scoped data, not top-level sessions, and opencode
+        // scopes them under a `parentID`. Passing `parentID=null` excludes
+        // them at the source so they never cross into the bridge (or the
+        // mobile session list).
+        query.push("parentID=null".to_string());
         if let Some(term) = search_term.as_deref() {
             query.push(format!("search={}", encode_query(term)));
         }
