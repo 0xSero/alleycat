@@ -238,3 +238,41 @@ async fn use_state_db_only_is_accepted_no_op() {
 
     fx.shutdown().await;
 }
+
+/// Subagent/agent sessions (opencode sessions with a `parentID`) are
+/// conversation-scoped, not top-level sessions. The bridge must never fetch
+/// them for `thread/list`: it asks opencode for `parentID=null` so subagents
+/// are excluded at the source instead of being fetched and then filtered.
+#[tokio::test]
+async fn session_list_requests_parentid_null_upstream() {
+    let state = std::sync::Arc::new(std::sync::Mutex::new(FakeServerState::default()));
+    let body = json!([
+        ses("ses_root_a", "/tmp/v10a", "top-level a", 1_000, None),
+        json!({
+            "id": "ses_sub_b",
+            "directory": "/tmp/v10a",
+            "title": "explore things (@explore subagent)",
+            "parentID": "ses_root_a",
+            "time": {"created": 1_100, "updated": 1_100},
+        }),
+    ]);
+    {
+        let mut guard = state.lock().unwrap();
+        guard.route("GET /session?", body.clone());
+        guard.route("GET /session ", body.clone());
+    }
+    let mut fx = bring_up_bridge("v10-subagents", state.clone()).await;
+
+    let _resp = list(&mut fx, 2, json!({})).await;
+
+    // The bridge must request only top-level sessions upstream so subagents
+    // are excluded at the source (opencode filters parent_id IS NULL for
+    // parentID=null), rather than fetching every session and filtering here.
+    let seen = fx.seen();
+    assert!(
+        seen.iter().any(|line| line.contains("parentID=null")),
+        "expected parentID=null in upstream session requests: {seen:?}"
+    );
+
+    fx.shutdown().await;
+}
