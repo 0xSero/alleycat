@@ -543,6 +543,21 @@ impl OpencodeBridge {
                 }
             }
         }
+        // Drop subagent sessions that still came back. The `parentID=null`
+        // query filter above is only honored by newer opencode builds; stable
+        // releases (e.g. 1.18.x) accept the param but ignore it, yet still
+        // tag subagent sessions with a non-empty `parentID` (top-level
+        // sessions omit the field). Subagents are conversation-scoped data,
+        // so they never belong in the session list regardless of server
+        // version.
+        raw_sessions.retain(|session| {
+            session
+                .get("parentID")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty()
+        });
         let upstream_count = raw_sessions.len();
 
         // Bind every fetched session into the local thread index so the
