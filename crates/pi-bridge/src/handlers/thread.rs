@@ -184,7 +184,7 @@ pub async fn handle_thread_start(
         .approval_policy
         .clone()
         .or_else(|| defaults.approval_policy.clone())
-        .unwrap_or(p::AskForApproval::OnRequest);
+        .unwrap_or(p::AskForApproval::Never);
     let approvals_reviewer = params
         .approvals_reviewer
         .or(defaults.approvals_reviewer)
@@ -290,7 +290,7 @@ pub async fn handle_thread_resume(
         .approval_policy
         .clone()
         .or_else(|| defaults.approval_policy.clone())
-        .unwrap_or(p::AskForApproval::OnRequest);
+        .unwrap_or(p::AskForApproval::Never);
     let approvals_reviewer = params
         .approvals_reviewer
         .or(defaults.approvals_reviewer)
@@ -412,7 +412,7 @@ pub async fn handle_thread_fork(
             .approval_policy
             .clone()
             .or_else(|| defaults.approval_policy.clone())
-            .unwrap_or(p::AskForApproval::OnRequest),
+            .unwrap_or(p::AskForApproval::Never),
         approvals_reviewer: params
             .approvals_reviewer
             .or(defaults.approvals_reviewer)
@@ -960,16 +960,17 @@ fn sandbox_value(mode: Option<p::SandboxMode>) -> p::SandboxPolicy {
     // "camelCase")]` with variants `ReadOnly`, `DangerFullAccess`,
     // `WorkspaceWrite`, `ExternalSandbox` (see app-server-protocol/src/protocol/v2.rs).
     // Inner fields all have `#[serde(default)]`, so emitting just the discriminator
-    // round-trips cleanly. Default to `workspaceWrite` when the caller didn't
+    // round-trips cleanly. Default to `dangerFullAccess` when the caller didn't
     // pick anything.
     match mode {
         Some(p::SandboxMode::ReadOnly) => serde_json::json!({ "type": "readOnly" }),
         Some(p::SandboxMode::DangerFullAccess) => {
             serde_json::json!({ "type": "dangerFullAccess" })
         }
-        Some(p::SandboxMode::WorkspaceWrite) | None => {
+        Some(p::SandboxMode::WorkspaceWrite) => {
             serde_json::json!({ "type": "workspaceWrite" })
         }
+        None => serde_json::json!({ "type": "dangerFullAccess" }),
     }
 }
 
@@ -1529,8 +1530,8 @@ mod tests {
             sandbox_value(Some(p::SandboxMode::WorkspaceWrite)),
             json!({"type": "workspaceWrite"})
         );
-        // Default falls back to workspaceWrite.
-        assert_eq!(sandbox_value(None), json!({"type": "workspaceWrite"}));
+        // Default falls back to dangerFullAccess.
+        assert_eq!(sandbox_value(None), json!({"type": "dangerFullAccess"}));
     }
 
     #[test]

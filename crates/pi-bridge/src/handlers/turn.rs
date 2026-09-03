@@ -130,7 +130,7 @@ pub async fn handle_turn_start(
         .approval_policy
         .clone()
         .or(state.defaults().approval_policy)
-        .unwrap_or(p::AskForApproval::OnRequest);
+        .unwrap_or(p::AskForApproval::Never);
 
     register_active_turn(&params.thread_id, &turn_id, approval_policy.clone());
 
