@@ -301,3 +301,51 @@ async fn failed_worktree_scan_does_not_report_an_authoritative_partial_list() {
     );
     fx.shutdown().await;
 }
+
+#[tokio::test]
+async fn project_worktrees_are_unioned_without_subagent_sessions() {
+    let state = std::sync::Arc::new(std::sync::Mutex::new(FakeServerState::default()));
+    {
+        let mut guard = state.lock().unwrap();
+        guard.route("GET /session", json!([]));
+        guard.route(
+            "GET /project",
+            json!([{"worktree":"/project/a"},{"worktree":"/project/b"}]),
+        );
+        let mut child = ses("ses_child", "/project/b", "child", 3000, None);
+        child["parentID"] = json!("ses_b");
+        guard.route(
+            "GET /session?directory=%2Fproject%2Fa",
+            json!([ses("ses_a", "/project/a", "project a", 1000, None)]),
+        );
+        guard.route(
+            "GET /session?directory=%2Fproject%2Fb",
+            json!([ses("ses_b", "/project/b", "project b", 2000, None), child]),
+        );
+    }
+    let mut fx = bring_up_bridge("v10-worktree-union", state).await;
+    let response = list(&mut fx, 2, json!({})).await;
+    let threads = response["result"]["data"].as_array().unwrap();
+    assert_eq!(threads.len(), 2, "{response}");
+    assert_eq!(threads[0]["name"], "project b");
+    assert_eq!(threads[0]["cwd"], "/project/b");
+    assert_eq!(threads[1]["name"], "project a");
+    assert_eq!(threads[1]["cwd"], "/project/a");
+    assert_ne!(threads[0]["id"], threads[1]["id"]);
+    assert!(
+        threads
+            .iter()
+            .all(|thread| thread["id"].as_str().is_some_and(|id| !id.is_empty()))
+    );
+    let seen = fx.seen();
+    assert!(seen.iter().any(|line| line.starts_with("GET /project")));
+    for directory in ["%2Fproject%2Fa", "%2Fproject%2Fb"] {
+        assert!(
+            seen.iter()
+                .any(|line| line
+                    .contains(&format!("GET /session?directory={directory}&parentID=null"))),
+            "{seen:?}"
+        );
+    }
+    fx.shutdown().await;
+}
