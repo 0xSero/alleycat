@@ -283,3 +283,21 @@ async fn session_list_requests_parentid_null_and_drops_subagents() {
 
     fx.shutdown().await;
 }
+
+#[tokio::test]
+async fn failed_worktree_scan_does_not_report_an_authoritative_partial_list() {
+    let state = std::sync::Arc::new(std::sync::Mutex::new(FakeServerState::default()));
+    seed_three(&state);
+    {
+        let mut guard = state.lock().unwrap();
+        guard.route("GET /project", json!([{"worktree":"/other"}]));
+        guard.route("GET /session?directory=", json!("__server_error__"));
+    }
+    let mut fx = bring_up_bridge("v10-failed-worktree", state).await;
+    let response = list(&mut fx, 2, json!({})).await;
+    assert!(
+        response.get("error").is_some(),
+        "partial success would let clients prune missing worktree sessions: {response}"
+    );
+    fx.shutdown().await;
+}

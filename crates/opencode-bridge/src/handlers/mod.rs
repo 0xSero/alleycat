@@ -527,8 +527,17 @@ impl OpencodeBridge {
                     encode_query(worktree),
                     query_suffix
                 );
-                if let Ok(page) = self.client.get(&path).await
-                    && let Some(page_array) = page.as_array()
+                // Once a project is advertised, omitting it on failure
+                // would turn a partial scan into an authoritative snapshot.
+                // Mobile consumers may prune every missing worktree thread.
+                let page = self.client.get(&path).await.map_err(|error| {
+                    JsonRpcError::internal(format!(
+                        "listing OpenCode worktree {worktree}: {error:#}"
+                    ))
+                })?;
+                let page_array = page.as_array().ok_or_else(|| {
+                    JsonRpcError::internal("OpenCode worktree session list is not an array")
+                })?;
                 {
                     for session in page_array {
                         let id = session
