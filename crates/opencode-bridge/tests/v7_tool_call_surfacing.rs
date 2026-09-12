@@ -18,7 +18,7 @@ async fn each_tool_kind_routes_to_its_codex_thread_item() {
     {
         let mut guard = state.lock().unwrap();
         guard.route(
-            "GET /session?directory=%2Ftmp%2Fv7",
+            "GET /session",
             json!([{
                 "id":"ses_v7",
                 "directory":"/tmp/v7",
@@ -101,7 +101,7 @@ async fn recent_opencode_tool_shapes_keep_args_results_and_context() {
     {
         let mut guard = state.lock().unwrap();
         guard.route(
-            "GET /session?directory=%2Ftmp%2Fv7-real",
+            "GET /session",
             json!([{
                 "id":"ses_v7_real",
                 "directory":"/tmp/v7-real",
