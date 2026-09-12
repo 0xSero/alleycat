@@ -776,10 +776,12 @@ impl OpencodeBridge {
     /// the whole archive and slicing locally.
     async fn handle_thread_turns_list(&self, params: Value) -> Result<Value, JsonRpcError> {
         let binding = binding_from_params(&self.index, &params)?;
-        let turn_limit = params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .map(|v| v as u32);
+        let turn_limit = Some(alleycat_bridge_core::resolve_list_limit(
+            params
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|value| u32::try_from(value).unwrap_or(u32::MAX)),
+        ));
         let cursor = params
             .get("cursor")
             .and_then(Value::as_str)
@@ -816,6 +818,23 @@ impl OpencodeBridge {
             if older.is_empty() {
                 upstream_has_more = false;
                 break;
+            }
+            // Older servers may accept `before` but ignore it. Refuse a
+            // repeated/overlapping window instead of growing memory forever
+            // while searching for a user boundary that will never arrive.
+            let known_ids: std::collections::HashSet<&str> = messages
+                .iter()
+                .filter_map(|message| message.pointer("/info/id").and_then(Value::as_str))
+                .collect();
+            if older.iter().any(|message| {
+                message
+                    .pointer("/info/id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| known_ids.contains(id))
+            }) {
+                return Err(JsonRpcError::internal(
+                    "OpenCode message pagination did not advance; update the OpenCode server",
+                ));
             }
             older.append(&mut messages);
             messages = older;
