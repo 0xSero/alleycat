@@ -190,6 +190,25 @@ impl OpencodeClient {
         let resp = self.raw_get(&path).await?;
         let body: Value = resp.json().await?;
         let messages = body.as_array().cloned().unwrap_or_default();
+        // Native `before` is exclusive. Checking its anchor also catches
+        // servers that ignore it across separate client page requests, even
+        // when this window already has enough complete user turns.
+        if let Some(cursor) = before
+            .and_then(|cursor| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(cursor)
+                    .ok()
+            })
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            && let Some(anchor_id) = cursor.get("id").and_then(Value::as_str)
+            && messages.iter().any(|message| {
+                message.pointer("/info/id").and_then(Value::as_str) == Some(anchor_id)
+            })
+        {
+            anyhow::bail!(
+                "OpenCode message pagination did not advance; update the OpenCode server"
+            );
+        }
         let has_more = limit.is_some_and(|limit| messages.len() >= limit as usize);
         Ok((messages, has_more))
     }

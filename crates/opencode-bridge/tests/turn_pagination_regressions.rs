@@ -155,3 +155,44 @@ async fn oversized_turn_limit_is_clamped_without_integer_wraparound() {
     );
     fx.shutdown().await;
 }
+
+#[tokio::test]
+async fn ignored_cursor_on_a_later_request_does_not_repeat_a_completed_page() {
+    let messages: Vec<_> = (1..=2)
+        .flat_map(|i| {
+            [
+                json!({
+                    "info":{"id":format!("u{i}"),"role":"user","time":{"created":i * 2}},
+                    "parts":[{"id":format!("pu{i}"),"type":"text","text":"hello"}]
+                }),
+                json!({
+                    "info":{"id":format!("a{i}"),"role":"assistant","time":{"created":i * 2 + 1}},
+                    "parts":[]
+                }),
+            ]
+        })
+        .collect();
+    let mut fx = page_fixture(json!(messages), json!(1)).await;
+    let first = read_until_response(&mut fx.read, 3).await;
+    let cursor = first["result"]["nextCursor"].as_str().unwrap();
+    // Resolve the same stable binding again; the fake deliberately ignores
+    // the `before` query and returns the newest page for every request.
+    send(&mut fx.write, 4, "thread/list", json!({})).await;
+    let listed = read_until_response(&mut fx.read, 4).await;
+    let thread_id = listed["result"]["data"][0]["id"].clone();
+    send(
+        &mut fx.write,
+        5,
+        "thread/turns/list",
+        json!({"threadId":thread_id,"limit":1,"cursor":cursor}),
+    )
+    .await;
+    let second = read_until_response(&mut fx.read, 5).await;
+    assert!(
+        second["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("pagination did not advance")
+    );
+    fx.shutdown().await;
+}
