@@ -910,6 +910,18 @@ async fn handle_session_created(rc: RouteContext<'_>, props: &Value) {
         Some(info) => info.clone(),
         None => return,
     };
+    // Subagent sessions carry a non-empty `parentID` (top-level sessions
+    // omit the field). They are conversation-scoped data, so they must not
+    // be bound into the index or announced as top-level threads — the same
+    // rule `thread/list` enforces.
+    if info
+        .get("parentID")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|parent| !parent.is_empty())
+    {
+        return;
+    }
     let binding = match rc.index.bind_session(&info).await {
         Ok(binding) => binding,
         Err(error) => {

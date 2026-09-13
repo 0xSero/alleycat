@@ -114,6 +114,58 @@ async fn session_diff_emits_turn_diff_updated_with_unified_text() {
     server_task.abort();
 }
 
+/// Subagent sessions carry a non-empty `parentID` (top-level sessions omit
+/// the field). A `session.created` for one must not be bound into the index
+/// or announced as `thread/started` — matching the `thread/list` rule that
+/// keeps conversation-scoped sessions out of the session list.
+#[tokio::test]
+async fn session_created_subagent_is_ignored_top_level_is_announced() {
+    let (mut read, write, sse_injector, _state_dir, server_task) = bring_up_bridge().await;
+
+    // Subagent session: has parentID → no thread/started.
+    inject_sse(
+        &sse_injector,
+        json!({
+            "type":"session.created",
+            "properties":{
+                "sessionID":"ses_sub_1",
+                "info":{
+                    "id":"ses_sub_1",
+                    "title":"Explore things (@explore subagent)",
+                    "directory":"/tmp/opencode-v5",
+                    "parentID":"ses_parent_1",
+                    "time":{"created":1_000,"updated":1_000}
+                }
+            }
+        }),
+    );
+    // Top-level session: no parentID → thread/started.
+    inject_sse(
+        &sse_injector,
+        json!({
+            "type":"session.created",
+            "properties":{
+                "sessionID":"ses_top_1",
+                "info":{
+                    "id":"ses_top_1",
+                    "title":"Top-level peer session",
+                    "directory":"/tmp/opencode-v5",
+                    "time":{"created":1_100,"updated":1_100}
+                }
+            }
+        }),
+    );
+    let started =
+        read_until_notification(&mut read, "thread/started", Duration::from_secs(3)).await;
+    // The subagent was injected first; if the guard failed it would be the
+    // one announced here. Only the top-level session may pass.
+    let announced_name = started["params"]["thread"]["name"].as_str().unwrap();
+    assert_eq!(announced_name, "Top-level peer session");
+
+    drop(write);
+    server_task.abort();
+}
+
 // ---- shared helpers ----
 
 async fn bring_up_bridge() -> (
