@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use alleycat_bridge_core::ProcessLauncher;
 use alleycat_bridge_core::session::Session;
 use alleycat_codex_proto::{
-    ApprovalsReviewer, AskForApproval, InitializeCapabilities, JsonRpcMessage, ReasoningEffort,
-    SandboxMode, ThreadItem, Turn, TurnError, TurnStatus,
+    ApprovalsReviewer, AskForApproval, InitializeCapabilities, JsonRpcMessage, SandboxMode,
+    ThreadItem, Turn, TurnError, TurnStatus,
 };
 use serde_json::Value;
 
@@ -44,7 +44,6 @@ pub struct RecordedTurn {
 pub struct ThreadDefaults {
     pub model: Option<String>,
     pub model_provider: Option<String>,
-    pub reasoning_effort: Option<ReasoningEffort>,
     pub approval_policy: Option<AskForApproval>,
     pub approvals_reviewer: Option<ApprovalsReviewer>,
     pub sandbox: Option<SandboxMode>,

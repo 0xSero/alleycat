@@ -8,6 +8,7 @@
 //! `DashMap` keyed by `session_id` so the same `(client_node_id, agent)`
 //! session keeps its config across iroh disconnects.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -26,7 +27,10 @@ use crate::codex_proto as p;
 use crate::handlers;
 use crate::index::{PiHydrator, PiSessionInfo, ThreadIndex};
 use crate::pool::{self as pi, PiPool};
-use crate::state::{ConnectionState, ThreadDefaults, ThreadIndexHandle};
+use crate::state::{ConnectionState, SessionIndexRefresh, ThreadDefaults, ThreadIndexHandle};
+
+const STARTUP_PREWARM_CWD_LIMIT: usize = 3;
+const STARTUP_SESSION_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Build the per-session map key from the session's `(node_id, agent)`
 /// identity. Matches the registry's keying so the same daemon-managed
@@ -50,6 +54,9 @@ pub struct PiBridge {
     /// underlying registry session expires.
     per_conn: DashMap<String, Arc<Mutex<ThreadDefaults>>>,
     trust_persisted_cwd: bool,
+    model_provider_prefixes: Arc<Vec<String>>,
+    model_catalog_path: Option<PathBuf>,
+    session_index_refresh: Option<SessionIndexRefresh>,
 }
 
 impl PiBridge {
@@ -103,6 +110,9 @@ impl PiBridge {
             defaults,
             Arc::clone(&self.launcher),
             self.trust_persisted_cwd,
+            Arc::clone(&self.model_provider_prefixes),
+            self.model_catalog_path.clone(),
+            self.session_index_refresh.clone(),
         ))
     }
 }
@@ -118,6 +128,9 @@ pub struct PiBridgeBuilder {
     trust_persisted_cwd: bool,
     hydrator: Option<PiHydrator>,
     rpc_session_listing_only: bool,
+    defer_initial_hydration: bool,
+    model_provider_prefixes: Vec<String>,
+    model_catalog_path: Option<PathBuf>,
 }
 
 impl PiBridgeBuilder {
@@ -156,12 +169,37 @@ impl PiBridgeBuilder {
         self
     }
 
-    /// When enabled, startup session hydration uses only Pi's RPC
-    /// `list_sessions` command. If that command fails, the bridge starts with
-    /// an empty index instead of falling back to a local `~/.pi` scan. Remote
-    /// launchers use this so session discovery stays on the remote machine.
+    /// Open the persisted thread index immediately and reconcile the full Pi
+    /// session store in the background. Daemon embedders use this so a large
+    /// local history cannot block the control socket or trigger a launchd
+    /// restart loop. Direct bridge consumers retain synchronous hydration by
+    /// default.
+    pub fn defer_initial_hydration(mut self, enabled: bool) -> Self {
+        self.defer_initial_hydration = enabled;
+        self
+    }
+
+    /// When enabled, startup session hydration uses only Pi's short-bounded
+    /// RPC `list_sessions` command. If that command fails or times out, the
+    /// bridge starts with an empty index instead of falling back to a local
+    /// `~/.pi` scan. Remote launchers use this so session discovery stays on
+    /// the remote machine. The default local builder scans Pi's filesystem
+    /// directly and never probes this optional RPC.
     pub fn rpc_session_listing_only(mut self, enabled: bool) -> Self {
         self.rpc_session_listing_only = enabled;
+        self
+    }
+
+    /// Restrict `model/list` to exact provider ids or their `prefix-*`
+    /// controller variants. Empty means the runtime's complete catalog.
+    pub fn model_provider_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.model_provider_prefixes.push(prefix.into());
+        self
+    }
+
+    /// Prefer a controller-owned Pi `models.json` for `model/list`.
+    pub fn model_catalog_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.model_catalog_path = Some(path.into());
         self
     }
 
@@ -205,22 +243,88 @@ impl PiBridgeBuilder {
             idle_ttl,
         ));
 
-        let hydrator = match self.hydrator {
-            Some(hydrator) => hydrator,
-            None => match list_sessions_via_rpc(&pool).await {
-                Ok(sessions) => PiHydrator::with_sessions(sessions),
-                Err(error) => {
+        let hydrator = match (self.hydrator, self.rpc_session_listing_only) {
+            (Some(hydrator), _) => hydrator,
+            (None, false) => PiHydrator::new(),
+            (None, true) => match tokio::time::timeout(
+                STARTUP_SESSION_RPC_TIMEOUT,
+                list_sessions_via_rpc(&pool),
+            )
+            .await
+            {
+                Ok(Ok(sessions)) => PiHydrator::with_sessions(sessions),
+                Ok(Err(error)) => {
                     tracing::warn!(%error, "pi RPC list_sessions failed during bridge startup");
-                    if self.rpc_session_listing_only {
-                        PiHydrator::with_sessions(Vec::new())
-                    } else {
-                        PiHydrator::new()
-                    }
+                    PiHydrator::with_sessions(Vec::new())
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = STARTUP_SESSION_RPC_TIMEOUT.as_millis(),
+                        "pi RPC list_sessions timed out during bridge startup"
+                    );
+                    release_startup_utilities(Arc::clone(&pool));
+                    PiHydrator::with_sessions(Vec::new())
                 }
             },
         };
-        let thread_index: Arc<ThreadIndex> =
-            ThreadIndex::open_and_hydrate_with(&codex_home, &hydrator).await?;
+        let defer_initial_hydration = self.defer_initial_hydration && hydrator.sessions.is_none();
+        let thread_index: Arc<ThreadIndex> = if defer_initial_hydration {
+            ThreadIndex::open(&codex_home).await?
+        } else {
+            ThreadIndex::open_and_hydrate_with(&codex_home, &hydrator).await?
+        };
+        let scoped_model_provider = self.model_provider_prefixes.first().cloned();
+        if let Some(model_provider) = scoped_model_provider.as_deref() {
+            thread_index
+                .inner()
+                .set_all_model_providers(model_provider)
+                .await?;
+        }
+        for cwd in recent_unique_cwds(
+            &thread_index.inner().snapshot().await,
+            STARTUP_PREWARM_CWD_LIMIT,
+        ) {
+            pool.schedule_prewarm(cwd);
+        }
+        let session_index_refresh = if hydrator.sessions.is_none() {
+            hydrator
+                .override_dir
+                .clone()
+                .or_else(crate::index::pi_sessions_dir)
+                .map(|root| {
+                    SessionIndexRefresh::new(
+                        thread_index.clone(),
+                        root,
+                        scoped_model_provider.clone(),
+                    )
+                })
+        } else {
+            None
+        };
+        if defer_initial_hydration {
+            let index = Arc::clone(&thread_index);
+            let sessions_root = hydrator.override_dir.clone();
+            let model_provider = scoped_model_provider.clone();
+            tokio::spawn(async move {
+                match index.hydrate_from_pi_dir(sessions_root.as_deref()).await {
+                    Ok(added) => {
+                        if let Some(model_provider) = model_provider.as_deref()
+                            && let Err(error) =
+                                index.inner().set_all_model_providers(model_provider).await
+                        {
+                            tracing::warn!(
+                                %error,
+                                "failed to scope deferred pi session hydration"
+                            );
+                        }
+                        tracing::info!(added, "deferred pi session hydration completed");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "deferred pi session hydration failed");
+                    }
+                }
+            });
+        }
         let thread_index_handle: Arc<dyn ThreadIndexHandle> = thread_index;
 
         Ok(Arc::new(PiBridge {
@@ -230,8 +334,43 @@ impl PiBridgeBuilder {
             launcher,
             per_conn: DashMap::new(),
             trust_persisted_cwd: self.trust_persisted_cwd,
+            model_provider_prefixes: Arc::new(self.model_provider_prefixes),
+            model_catalog_path: self.model_catalog_path,
+            session_index_refresh,
         }))
     }
+}
+
+fn release_startup_utilities(pool: Arc<PiPool>) {
+    tokio::spawn(async move {
+        for thread_id in pool.loaded_thread_ids().await {
+            if thread_id.starts_with("utility_") {
+                pool.release(&thread_id).await;
+            }
+        }
+    });
+}
+
+fn recent_unique_cwds(entries: &[crate::index::IndexEntry], limit: usize) -> Vec<PathBuf> {
+    let mut recent: Vec<_> = entries
+        .iter()
+        .filter(|entry| !entry.cwd.is_empty())
+        .collect();
+    recent.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.created_at.cmp(&left.created_at))
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+    });
+
+    let mut seen = HashSet::new();
+    recent
+        .into_iter()
+        .filter(|entry| seen.insert(entry.cwd.as_str()))
+        .take(limit)
+        .map(|entry| PathBuf::from(&entry.cwd))
+        .collect()
 }
 
 async fn list_sessions_via_rpc(pool: &PiPool) -> Result<Vec<PiSessionInfo>> {
@@ -411,6 +550,10 @@ async fn dispatch(
                 decode(&params)?
             };
             ok(handlers::model::handle_model_list(state, typed).await)
+        }
+        "fuzzyFileSearch" => {
+            let typed: p::FuzzyFileSearchParams = decode(&params)?;
+            ok(handlers::file_search::handle_fuzzy_file_search(typed).await)
         }
         "skills/list" => {
             let typed: p::SkillsListParams = if params.is_null() {
@@ -631,5 +774,112 @@ fn turn_err(err: handlers::turn::TurnError) -> JsonRpcError {
         code: err.rpc_code(),
         message: err.to_string(),
         data: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{IndexEntry, PiSessionRef};
+    use futures::future::BoxFuture;
+
+    fn entry(thread_id: &str, cwd: &str, updated_at: i64) -> IndexEntry {
+        IndexEntry {
+            thread_id: thread_id.to_string(),
+            cwd: cwd.to_string(),
+            created_at: updated_at,
+            updated_at,
+            archived: false,
+            name: None,
+            preview: String::new(),
+            forked_from_id: None,
+            model_provider: "pi".to_string(),
+            source: p::ThreadSourceKind::AppServer,
+            metadata: PiSessionRef {
+                pi_session_path: PathBuf::from(format!("/sessions/{thread_id}.jsonl")),
+                pi_session_id: thread_id.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn startup_prewarm_uses_three_most_recent_unique_cwds() {
+        let entries = vec![
+            entry("old", "/old", 1),
+            entry("duplicate-newer", "/same", 9),
+            entry("newest", "/new", 10),
+            entry("duplicate-older", "/same", 8),
+            entry("third", "/third", 7),
+            entry("fourth", "/fourth", 6),
+            entry("blank", "", 11),
+        ];
+
+        assert_eq!(
+            recent_unique_cwds(&entries, STARTUP_PREWARM_CWD_LIMIT),
+            vec![
+                PathBuf::from("/new"),
+                PathBuf::from("/same"),
+                PathBuf::from("/third")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_provider_relabels_hydrated_history() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let now = Utc::now();
+        let bridge = PiBridge::builder()
+            .codex_home(codex_home.path())
+            .hydrator(PiHydrator::with_sessions(vec![PiSessionInfo {
+                path: codex_home.path().join("session.jsonl"),
+                id: "pi-session".to_string(),
+                cwd: String::new(),
+                name: None,
+                parent_session_path: None,
+                created: now,
+                modified: now,
+                message_count: 0,
+                first_message: "(no messages)".to_string(),
+                all_messages_text: String::new(),
+            }]))
+            .model_provider_prefix("local-studio")
+            .build()
+            .await
+            .unwrap();
+
+        let thread_id = bridge.thread_index().loaded_thread_ids().await.remove(0);
+        let entry = bridge.thread_index().lookup(&thread_id).await.unwrap();
+        assert_eq!(entry.model_provider, "local-studio");
+    }
+
+    struct HangingLauncher;
+
+    impl ProcessLauncher for HangingLauncher {
+        fn launch(
+            &self,
+            _spec: alleycat_bridge_core::ProcessSpec,
+        ) -> BoxFuture<'_, std::io::Result<Box<dyn alleycat_bridge_core::ChildProcess>>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn rpc_only_session_discovery_is_short_bounded() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let started = tokio::time::Instant::now();
+
+        let bridge = PiBridge::builder()
+            .launcher(Arc::new(HangingLauncher))
+            .codex_home(codex_home.path())
+            .rpc_session_listing_only(true)
+            .build()
+            .await
+            .expect("timeout should degrade to an empty remote index");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "startup exceeded its short RPC discovery bound"
+        );
+        assert!(bridge.thread_index().loaded_thread_ids().await.is_empty());
     }
 }

@@ -327,6 +327,28 @@ where
         Ok(changed)
     }
 
+    /// Rewrite the provider label for every indexed row. Embedders that
+    /// expose a scoped Pi runtime (for example Local Studio) use this after
+    /// hydration so historical sessions keep the embedding runtime's
+    /// identity instead of appearing as standalone Pi.
+    pub async fn set_all_model_providers(&self, model_provider: &str) -> Result<()> {
+        let changed = {
+            let mut guard = self.inner.write().await;
+            let mut changed = false;
+            for row in guard.values_mut() {
+                if row.model_provider != model_provider {
+                    row.model_provider = model_provider.to_string();
+                    changed = true;
+                }
+            }
+            changed
+        };
+        if changed {
+            self.persist().await?;
+        }
+        Ok(())
+    }
+
     /// Look a row up by thread id.
     pub async fn lookup(&self, thread_id: &str) -> Option<IndexEntry<M>> {
         self.inner.read().await.get(thread_id).cloned()

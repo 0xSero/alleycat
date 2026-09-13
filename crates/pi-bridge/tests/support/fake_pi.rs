@@ -17,6 +17,8 @@
 //!   or the file is missing, a minimal default script (`agent_start` →
 //!   `agent_end`) is used. The script can also include `{"type":"sleep",
 //!   "ms":N}` directives to insert delays — these are stripped from the wire.
+//! - A `prompt` whose message starts with `FAKE_PI_REJECT:` rejects during
+//!   preflight without running the script. The suffix becomes its error.
 //! - The fake exits cleanly when stdin EOFs, mirroring the real pi shutdown
 //!   path the bridge relies on (closing stdin = drain pending work + exit).
 //!
@@ -37,7 +39,16 @@ fn main() -> ExitCode {
 
     let script = load_script();
     let mut session_id = mint_session_id();
-    let mut session_path: Option<String> = None;
+    // Real Pi enters RPC mode with an already-created, persisted session.
+    // Keep the fake lifecycle-aligned so thread/start can adopt that initial
+    // session without issuing a redundant `new_session`.
+    let mut session_path = Some(format!("/tmp/fake-pi-sessions/{session_id}-initial.jsonl"));
+    let initial_message_count = env::var("FAKE_PI_INITIAL_MESSAGE_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let mut active_model: Option<Value> = None;
+    let mut thinking_level = "off".to_string();
 
     let mut lines = stdin.lock().lines();
     while let Some(Ok(line)) = lines.next() {
@@ -80,8 +91,26 @@ fn main() -> ExitCode {
 
         match cmd_type {
             "prompt" | "steer" | "follow_up" => {
-                run_script(&mut out, &script);
-                emit(&mut out, &response(id.as_deref(), cmd_type, true, None));
+                let prompt_error = (cmd_type == "prompt")
+                    .then(|| cmd.get("message").and_then(Value::as_str))
+                    .flatten()
+                    .and_then(|message| message.strip_prefix("FAKE_PI_REJECT:"))
+                    .map(str::trim)
+                    .filter(|message| !message.is_empty());
+                if let Some(message) = prompt_error {
+                    emit(
+                        &mut out,
+                        &response(
+                            id.as_deref(),
+                            cmd_type,
+                            false,
+                            Some(json!({ "error": message })),
+                        ),
+                    );
+                } else {
+                    run_script(&mut out, &script);
+                    emit(&mut out, &response(id.as_deref(), cmd_type, true, None));
+                }
             }
             "abort" | "abort_bash" | "abort_retry" => {
                 emit(&mut out, &response(id.as_deref(), cmd_type, true, None));
@@ -135,7 +164,8 @@ fn main() -> ExitCode {
                         cmd_type,
                         true,
                         Some(json!({
-                            "thinkingLevel": "off",
+                            "model": active_model.clone(),
+                            "thinkingLevel": thinking_level.clone(),
                             "isStreaming": false,
                             "isCompacting": false,
                             "steeringMode": "all",
@@ -143,7 +173,7 @@ fn main() -> ExitCode {
                             "sessionFile": session_path,
                             "sessionId": session_id,
                             "autoCompactionEnabled": true,
-                            "messageCount": 0,
+                            "messageCount": initial_message_count,
                             "pendingMessageCount": 0,
                         })),
                     ),
@@ -192,6 +222,23 @@ fn main() -> ExitCode {
                     .and_then(|v| v.as_str())
                     .unwrap_or("fake-model")
                     .to_string();
+                active_model = Some(json!({
+                    "id": model_id.clone(),
+                    "name": "Fake Model",
+                    "api": "fake",
+                    "provider": provider.clone(),
+                    "baseUrl": "http://127.0.0.1",
+                    "reasoning": true,
+                    "input": ["text"],
+                    "cost": {
+                        "input": 0.0,
+                        "output": 0.0,
+                        "cacheRead": 0.0,
+                        "cacheWrite": 0.0
+                    },
+                    "contextWindow": 1,
+                    "maxTokens": 1
+                }));
                 emit(
                     &mut out,
                     &response(
@@ -213,8 +260,15 @@ fn main() -> ExitCode {
                     &response(id.as_deref(), cmd_type, true, Some(Value::Null)),
                 );
             }
-            "set_thinking_level"
-            | "cycle_thinking_level"
+            "set_thinking_level" => {
+                thinking_level = cmd
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("off")
+                    .to_string();
+                emit(&mut out, &response(id.as_deref(), cmd_type, true, None));
+            }
+            "cycle_thinking_level"
             | "set_steering_mode"
             | "set_follow_up_mode"
             | "set_auto_compaction"

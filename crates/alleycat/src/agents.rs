@@ -20,9 +20,11 @@ use alleycat_grok_bridge::GrokBridge;
 use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig};
 use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
+use alleycat_pi_bridge::index::PiHydrator;
 use alleycat_shell_bridge::ShellBridge;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
+use iroh::EndpointId;
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
 use tokio::net::TcpStream;
@@ -34,7 +36,8 @@ use tracing::{info, warn};
 
 use crate::agent_manifest::{MANIFESTS, manifest_for};
 use crate::config::HostConfig;
-use crate::protocol::{AgentInfo, AgentWire};
+use crate::local_studio;
+use crate::protocol::{AgentInfo, AgentPresentation, AgentWire};
 use crate::stream::IrohStream;
 
 /// Stable identifier for a JSON-RPC bridge agent. Codex is intentionally
@@ -113,14 +116,139 @@ impl CodexUnixEndpoint {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BridgeStateLayout {
+    base: PathBuf,
+    pi: PathBuf,
+    amp: PathBuf,
+    claude: PathBuf,
+    droid: PathBuf,
+    hermes: PathBuf,
+    devin: PathBuf,
+    opencode: PathBuf,
+}
+
+impl BridgeStateLayout {
+    fn new(base: PathBuf) -> Self {
+        Self {
+            pi: base.join("pi"),
+            amp: base.join("amp"),
+            claude: base.join("claude"),
+            droid: base.join("droid"),
+            hermes: base.join("hermes"),
+            devin: base.join("devin"),
+            opencode: base.join("opencode"),
+            base,
+        }
+    }
+
+    async fn ensure(&self) -> anyhow::Result<()> {
+        for directory in [
+            &self.base,
+            &self.pi,
+            &self.amp,
+            &self.claude,
+            &self.droid,
+            &self.hermes,
+            &self.devin,
+            &self.opencode,
+        ] {
+            tokio::fs::create_dir_all(directory)
+                .await
+                .with_context(|| format!("creating bridge state dir {}", directory.display()))?;
+            #[cfg(unix)]
+            tokio::fs::set_permissions(
+                directory,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+            )
+            .await
+            .with_context(|| format!("securing bridge state directory {}", directory.display()))?;
+        }
+        Ok(())
+    }
+}
+
+fn bridge_state_layout(
+    daemon_env: &LaunchEnvironment,
+) -> anyhow::Result<(BridgeStateLayout, PathBuf)> {
+    let configured_home = env_path(daemon_env, "CODEX_HOME");
+    let legacy_pi_home = configured_home
+        .clone()
+        .unwrap_or_else(|| alleycat_pi_bridge::handlers::lifecycle::default_codex_home());
+    let base = configured_home.unwrap_or(crate::paths::state_dir()?.join("bridges"));
+    Ok((BridgeStateLayout::new(base), legacy_pi_home))
+}
+
+async fn preserve_legacy_pi_state(legacy_home: &Path, pi_home: &Path) {
+    if legacy_home == pi_home {
+        return;
+    }
+    for file_name in ["threads.json", "config.json"] {
+        let source = legacy_home.join(file_name);
+        let destination = pi_home.join(file_name);
+        if destination.exists() || !source.is_file() {
+            continue;
+        }
+        if file_name == "threads.json" {
+            let compatible = tokio::fs::read(&source)
+                .await
+                .ok()
+                .is_some_and(|bytes| pi_threads_index_compatible(&bytes));
+            if !compatible {
+                warn!(
+                    source = %source.display(),
+                    "legacy bridge index is not Pi-shaped; leaving it untouched"
+                );
+                continue;
+            }
+        }
+        let temporary = pi_home.join(format!(".{file_name}.migrating"));
+        let copied = async {
+            tokio::fs::copy(&source, &temporary).await?;
+            tokio::fs::rename(&temporary, &destination).await
+        }
+        .await;
+        match copied {
+            Ok(()) => info!(
+                source = %source.display(),
+                destination = %destination.display(),
+                "copied legacy Pi bridge state into its namespaced directory"
+            ),
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                warn!(
+                    source = %source.display(),
+                    destination = %destination.display(),
+                    %error,
+                    "could not copy legacy Pi bridge state; source was left untouched"
+                );
+            }
+        }
+    }
+}
+
+fn pi_threads_index_compatible(bytes: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return false;
+    };
+    let Some(threads) = value.get("threads").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    threads
+        .iter()
+        .all(|thread| thread.get("piSessionPath").is_some() && thread.get("piSessionId").is_some())
+}
+
 #[derive(Clone)]
 pub struct AgentManager {
     config: Arc<ArcSwap<HostConfig>>,
     bridges: HashMap<AgentKind, Arc<dyn Bridge>>,
+    local_studio_bridge: Option<Arc<PiBridge>>,
     /// Opencode is built lazily because constructing it spawns the opencode
     /// child + opens an SSE subscription; we don't want to pay that cost on
     /// daemon startup if no client ever asks for opencode.
     opencode_bridge: Arc<OnceCell<Arc<OpencodeBridge>>>,
+    opencode_state_dir: PathBuf,
     /// One daemon-owned `codex app-server` child for modes that keep a shared
     /// app-server alive (`UnixProxy` or legacy `Websocket`). Not populated when
     /// Alleycat is proxying to an externally-started Codex app-server.
@@ -150,12 +278,9 @@ impl AgentManager {
         // Honor `CODEX_HOME` from the same resolved launch environment used
         // for child processes, so bridge indexes/config and spawned agents all
         // agree even when launchd/systemd did not inherit the user's shell env.
-        let codex_home = env_path(&daemon_env, "CODEX_HOME");
-        if let Some(ref home) = codex_home {
-            tokio::fs::create_dir_all(home)
-                .await
-                .with_context(|| format!("creating {}", home.display()))?;
-        }
+        let (bridge_state, legacy_pi_home) = bridge_state_layout(&daemon_env)?;
+        bridge_state.ensure().await?;
+        preserve_legacy_pi_state(&legacy_pi_home, &bridge_state.pi).await;
 
         let base_launcher: Arc<dyn ProcessLauncher> = Arc::new(LocalLauncher);
         let user_launcher =
@@ -163,41 +288,92 @@ impl AgentManager {
                 .with_program_aliases(pi_program_aliases());
         let launcher: Arc<dyn ProcessLauncher> = Arc::new(user_launcher);
 
+        let pi_agent_dir = env_path(&daemon_env, "PI_CODING_AGENT_DIR");
+        let pi_launcher: Arc<dyn ProcessLauncher> = match pi_agent_dir.as_ref() {
+            Some(agent_dir) => {
+                info!(
+                    agent_dir = %agent_dir.display(),
+                    "pi bridge using configured agent directory"
+                );
+                Arc::new(EnvironmentOverlayLauncher::new(
+                    Arc::clone(&launcher),
+                    "PI_CODING_AGENT_DIR",
+                    agent_dir.as_os_str(),
+                ))
+            }
+            None => Arc::clone(&launcher),
+        };
+
         let mut pi_builder = PiBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.pi.bin))
-            .launcher(Arc::clone(&launcher));
-        if let Some(ref home) = codex_home {
-            pi_builder = pi_builder.codex_home(home.clone());
+            .launcher(pi_launcher)
+            .defer_initial_hydration(true)
+            .codex_home(bridge_state.pi.clone());
+        if let Some(agent_dir) = pi_agent_dir {
+            pi_builder = pi_builder.hydrator(PiHydrator::with_override(agent_dir.join("sessions")));
         }
         let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
 
-        let mut amp_builder = AmpBridge::builder()
+        // Local Studio owns a separate Pi home containing its controller
+        // catalog and sessions. Expose it as its own standard app-server
+        // runtime instead of redirecting the user's standalone `pi` runtime.
+        let local_studio_runtime = local_studio::bundled_pi_runtime().or_else(|| {
+            resolve_pi_bin(&snapshot.agents.pi.bin, &daemon_env).map(|program| {
+                local_studio::PiRuntimeCommand {
+                    program,
+                    prefix_args: Vec::new(),
+                    env: Vec::new(),
+                }
+            })
+        });
+        let local_studio_bridge = if let (Some(agent_dir), Some(runtime)) =
+            (local_studio::pi_agent_dir(), local_studio_runtime)
+        {
+            let studio_launcher: Arc<dyn ProcessLauncher> = Arc::new(LocalStudioLauncher::new(
+                Arc::clone(&launcher),
+                agent_dir.clone(),
+                runtime.clone(),
+            ));
+            let builder = PiBridge::builder()
+                .agent_bin(runtime.program)
+                .launcher(studio_launcher)
+                .defer_initial_hydration(true)
+                .hydrator(PiHydrator::with_override(agent_dir.join("sessions")))
+                .model_provider_prefix("local-studio")
+                .model_catalog_path(agent_dir.join("models.json"))
+                .codex_home(agent_dir.join("bridge-index"));
+            Some(
+                builder
+                    .build()
+                    .await
+                    .context("building Local Studio Pi bridge")?,
+            )
+        } else {
+            None
+        };
+
+        let amp_builder = AmpBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.amp.bin))
             .launcher(Arc::clone(&launcher))
+            .codex_home(bridge_state.amp.clone())
             .dangerously_allow_all(snapshot.agents.amp.dangerously_allow_all);
-        if let Some(ref home) = codex_home {
-            amp_builder = amp_builder.codex_home(home.clone());
-        }
         let amp_bridge = amp_builder.build().await.context("building amp bridge")?;
 
-        let mut claude_builder = ClaudeBridge::builder()
+        let claude_builder = ClaudeBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.claude.bin))
             .launcher(Arc::clone(&launcher))
+            .codex_home(bridge_state.claude.clone())
             .bypass_permissions(snapshot.agents.claude.bypass_permissions);
-        if let Some(ref home) = codex_home {
-            claude_builder = claude_builder.codex_home(home.clone());
-        }
         let claude_bridge = claude_builder
             .build()
             .await
             .context("building claude bridge")?;
 
-        let mut droid_builder = DroidBridge::builder()
+        let droid_builder = DroidBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.droid.bin))
-            .launcher(Arc::clone(&launcher));
-        if let Some(ref home) = codex_home {
-            droid_builder = droid_builder.codex_home(home.clone());
-        }
+            .launcher(Arc::clone(&launcher))
+            .codex_home(bridge_state.droid.clone())
+            .defer_initial_hydration(true);
         let droid_bridge = droid_builder
             .build()
             .await
@@ -205,7 +381,8 @@ impl AgentManager {
 
         let devin_builder = AcpBridge::builder()
             .agent_bin(PathBuf::from(&snapshot.agents.devin.bin))
-            .launcher(Arc::clone(&launcher));
+            .launcher(Arc::clone(&launcher))
+            .state_dir(bridge_state.devin.clone());
         let devin_acp = devin_builder
             .build()
             .await
@@ -255,9 +432,7 @@ impl AgentManager {
                 api_base: hermes_cfg.api_base.clone(),
                 bin: Some(hermes_cfg.bin.clone()),
             },
-            state_dir: codex_home
-                .as_ref()
-                .map(|p| p.join("hermes-bridge").to_string_lossy().to_string()),
+            state_dir: Some(bridge_state.hermes.to_string_lossy().to_string()),
         };
         bridges.insert(
             AgentKind::Hermes,
@@ -296,7 +471,9 @@ impl AgentManager {
         Ok(Self {
             config,
             bridges,
+            local_studio_bridge,
             opencode_bridge: Arc::new(OnceCell::new()),
+            opencode_state_dir: bridge_state.opencode,
             codex_child: Arc::new(Mutex::new(None)),
             codex_mode: codex_detection.mode,
             codex_bin: codex_detection.bin,
@@ -323,6 +500,9 @@ impl AgentManager {
             info!(agent = agent_kind_str(*kind), "shutting down bridge");
             bridge.shutdown().await;
         }
+        if let Some(bridge) = &self.local_studio_bridge {
+            bridge.shutdown().await;
+        }
         if let Some(opencode) = self.opencode_bridge.get() {
             opencode.shutdown().await;
         }
@@ -330,10 +510,21 @@ impl AgentManager {
     }
 
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
+        self.list_agents_for_node(None).await
+    }
+
+    pub async fn list_agents_for(&self, authenticated_node: &EndpointId) -> Vec<AgentInfo> {
+        self.list_agents_for_node(Some(authenticated_node)).await
+    }
+
+    async fn list_agents_for_node(
+        &self,
+        _authenticated_node: Option<&EndpointId>,
+    ) -> Vec<AgentInfo> {
         // Availability is computed per-agent (some are async, some not),
         // then each manifest is rendered to the wire `AgentInfo` shape.
         let launch_env = self.daemon_launch_env().await;
-        let mut out = Vec::with_capacity(MANIFESTS.len());
+        let mut out = Vec::with_capacity(MANIFESTS.len() + 1);
         for manifest in MANIFESTS {
             let available = match manifest.name {
                 "codex" => self.codex_available(),
@@ -365,6 +556,25 @@ impl AgentManager {
                 available,
                 presentation: Some(manifest.presentation()),
                 capabilities: Some(manifest.capabilities()),
+                local_studio: None,
+            });
+        }
+        if self.local_studio_bridge.is_some() {
+            let pi_manifest = manifest_for("pi").expect("Pi manifest must exist");
+            out.push(AgentInfo {
+                name: "local-studio".to_owned(),
+                display_name: "Local Studio".to_owned(),
+                wire: AgentWire::Jsonl,
+                available: true,
+                presentation: Some(AgentPresentation {
+                    title: Some("Local Studio".into()),
+                    is_beta: true,
+                    sort_order: 1,
+                    description: Some("Local Studio controller models and sessions".into()),
+                    aliases: Vec::new(),
+                }),
+                capabilities: Some(pi_manifest.capabilities()),
+                local_studio: None,
             });
         }
         out
@@ -386,6 +596,7 @@ impl AgentManager {
         stream: IrohStream,
         session: Arc<Session>,
         last_seen: Option<u64>,
+        authenticated_node: EndpointId,
     ) -> anyhow::Result<()> {
         match agent {
             // Codex doesn't participate in the JSON-RPC replay scheme —
@@ -396,6 +607,16 @@ impl AgentManager {
             "codex" => {
                 let _ = (session, last_seen);
                 self.serve_codex(stream).await
+            }
+            "local-studio" => {
+                let _ = authenticated_node;
+                let bridge = self
+                    .local_studio_bridge
+                    .clone()
+                    .ok_or_else(|| anyhow!("Local Studio runtime is unavailable"))?;
+                alleycat_bridge_core::serve_stream_with_session(bridge, stream, session, last_seen)
+                    .await
+                    .context("serving `local-studio` bridge stream")
             }
             other => {
                 let kind =
@@ -450,8 +671,13 @@ impl AgentManager {
             "devin" => Some("devin"),
             "grok" => Some("grok"),
             "shell" => Some("shell"),
+            "local-studio" => Some("local-studio"),
             _ => None,
         }
+    }
+
+    pub fn local_studio_gateway_available(&self) -> bool {
+        self.local_studio_bridge.is_some()
     }
 
     pub fn agent_enabled(&self, agent: &str) -> bool {
@@ -922,6 +1148,7 @@ impl AgentManager {
                 }
                 OpencodeBridge::builder()
                     .from_env()
+                    .state_dir(self.opencode_state_dir.clone())
                     .build()
                     .await
                     .context("initializing opencode bridge")
@@ -996,6 +1223,93 @@ impl AgentManager {
             )
         };
         enabled && (program_available(env, &bin) || hermes_api_available(&api_base).await)
+    }
+}
+
+/// Adds one explicit variable before delegating to the normal user-environment
+/// launcher. `ProcessSpec` overrides win inside that launcher, so this remains
+/// compatible with future Pi per-process configuration.
+#[derive(Clone)]
+struct EnvironmentOverlayLauncher {
+    inner: Arc<dyn ProcessLauncher>,
+    key: OsString,
+    value: OsString,
+}
+
+#[derive(Clone)]
+struct LocalStudioLauncher {
+    inner: Arc<dyn ProcessLauncher>,
+    agent_dir: OsString,
+    command: local_studio::PiRuntimeCommand,
+}
+
+impl LocalStudioLauncher {
+    fn new(
+        inner: Arc<dyn ProcessLauncher>,
+        agent_dir: PathBuf,
+        command: local_studio::PiRuntimeCommand,
+    ) -> Self {
+        Self {
+            inner,
+            agent_dir: agent_dir.into_os_string(),
+            command,
+        }
+    }
+}
+
+impl ProcessLauncher for LocalStudioLauncher {
+    fn launch(
+        &self,
+        mut spec: alleycat_bridge_core::ProcessSpec,
+    ) -> futures::future::BoxFuture<'_, std::io::Result<Box<dyn alleycat_bridge_core::ChildProcess>>>
+    {
+        let agent_dir = self.agent_dir.clone();
+        let command = self.command.clone();
+        Box::pin(async move {
+            if !spec.env.iter().any(|(key, _)| key == "PI_CODING_AGENT_DIR") {
+                spec.env
+                    .push((OsString::from("PI_CODING_AGENT_DIR"), agent_dir));
+            }
+            if spec.role == alleycat_bridge_core::ProcessRole::Agent {
+                let mut args = command.prefix_args;
+                args.extend(spec.args);
+                spec.program = command.program;
+                spec.args = args;
+                for (key, value) in command.env {
+                    if !spec.env.iter().any(|(candidate, _)| candidate == &key) {
+                        spec.env.push((key, value));
+                    }
+                }
+            }
+            self.inner.launch(spec).await
+        })
+    }
+}
+
+impl EnvironmentOverlayLauncher {
+    fn new(inner: Arc<dyn ProcessLauncher>, key: &str, value: &std::ffi::OsStr) -> Self {
+        Self {
+            inner,
+            key: OsString::from(key),
+            value: value.to_os_string(),
+        }
+    }
+}
+
+impl ProcessLauncher for EnvironmentOverlayLauncher {
+    fn launch(
+        &self,
+        mut spec: alleycat_bridge_core::ProcessSpec,
+    ) -> futures::future::BoxFuture<'_, std::io::Result<Box<dyn alleycat_bridge_core::ChildProcess>>>
+    {
+        let key = self.key.clone();
+        let value = self.value.clone();
+        Box::pin(async move {
+            if !spec.env.iter().any(|(candidate, _)| candidate == &key) {
+                spec.env.push((key, value));
+            }
+            self.inner.launch(spec).await
+        })
     }
 }
 
@@ -1222,6 +1536,10 @@ async fn codex_app_server_proxy_supported(bin: &Path, env: &LaunchEnvironment) -
 }
 
 async fn codex_app_server_daemon_supported(bin: &Path, env: &LaunchEnvironment) -> bool {
+    if !codex_managed_standalone_available(env) {
+        return false;
+    }
+
     let mut command = codex_command(bin);
     apply_launch_env_to_command(&mut command, env);
     command
@@ -1234,6 +1552,27 @@ async fn codex_app_server_daemon_supported(bin: &Path, env: &LaunchEnvironment) 
         tokio::time::timeout(Duration::from_secs(5), command.status()).await,
         Ok(Ok(status)) if status.success()
     )
+}
+
+fn codex_managed_standalone_available(env: &LaunchEnvironment) -> bool {
+    #[cfg(windows)]
+    let names: &[&str] = &["codex.exe", "codex.cmd", "codex.bat", "codex.com"];
+    #[cfg(not(windows))]
+    let names: &[&str] = &["codex"];
+
+    names
+        .iter()
+        .map(|name| codex_managed_standalone_path(env).join(name))
+        .any(|path| is_executable_file(&path))
+}
+
+fn codex_managed_standalone_path(env: &LaunchEnvironment) -> PathBuf {
+    env_path(env, "CODEX_HOME")
+        .or_else(|| env_path(env, "HOME").map(|home| home.join(".codex")))
+        .unwrap_or_else(|| PathBuf::from(".codex"))
+        .join("packages")
+        .join("standalone")
+        .join("current")
 }
 
 #[derive(Debug, Deserialize)]
@@ -1533,8 +1872,262 @@ fn has_amp_auth(api_key_env: &str, env: &LaunchEnvironment) -> bool {
 }
 
 #[cfg(test)]
+mod local_studio_launcher_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Captures the spec it is handed and fails the launch. The decorator's
+    /// contract is the spec rewrite, not the spawn.
+    struct CapturingLauncher {
+        captured: Mutex<Option<alleycat_bridge_core::ProcessSpec>>,
+    }
+
+    impl CapturingLauncher {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                captured: Mutex::new(None),
+            })
+        }
+
+        fn take(&self) -> alleycat_bridge_core::ProcessSpec {
+            self.captured
+                .lock()
+                .expect("capture mutex poisoned")
+                .take()
+                .expect("launcher was never invoked")
+        }
+    }
+
+    impl ProcessLauncher for CapturingLauncher {
+        fn launch(
+            &self,
+            spec: alleycat_bridge_core::ProcessSpec,
+        ) -> futures::future::BoxFuture<
+            '_,
+            std::io::Result<Box<dyn alleycat_bridge_core::ChildProcess>>,
+        > {
+            *self.captured.lock().expect("capture mutex poisoned") = Some(spec);
+            Box::pin(async {
+                Err(std::io::Error::other("capturing launcher does not spawn"))
+            })
+        }
+    }
+
+    fn electron_command() -> local_studio::PiRuntimeCommand {
+        local_studio::PiRuntimeCommand {
+            program: PathBuf::from("/Applications/Local Studio.app/Contents/MacOS/Local Studio"),
+            prefix_args: vec![OsString::from(
+                "/Applications/Local Studio.app/Contents/Resources/cli.js",
+            )],
+            env: vec![(
+                OsString::from("ELECTRON_RUN_AS_NODE"),
+                OsString::from("1"),
+            )],
+        }
+    }
+
+    fn env_value<'a>(
+        spec: &'a alleycat_bridge_core::ProcessSpec,
+        key: &str,
+    ) -> Option<&'a std::ffi::OsStr> {
+        spec.env
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.as_os_str())
+    }
+
+    async fn launch_capturing(
+        spec: alleycat_bridge_core::ProcessSpec,
+    ) -> alleycat_bridge_core::ProcessSpec {
+        let inner = CapturingLauncher::new();
+        let decorated = LocalStudioLauncher::new(
+            Arc::clone(&inner) as Arc<dyn ProcessLauncher>,
+            PathBuf::from("/Users/test/Library/Application Support/Local Studio/pi-agent"),
+            electron_command(),
+        );
+        let _ = decorated.launch(spec).await;
+        inner.take()
+    }
+
+    #[tokio::test]
+    async fn agent_launch_uses_the_bundled_local_studio_runtime() {
+        let mut spec = alleycat_bridge_core::ProcessSpec::new("/usr/bin/pi");
+        spec.role = alleycat_bridge_core::ProcessRole::Agent;
+        spec.args = vec![OsString::from("--mode"), OsString::from("rpc")];
+
+        let launched = launch_capturing(spec).await;
+
+        assert_eq!(
+            launched.program,
+            PathBuf::from("/Applications/Local Studio.app/Contents/MacOS/Local Studio")
+        );
+        assert_eq!(
+            launched
+                .args
+                .iter()
+                .filter_map(|arg| arg.to_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/Applications/Local Studio.app/Contents/Resources/cli.js",
+                "--mode",
+                "rpc"
+            ],
+            "the bundled CLI must precede the original args, not replace them"
+        );
+        assert_eq!(
+            env_value(&launched, "ELECTRON_RUN_AS_NODE"),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            env_value(&launched, "PI_CODING_AGENT_DIR"),
+            Some(std::ffi::OsStr::new(
+                "/Users/test/Library/Application Support/Local Studio/pi-agent"
+            )),
+            "Local Studio's Pi home is what keeps this runtime distinct from `pi`"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_commands_keep_their_program_but_still_see_the_agent_dir() {
+        let mut spec = alleycat_bridge_core::ProcessSpec::new("/bin/sh");
+        spec.role = alleycat_bridge_core::ProcessRole::ToolCommand;
+        spec.args = vec![OsString::from("-c"), OsString::from("pwd")];
+
+        let launched = launch_capturing(spec).await;
+
+        assert_eq!(launched.program, PathBuf::from("/bin/sh"));
+        assert_eq!(
+            launched
+                .args
+                .iter()
+                .filter_map(|arg| arg.to_str())
+                .collect::<Vec<_>>(),
+            vec!["-c", "pwd"],
+            "tool commands must not gain the agent CLI prefix"
+        );
+        assert_eq!(
+            env_value(&launched, "PI_CODING_AGENT_DIR"),
+            Some(std::ffi::OsStr::new(
+                "/Users/test/Library/Application Support/Local Studio/pi-agent"
+            ))
+        );
+        assert!(
+            env_value(&launched, "ELECTRON_RUN_AS_NODE").is_none(),
+            "ELECTRON_RUN_AS_NODE is an agent-only concern"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_agent_dir_is_never_overridden() {
+        let mut spec = alleycat_bridge_core::ProcessSpec::new("/usr/bin/pi");
+        spec.role = alleycat_bridge_core::ProcessRole::Agent;
+        spec.env.push((
+            OsString::from("PI_CODING_AGENT_DIR"),
+            OsString::from("/explicit/override"),
+        ));
+
+        let launched = launch_capturing(spec).await;
+
+        assert_eq!(
+            env_value(&launched, "PI_CODING_AGENT_DIR"),
+            Some(std::ffi::OsStr::new("/explicit/override"))
+        );
+        assert_eq!(
+            launched
+                .env
+                .iter()
+                .filter(|(key, _)| key == "PI_CODING_AGENT_DIR")
+                .count(),
+            1,
+            "the decorator must not append a duplicate agent-dir entry"
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_bridge_state_layout_is_stable_and_namespaced() {
+        let mut home = crate::test_support::TempHome::new();
+        home.override_env(&[("CODEX_HOME", "")]);
+        let env = LaunchEnvironment::current();
+
+        let (layout, legacy_pi_home) = bridge_state_layout(&env).unwrap();
+        assert_eq!(
+            layout.base,
+            crate::paths::state_dir().unwrap().join("bridges")
+        );
+        assert_eq!(
+            legacy_pi_home,
+            alleycat_pi_bridge::handlers::lifecycle::default_codex_home()
+        );
+
+        let roots = [
+            &layout.pi,
+            &layout.amp,
+            &layout.claude,
+            &layout.droid,
+            &layout.hermes,
+            &layout.devin,
+            &layout.opencode,
+        ];
+        assert_eq!(
+            roots
+                .iter()
+                .map(|path| path.as_path())
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            roots.len()
+        );
+        assert!(roots.iter().all(|path| path.parent() == Some(&layout.base)));
+    }
+
+    #[tokio::test]
+    async fn legacy_pi_state_is_copied_without_deleting_the_source() {
+        let legacy = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source = legacy.path().join("threads.json");
+        let pi_index = serde_json::json!({
+            "threads": [{
+                "threadId": "pi-thread",
+                "piSessionPath": "/sessions/pi.jsonl",
+                "piSessionId": "pi-session"
+            }]
+        });
+        tokio::fs::write(&source, serde_json::to_vec(&pi_index).unwrap())
+            .await
+            .unwrap();
+
+        preserve_legacy_pi_state(legacy.path(), destination.path()).await;
+
+        assert!(source.is_file(), "migration must never remove legacy state");
+        assert_eq!(
+            tokio::fs::read(destination.path().join("threads.json"))
+                .await
+                .unwrap(),
+            tokio::fs::read(&source).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_pi_legacy_index_is_left_in_place() {
+        let legacy = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let source = legacy.path().join("threads.json");
+        tokio::fs::write(
+            &source,
+            br#"{"threads":[{"threadId":"amp","ampThreadId":"amp-session"}]}"#,
+        )
+        .await
+        .unwrap();
+
+        preserve_legacy_pi_state(legacy.path(), destination.path()).await;
+
+        assert!(source.is_file());
+        assert!(!destination.path().join("threads.json").exists());
+    }
 
     #[test]
     fn factory_auth_accepts_v2_store() {
@@ -1581,6 +2174,42 @@ mod tests {
 
         assert!(program_available(&env, "agent"));
         assert_eq!(resolve_pi_bin("pi", &env), None);
+    }
+
+    #[test]
+    fn codex_daemon_requires_managed_standalone_install() {
+        let mut home = crate::test_support::TempHome::new();
+        home.override_env(&[("CODEX_HOME", "")]);
+        let env = LaunchEnvironment::current();
+
+        assert!(!codex_managed_standalone_available(&env));
+    }
+
+    #[test]
+    fn codex_daemon_accepts_codex_home_standalone_install() {
+        let mut home = crate::test_support::TempHome::new();
+        let codex_home = home.path().join("custom-codex-home");
+        let standalone_dir = codex_home.join("packages/standalone/current");
+        std::fs::create_dir_all(&standalone_dir).unwrap();
+        #[cfg(windows)]
+        let codex = standalone_dir.join("codex.exe");
+        #[cfg(not(windows))]
+        let codex = standalone_dir.join("codex");
+        std::fs::write(&codex, b"#!/bin/sh\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&codex, perms).unwrap();
+        }
+
+        home.override_env(&[("CODEX_HOME", codex_home.to_str().unwrap())]);
+        let env = LaunchEnvironment::current();
+
+        assert_eq!(codex_managed_standalone_path(&env), standalone_dir);
+        assert!(codex_managed_standalone_available(&env));
     }
 
     #[test]

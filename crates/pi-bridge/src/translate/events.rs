@@ -17,12 +17,12 @@
 //! [`crate::codex_proto::notifications::ServerNotification`] values that
 //! `handlers/turn.rs` writes to the codex client.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::codex_proto::common::{TurnError, TurnStatus};
+use crate::codex_proto::common::{ThreadTokenUsage, TokenUsageBreakdown, TurnError};
 use crate::codex_proto::items::{
     CommandExecutionStatus, DynamicToolCallStatus, FileUpdateChange, McpToolCallError,
     McpToolCallResult, McpToolCallStatus, PatchApplyStatus, PatchChangeKind, ThreadItem,
@@ -31,13 +31,16 @@ use crate::codex_proto::notifications::{
     AgentMessageDeltaNotification, CommandExecutionOutputDeltaNotification,
     ContextCompactedNotification, ErrorNotification, ItemCompletedNotification,
     ItemStartedNotification, McpToolCallProgressNotification, ReasoningTextDeltaNotification,
-    ServerNotification,
+    ServerNotification, ThreadTokenUsageUpdatedNotification,
 };
 use crate::pool::pi_protocol::{
     AgentMessage, AssistantContentBlock, AssistantMessage, AssistantMessageEvent, PiEvent,
-    StopReason as PiStopReason,
+    StopReason as PiStopReason, ToolResultMessage, UserMessage,
 };
-use crate::translate::items::{assistant_item_id, reasoning_item_id};
+use crate::translate::items::{
+    assistant_item_id, reasoning_item_id, tool_call_to_item, user_cycle_item_id,
+    user_message_to_item,
+};
 use crate::translate::tool_call::{CodexToolKind, classify};
 
 /// Per-(thread, turn) state the translator carries between events.
@@ -50,10 +53,18 @@ pub struct EventTranslatorState {
     thread_id: String,
     turn_id: String,
     turn_index: usize,
+    assistant_index: usize,
+    user_index: usize,
+    saw_user_event: bool,
+    completed_user_items: HashSet<String>,
+    completed_assistant_cycles: HashSet<(usize, usize)>,
+    completed_tool_calls: HashSet<String>,
+    lagged: bool,
     open_message_item: Option<OpenItem>,
     open_reasoning_item: Option<OpenItem>,
     open_tool_calls: HashMap<String, OpenToolCall>,
     open_compaction_item_id: Option<String>,
+    cumulative_token_usage: TokenUsageBreakdown,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +72,7 @@ struct OpenItem {
     item_id: String,
     started: bool,
     saw_delta: bool,
+    accumulated: String,
 }
 
 #[derive(Debug, Clone)]
@@ -90,10 +102,18 @@ impl EventTranslatorState {
             thread_id: thread_id.into(),
             turn_id: turn_id.into(),
             turn_index,
+            assistant_index: 0,
+            user_index: 0,
+            saw_user_event: false,
+            completed_user_items: HashSet::from([user_cycle_item_id(turn_index, 0)]),
+            completed_assistant_cycles: HashSet::new(),
+            completed_tool_calls: HashSet::new(),
+            lagged: false,
             open_message_item: None,
             open_reasoning_item: None,
             open_tool_calls: HashMap::new(),
             open_compaction_item_id: None,
+            cumulative_token_usage: TokenUsageBreakdown::default(),
         }
     }
 
@@ -101,21 +121,38 @@ impl EventTranslatorState {
         &self.thread_id
     }
 
+    /// Complete any items still open when the Pi event stream closes.
+    pub fn finish(&mut self) -> Vec<ServerNotification> {
+        self.translate_agent_end(&[])
+    }
+
     pub fn turn_id(&self) -> &str {
         &self.turn_id
     }
 
+    /// Stop applying ordinal live events after the broadcast receiver reports
+    /// loss. The authoritative `AgentEnd` history can then reconcile the
+    /// already-emitted prefix without assigning later cycles shifted IDs.
+    pub fn mark_lagged(&mut self) {
+        self.lagged = true;
+    }
+
     /// Translate a single pi event into zero or more codex notifications.
     pub fn translate(&mut self, event: PiEvent) -> Vec<ServerNotification> {
+        if self.lagged && !matches!(event, PiEvent::AgentEnd { .. }) {
+            return Vec::new();
+        }
         match event {
             PiEvent::AgentStart => Vec::new(),
             PiEvent::TurnStart => Vec::new(),
-            PiEvent::AgentEnd { .. } => self.translate_agent_end(),
-            PiEvent::TurnEnd { .. } => Vec::new(),
+            PiEvent::AgentEnd { messages } => self.translate_agent_end(&messages),
+            PiEvent::AgentSettled => Vec::new(),
+            PiEvent::TurnEnd { message, .. } => self.translate_turn_end(message),
             PiEvent::ThinkingLevelChanged { .. } => Vec::new(),
 
             PiEvent::MessageStart { message } => match message {
                 AgentMessage::Assistant(a) => self.translate_message_start(a),
+                AgentMessage::User(user) => self.translate_user_start(user),
                 _ => Vec::new(),
             },
             PiEvent::MessageUpdate {
@@ -146,6 +183,7 @@ impl EventTranslatorState {
             } => self.translate_tool_end(tool_call_id, tool_name, result, is_error),
 
             PiEvent::QueueUpdate { .. } => Vec::new(),
+            PiEvent::EntryAppended { .. } => Vec::new(),
 
             PiEvent::CompactionStart { reason: _ } => self.translate_compaction_start(),
             PiEvent::CompactionEnd {
@@ -194,25 +232,26 @@ impl EventTranslatorState {
 
     // ---- message lifecycle -------------------------------------------------
 
-    fn translate_message_start(&mut self, message: AssistantMessage) -> Vec<ServerNotification> {
-        let item_id = assistant_item_id(self.turn_index, message.timestamp);
-        let text = extract_assistant_text(&message);
-        let started = !text.is_empty();
-        self.open_message_item = Some(OpenItem {
-            item_id: item_id.clone(),
-            started,
-            saw_delta: false,
-        });
-        if started {
-            vec![self.item_started(ThreadItem::AgentMessage {
-                id: item_id,
-                text,
-                phase: Some(serde_json::Value::String("final_answer".into())),
-                memory_citation: None,
-            })]
-        } else {
-            Vec::new()
+    fn translate_user_start(&mut self, message: UserMessage) -> Vec<ServerNotification> {
+        if !self.saw_user_event {
+            self.saw_user_event = true;
+            return Vec::new();
         }
+        self.user_index += 1;
+        let item = user_message_to_item(&message, self.turn_index, self.user_index);
+        self.completed_user_items.insert(item.id().to_string());
+        vec![self.item_completed(item)]
+    }
+
+    fn translate_message_start(&mut self, _message: AssistantMessage) -> Vec<ServerNotification> {
+        let item_id = assistant_item_id(self.turn_index, self.assistant_index);
+        self.open_message_item = Some(OpenItem {
+            item_id,
+            started: false,
+            saw_delta: false,
+            accumulated: String::new(),
+        });
+        Vec::new()
     }
 
     fn translate_message_update(
@@ -221,18 +260,19 @@ impl EventTranslatorState {
     ) -> Vec<ServerNotification> {
         match event {
             AssistantMessageEvent::TextStart { .. } => Vec::new(),
-            AssistantMessageEvent::TextDelta { delta, partial, .. } => {
+            AssistantMessageEvent::TextDelta { delta, .. } => {
                 if self.open_message_item.is_none() {
-                    let item_id = assistant_item_id(self.turn_index, partial.timestamp);
+                    let item_id = assistant_item_id(self.turn_index, self.assistant_index);
                     self.open_message_item = Some(OpenItem {
                         item_id,
                         started: false,
                         saw_delta: false,
+                        accumulated: String::new(),
                     });
                 }
 
                 let mut started_item = None;
-                let item_id = {
+                let (item_id, delta) = {
                     let item = self
                         .open_message_item
                         .as_mut()
@@ -247,7 +287,8 @@ impl EventTranslatorState {
                         });
                     }
                     item.saw_delta = true;
-                    item.item_id.clone()
+                    let delta = append_live_fragment(item, delta);
+                    (item.item_id.clone(), delta)
                 };
 
                 let mut out = Vec::new();
@@ -265,26 +306,29 @@ impl EventTranslatorState {
                 ));
                 out
             }
-            AssistantMessageEvent::TextEnd {
-                content, partial, ..
-            } => {
+            AssistantMessageEvent::TextEnd { content, .. } => {
                 if self.open_message_item.is_none() && !content.is_empty() {
-                    let item_id = assistant_item_id(self.turn_index, partial.timestamp);
+                    let item_id = assistant_item_id(self.turn_index, self.assistant_index);
                     self.open_message_item = Some(OpenItem {
                         item_id,
                         started: false,
                         saw_delta: false,
+                        accumulated: String::new(),
                     });
                 }
                 self.ensure_agent_message_delta(content)
             }
 
-            AssistantMessageEvent::ThinkingStart { partial, .. } => {
-                let item_id = reasoning_item_id(self.turn_index, partial.timestamp);
+            AssistantMessageEvent::ThinkingStart { .. } => {
+                if self.open_reasoning_item.is_some() {
+                    return Vec::new();
+                }
+                let item_id = reasoning_item_id(self.turn_index, self.assistant_index);
                 self.open_reasoning_item = Some(OpenItem {
                     item_id: item_id.clone(),
                     started: true,
                     saw_delta: false,
+                    accumulated: String::new(),
                 });
                 vec![self.item_started(ThreadItem::Reasoning {
                     id: item_id,
@@ -297,6 +341,7 @@ impl EventTranslatorState {
                     return Vec::new();
                 };
                 item.saw_delta = true;
+                let delta = append_live_fragment(item, delta);
                 vec![ServerNotification::ReasoningTextDelta(
                     ReasoningTextDeltaNotification {
                         thread_id: self.thread_id.clone(),
@@ -309,15 +354,7 @@ impl EventTranslatorState {
                 )]
             }
             AssistantMessageEvent::ThinkingEnd { content, .. } => {
-                if let Some(item) = self.open_reasoning_item.take() {
-                    vec![self.item_completed(ThreadItem::Reasoning {
-                        id: item.item_id,
-                        summary: Vec::new(),
-                        content: vec![content],
-                    })]
-                } else {
-                    Vec::new()
-                }
+                self.ensure_reasoning_delta(content)
             }
 
             AssistantMessageEvent::ToolcallStart { .. }
@@ -338,41 +375,7 @@ impl EventTranslatorState {
     }
 
     fn translate_message_end(&mut self, message: AssistantMessage) -> Vec<ServerNotification> {
-        let Some(item) = self.open_message_item.take() else {
-            return Vec::new();
-        };
-        let text = extract_assistant_text(&message);
-        if !item.started && text.is_empty() {
-            return Vec::new();
-        }
-
-        let mut out = Vec::new();
-        if !item.started {
-            out.push(self.item_started(ThreadItem::AgentMessage {
-                id: item.item_id.clone(),
-                text: String::new(),
-                phase: Some(serde_json::Value::String("final_answer".into())),
-                memory_citation: None,
-            }));
-        }
-        if !item.saw_delta && !text.is_empty() {
-            out.push(ServerNotification::AgentMessageDelta(
-                AgentMessageDeltaNotification {
-                    thread_id: self.thread_id.clone(),
-                    turn_id: self.turn_id.clone(),
-                    item_id: item.item_id.clone(),
-                    delta: text.clone(),
-                    parent_item_id: None,
-                },
-            ));
-        }
-        out.push(self.item_completed(ThreadItem::AgentMessage {
-            id: item.item_id,
-            text,
-            phase: Some(serde_json::Value::String("final_answer".into())),
-            memory_citation: None,
-        }));
-        out
+        self.complete_assistant_cycle(Some(&message))
     }
 
     // ---- tool execution ----------------------------------------------------
@@ -462,6 +465,7 @@ impl EventTranslatorState {
             return Vec::new();
         };
         let item = self.tool_completed_item(&open, result, is_error);
+        self.completed_tool_calls.insert(tool_call_id);
         vec![self.item_completed(item)]
     }
 
@@ -645,25 +649,226 @@ impl EventTranslatorState {
         out
     }
 
-    fn translate_agent_end(&mut self) -> Vec<ServerNotification> {
+    fn translate_agent_end(&mut self, messages: &[AgentMessage]) -> Vec<ServerNotification> {
         let mut out = Vec::new();
-        if let Some(item) = self.open_message_item.take()
-            && item.started
-        {
-            out.push(self.item_completed(ThreadItem::AgentMessage {
-                id: item.item_id,
-                text: String::new(),
-                phase: None,
-                memory_citation: None,
-            }));
+        let tool_results = messages
+            .iter()
+            .filter_map(|message| {
+                if let AgentMessage::ToolResult(result) = message {
+                    Some((result.tool_call_id.as_str(), result))
+                } else {
+                    None
+                }
+            })
+            .collect::<HashMap<_, _>>();
+        let mut assistant_index = 0;
+        let mut user_index = 0;
+
+        for message in messages {
+            match message {
+                AgentMessage::User(message) => {
+                    let id = user_cycle_item_id(self.turn_index, user_index);
+                    if !self.completed_user_items.contains(&id) {
+                        out.push(self.item_completed(user_message_to_item(
+                            message,
+                            self.turn_index,
+                            user_index,
+                        )));
+                        self.completed_user_items.insert(id);
+                    }
+                    user_index += 1;
+                }
+                AgentMessage::Assistant(message) => {
+                    let cycle = (self.turn_index, assistant_index);
+                    if !self.completed_assistant_cycles.contains(&cycle) {
+                        self.assistant_index = assistant_index;
+                        out.extend(self.complete_assistant_cycle(Some(message)));
+                    }
+                    for block in &message.content {
+                        if let AssistantContentBlock::ToolCall(call) = block {
+                            out.extend(self.reconcile_authoritative_tool(
+                                call,
+                                tool_results.get(call.id.as_str()).copied(),
+                            ));
+                        }
+                    }
+                    assistant_index += 1;
+                }
+                AgentMessage::ToolResult(_) | AgentMessage::Other(_) => {}
+            }
+
         }
-        if let Some(item) = self.open_reasoning_item.take() {
-            out.push(self.item_completed(ThreadItem::Reasoning {
-                id: item.item_id,
+        if (self.open_message_item.is_some() || self.open_reasoning_item.is_some())
+            && !self
+                .completed_assistant_cycles
+                .contains(&(self.turn_index, self.assistant_index))
+        {
+            out.extend(self.complete_assistant_cycle(None));
+        }
+
+        let abandoned_tools = self
+            .open_tool_calls
+            .drain()
+            .map(|(_, open)| open)
+            .collect::<Vec<_>>();
+        for open in abandoned_tools {
+            let item = self.tool_completed_item(
+                &open,
+                json!({"content": [{
+                    "type": "text",
+                    "text": "tool execution ended before a result was received"
+                }]}),
+                true,
+            );
+            self.completed_tool_calls.insert(open.item_id.clone());
+            out.push(self.item_completed(item));
+        }
+        out
+    }
+
+    fn translate_turn_end(&mut self, message: AgentMessage) -> Vec<ServerNotification> {
+        let AgentMessage::Assistant(a) = &message else {
+            return Vec::new();
+        };
+        if a.usage.total_tokens == 0 && a.usage.input == 0 && a.usage.output == 0 {
+            return Vec::new();
+        }
+        let breakdown = TokenUsageBreakdown {
+            total_tokens: a.usage.total_tokens as i64,
+            input_tokens: a.usage.input as i64,
+            cached_input_tokens: a.usage.cache_read as i64,
+            output_tokens: a.usage.output as i64,
+            reasoning_output_tokens: 0,
+        };
+        self.cumulative_token_usage = sum_breakdown(&self.cumulative_token_usage, &breakdown);
+        vec![ServerNotification::ThreadTokenUsageUpdated(
+            ThreadTokenUsageUpdatedNotification {
+                thread_id: self.thread_id.clone(),
+                turn_id: self.turn_id.clone(),
+                token_usage: ThreadTokenUsage {
+                    total: self.cumulative_token_usage.clone(),
+                    last: breakdown,
+                    model_context_window: None,
+                },
+            },
+        )]
+    }
+
+    fn reconcile_authoritative_tool(
+        &mut self,
+        call: &crate::pool::pi_protocol::ToolCall,
+        result: Option<&ToolResultMessage>,
+    ) -> Vec<ServerNotification> {
+        if self.completed_tool_calls.contains(&call.id) {
+            return Vec::new();
+        }
+        let kind = classify(&call.name);
+        let mut out = Vec::new();
+        let open = self.open_tool_calls.remove(&call.id).unwrap_or_else(|| {
+            out.push(self.item_started(self.tool_started_item(
+                &kind,
+                &call.name,
+                &call.id,
+                &call.arguments,
+            )));
+            OpenToolCall {
+                item_id: call.id.clone(),
+                kind: kind.clone(),
+                tool_name: call.name.clone(),
+                args: call.arguments.clone(),
+            }
+        });
+        let item = if let Some(result) = result {
+            tool_call_to_item(&kind, call.id.clone(), call, Some(result))
+        } else {
+            self.tool_completed_item(
+                &open,
+                json!({"content": [{
+                    "type": "text",
+                    "text": "tool execution ended before a result was received"
+                }]}),
+                true,
+            )
+        };
+        self.completed_tool_calls.insert(call.id.clone());
+        out.push(self.item_completed(item));
+        out
+    }
+
+    fn complete_assistant_cycle(
+        &mut self,
+        message: Option<&AssistantMessage>,
+    ) -> Vec<ServerNotification> {
+        let text = message.map(extract_assistant_text).unwrap_or_default();
+        let reasoning = message.map(extract_assistant_reasoning).unwrap_or_default();
+        let mut out = Vec::new();
+
+        if self.open_reasoning_item.is_none() && !reasoning.is_empty() {
+            let id = reasoning_item_id(self.turn_index, self.assistant_index);
+            self.open_reasoning_item = Some(OpenItem {
+                item_id: id.clone(),
+                started: true,
+                saw_delta: false,
+                accumulated: String::new(),
+            });
+            out.push(self.item_started(ThreadItem::Reasoning {
+                id,
                 summary: Vec::new(),
                 content: Vec::new(),
             }));
         }
+        if let Some(item) = self.open_reasoning_item.take() {
+            let content = if reasoning.is_empty() {
+                item.accumulated
+            } else {
+                reasoning
+            };
+            out.push(
+                self.item_completed(ThreadItem::Reasoning {
+                    id: item.item_id,
+                    summary: Vec::new(),
+                    content: (!content.is_empty())
+                        .then_some(content)
+                        .into_iter()
+                        .collect(),
+                }),
+            );
+        }
+
+        if self.open_message_item.is_none() && !text.is_empty() {
+            self.open_message_item = Some(OpenItem {
+                item_id: assistant_item_id(self.turn_index, self.assistant_index),
+                started: false,
+                saw_delta: false,
+                accumulated: String::new(),
+            });
+        }
+        if let Some(item) = self.open_message_item.take() {
+            let text = if text.is_empty() {
+                item.accumulated
+            } else {
+                text
+            };
+            if !item.started && !text.is_empty() {
+                out.push(self.item_started(ThreadItem::AgentMessage {
+                    id: item.item_id.clone(),
+                    text: String::new(),
+                    phase: Some(serde_json::Value::String("final_answer".into())),
+                    memory_citation: None,
+                }));
+            }
+            if item.started || !text.is_empty() {
+                out.push(self.item_completed(ThreadItem::AgentMessage {
+                    id: item.item_id,
+                    text,
+                    phase: Some(serde_json::Value::String("final_answer".into())),
+                    memory_citation: None,
+                }));
+            }
+        }
+        self.completed_assistant_cycles
+            .insert((self.turn_index, self.assistant_index));
+        self.assistant_index += 1;
         out
     }
 
@@ -690,6 +895,7 @@ impl EventTranslatorState {
         }
         item.saw_delta = true;
         let item_id = item.item_id.clone();
+        let text = append_live_fragment(item, text);
 
         let mut out = Vec::new();
         if let Some(item) = started_item {
@@ -705,6 +911,31 @@ impl EventTranslatorState {
             },
         ));
         out
+    }
+
+    fn ensure_reasoning_delta(&mut self, text: String) -> Vec<ServerNotification> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        let Some(item) = self.open_reasoning_item.as_mut() else {
+            return Vec::new();
+        };
+        if item.saw_delta {
+            return Vec::new();
+        }
+        item.saw_delta = true;
+        let item_id = item.item_id.clone();
+        let delta = append_live_fragment(item, text);
+        vec![ServerNotification::ReasoningTextDelta(
+            ReasoningTextDeltaNotification {
+                thread_id: self.thread_id.clone(),
+                turn_id: self.turn_id.clone(),
+                item_id,
+                delta,
+                content_index: 0,
+                parent_item_id: None,
+            },
+        )]
     }
 
     // ---- helpers -----------------------------------------------------------
@@ -745,12 +976,28 @@ fn new_item_id() -> String {
     Uuid::now_v7().to_string()
 }
 
+fn append_live_fragment(item: &mut OpenItem, fragment: String) -> String {
+    item.accumulated.push_str(&fragment);
+    fragment
+}
+
 fn extract_assistant_text(message: &AssistantMessage) -> String {
     message
         .content
         .iter()
         .filter_map(|b| match b {
             AssistantContentBlock::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<String>()
+}
+
+fn extract_assistant_reasoning(message: &AssistantMessage) -> String {
+    message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            AssistantContentBlock::Thinking(content) => Some(content.thinking.as_str()),
             _ => None,
         })
         .collect::<String>()
@@ -786,13 +1033,7 @@ fn stringify_progress_message(value: &Value) -> String {
 }
 
 fn extract_bash_output(result: &Value) -> Option<String> {
-    if let Some(s) = result.as_str() {
-        return Some(s.to_string());
-    }
-    if let Some(s) = result.get("output").and_then(|v| v.as_str()) {
-        return Some(s.to_string());
-    }
-    None
+    extract_tool_text_output(result)
 }
 
 /// Cap aggregated_output at 256 KiB on a UTF-8 boundary. Multi-megabyte
@@ -1078,29 +1319,13 @@ fn mcp_result_split(
     (Some(Box::new(payload)), None)
 }
 
-/// Helper for `handlers/turn.rs`: derive a `TurnStatus`/`TurnError` pair from
-/// the optional error string carried out of the final pi event of a turn.
-pub fn turn_status_from_agent_end(error_message: Option<&str>) -> (TurnStatus, Option<TurnError>) {
-    if let Some(message) = error_message {
-        (
-            TurnStatus::Failed,
-            Some(TurnError {
-                message: message.to_string(),
-                codex_error_info: None,
-                additional_details: None,
-            }),
-        )
-    } else {
-        (TurnStatus::Completed, None)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pool::pi_protocol::{
-        AssistantContentBlock, AssistantRole, CompactionReason, StopReason, TextContent, Usage,
-        UsageCost,
+        AssistantContentBlock, AssistantRole, CompactionReason, StopReason, TextContent,
+        ThinkingContent, ToolCall, ToolResultContentBlock, ToolResultRole, Usage, UsageCost,
+        UserMessageContent, UserRole,
     };
 
     fn state() -> EventTranslatorState {
@@ -1149,6 +1374,135 @@ mod tests {
         }
     }
 
+    fn assistant_msg_with_usage(input: u64, output: u64, cache_read: u64) -> AgentMessage {
+        AgentMessage::Assistant(AssistantMessage {
+            usage: Usage {
+                input,
+                output,
+                cache_read,
+                cache_write: 0,
+                total_tokens: input + output + cache_read,
+                cost: UsageCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    total: 0.0,
+                },
+            },
+            ..assistant_message("")
+        })
+    }
+
+    #[test]
+    fn turn_end_with_usage_emits_thread_token_usage_updated() {
+        let mut s = state();
+        let out = s.translate(PiEvent::TurnEnd {
+            message: assistant_msg_with_usage(300, 200, 100),
+            tool_results: Vec::new(),
+        });
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ServerNotification::ThreadTokenUsageUpdated(n) => {
+                assert_eq!(n.thread_id, "th_1");
+                assert_eq!(n.turn_id, "tu_1");
+                assert_eq!(n.token_usage.last.total_tokens, 600);
+                assert_eq!(n.token_usage.total.total_tokens, 600);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_end_zero_usage_is_silent() {
+        let mut s = state();
+        let out = s.translate(PiEvent::TurnEnd {
+            message: assistant_msg_with_usage(0, 0, 0),
+            tool_results: Vec::new(),
+        });
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn turn_end_usage_accumulates_across_turns() {
+        let mut s = state();
+        s.translate(PiEvent::TurnEnd {
+            message: assistant_msg_with_usage(300, 200, 100),
+            tool_results: Vec::new(),
+        });
+        let out = s.translate(PiEvent::TurnEnd {
+            message: assistant_msg_with_usage(100, 100, 0),
+            tool_results: Vec::new(),
+        });
+        match &out[0] {
+            ServerNotification::ThreadTokenUsageUpdated(n) => {
+                assert_eq!(n.token_usage.last.total_tokens, 200);
+                assert_eq!(n.token_usage.total.total_tokens, 800);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    fn assistant_message_with_reasoning(
+        reasoning: &str,
+        text: &str,
+        timestamp: i64,
+    ) -> AssistantMessage {
+        let mut message = assistant_message(text);
+        message.content.insert(
+            0,
+            AssistantContentBlock::Thinking(ThinkingContent {
+                thinking: reasoning.into(),
+                thinking_signature: None,
+                redacted: None,
+            }),
+        );
+        message.timestamp = timestamp;
+        message
+    }
+
+    fn assistant_message_with_tool(
+        reasoning: &str,
+        text: &str,
+        tool_id: &str,
+        command: &str,
+        timestamp: i64,
+    ) -> AgentMessage {
+        let mut message = assistant_message_with_reasoning(reasoning, text, timestamp);
+        message
+            .content
+            .push(AssistantContentBlock::ToolCall(ToolCall {
+                id: tool_id.into(),
+                name: "bash".into(),
+                arguments: json!({"command": command}),
+                thought_signature: None,
+            }));
+        AgentMessage::Assistant(message)
+    }
+
+    fn tool_result_message(tool_id: &str, text: &str, timestamp: i64) -> AgentMessage {
+        AgentMessage::ToolResult(ToolResultMessage {
+            role: ToolResultRole::ToolResult,
+            tool_call_id: tool_id.into(),
+            tool_name: "bash".into(),
+            content: vec![ToolResultContentBlock::Text(TextContent {
+                text: text.into(),
+                text_signature: None,
+            })],
+            details: None,
+            is_error: false,
+            timestamp,
+        })
+    }
+
+    fn user_message(text: &str, timestamp: i64) -> AgentMessage {
+        AgentMessage::User(UserMessage {
+            role: UserRole::User,
+            content: UserMessageContent::Text(text.into()),
+            timestamp,
+        })
+    }
+
     #[test]
     fn agent_start_and_turn_start_are_silent() {
         let mut s = state();
@@ -1167,22 +1521,12 @@ mod tests {
     }
 
     #[test]
-    fn message_start_emits_non_empty_item_started_agent_message() {
+    fn message_start_waits_for_native_stream_even_when_snapshot_has_text() {
         let mut s = state();
         let out = s.translate(PiEvent::MessageStart {
             message: agent_msg("hi"),
         });
-        assert_eq!(out.len(), 1);
-        match &out[0] {
-            ServerNotification::ItemStarted(n) => match &n.item {
-                ThreadItem::AgentMessage { id, text, .. } => {
-                    assert_eq!(id, "assistant_7_0");
-                    assert_eq!(text, "hi");
-                }
-                other => panic!("expected AgentMessage, got {other:?}"),
-            },
-            other => panic!("expected ItemStarted, got {other:?}"),
-        }
+        assert!(out.is_empty());
         assert!(s.open_message_item.is_some());
     }
 
@@ -1229,9 +1573,12 @@ mod tests {
         );
         message.timestamp = 42;
 
-        let started = live.translate(PiEvent::MessageStart {
-            message: AgentMessage::Assistant(message.clone()),
-        });
+        assert!(
+            live.translate(PiEvent::MessageStart {
+                message: AgentMessage::Assistant(message.clone()),
+            })
+            .is_empty()
+        );
         let thinking = live.translate(PiEvent::MessageUpdate {
             message: AgentMessage::Assistant(message.clone()),
             assistant_message_event: Box::new(AssistantMessageEvent::ThinkingStart {
@@ -1241,30 +1588,30 @@ mod tests {
         });
 
         let replay = crate::translate::items::translate_messages(&[
-            AgentMessage::User(crate::pool::pi_protocol::UserMessage {
-                role: crate::pool::pi_protocol::UserRole::User,
-                content: crate::pool::pi_protocol::UserMessageContent::Text("q".into()),
-                timestamp: 1,
-            }),
-            AgentMessage::User(crate::pool::pi_protocol::UserMessage {
-                role: crate::pool::pi_protocol::UserRole::User,
-                content: crate::pool::pi_protocol::UserMessageContent::Text("q".into()),
-                timestamp: 2,
-            }),
-            AgentMessage::User(crate::pool::pi_protocol::UserMessage {
-                role: crate::pool::pi_protocol::UserRole::User,
-                content: crate::pool::pi_protocol::UserMessageContent::Text("q".into()),
-                timestamp: 3,
-            }),
-            AgentMessage::User(crate::pool::pi_protocol::UserMessage {
-                role: crate::pool::pi_protocol::UserRole::User,
-                content: crate::pool::pi_protocol::UserMessageContent::Text("q".into()),
-                timestamp: 4,
-            }),
-            AgentMessage::Assistant(message),
+            user_message("q1", 1),
+            AgentMessage::Assistant(assistant_message_with_reasoning("", "a1", 2)),
+            user_message("q2", 3),
+            AgentMessage::Assistant(assistant_message_with_reasoning("", "a2", 4)),
+            user_message("q3", 5),
+            AgentMessage::Assistant(assistant_message_with_reasoning("", "a3", 6)),
+            user_message("q4", 7),
+            AgentMessage::Assistant(message.clone()),
         ]);
-        assert_eq!(item_id_from_started(&started[0]), replay[3].items[1].id());
-        assert_eq!(item_id_from_started(&thinking[0]), replay[3].items[2].id());
+        assert_eq!(item_id_from_started(&thinking[0]), replay[3].items[1].id());
+        let completed = live.translate(PiEvent::MessageEnd {
+            message: AgentMessage::Assistant(message),
+        });
+        let started = completed
+            .iter()
+            .find_map(|notification| match notification {
+                ServerNotification::ItemStarted(notification)
+                    if matches!(notification.item, ThreadItem::AgentMessage { .. }) =>
+                {
+                    Some(notification.item.id())
+                }
+                _ => None,
+            });
+        assert_eq!(started, Some(replay[3].items[2].id()));
     }
 
     #[test]
@@ -1280,7 +1627,7 @@ mod tests {
         assert_eq!(started.len(), 1);
         match &started[0] {
             ServerNotification::ItemStarted(n) => match &n.item {
-                ThreadItem::Reasoning { id, .. } => assert_eq!(id, "reasoning_7_0"),
+                ThreadItem::Reasoning { id, .. } => assert_eq!(id, "reasoning_7"),
                 other => panic!("expected Reasoning, got {other:?}"),
             },
             other => panic!("unexpected {other:?}"),
@@ -1307,15 +1654,218 @@ mod tests {
                 partial: assistant_message(""),
             }),
         });
-        match &ended[0] {
+        assert!(ended.is_empty());
+
+        let completed = s.translate(PiEvent::AgentEnd {
+            messages: Vec::new(),
+        });
+        match &completed[0] {
             ServerNotification::ItemCompleted(n) => match &n.item {
                 ThreadItem::Reasoning { content, .. } => {
-                    assert_eq!(content, &vec!["thinking done".to_string()]);
+                    assert_eq!(content, &vec!["thinking…".to_string()]);
                 }
                 other => panic!("expected Reasoning, got {other:?}"),
             },
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn tool_cycles_stream_into_distinct_reasoning_and_message_items() {
+        let mut s = EventTranslatorState::with_turn_index("th_1", "tu_1", 0);
+        let mut notifications = Vec::new();
+        let final_messages = vec![
+            assistant_message_with_tool("first thought", "first update", "tool-0", "echo 0", 10),
+            tool_result_message("tool-0", "0", 11),
+            assistant_message_with_tool("second thought", "final answer", "tool-1", "echo 1", 20),
+            tool_result_message("tool-1", "1", 21),
+        ];
+
+        for (index, (thinking, text)) in [
+            ("first thought", "first update"),
+            ("second thought", "final answer"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            notifications.extend(s.translate(PiEvent::MessageStart {
+                message: agent_msg(""),
+            }));
+            notifications.extend(s.translate(PiEvent::MessageUpdate {
+                message: agent_msg(""),
+                assistant_message_event: Box::new(AssistantMessageEvent::ThinkingStart {
+                    content_index: 0,
+                    partial: assistant_message(""),
+                }),
+            }));
+            notifications.extend(s.translate(PiEvent::MessageUpdate {
+                message: agent_msg(""),
+                assistant_message_event: Box::new(AssistantMessageEvent::ThinkingDelta {
+                    content_index: 0,
+                    delta: thinking.into(),
+                    partial: assistant_message(""),
+                }),
+            }));
+            notifications.extend(s.translate(PiEvent::MessageUpdate {
+                message: agent_msg(""),
+                assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: text.into(),
+                    partial: assistant_message(""),
+                }),
+            }));
+            notifications.extend(s.translate(PiEvent::MessageEnd {
+                message: agent_msg(text),
+            }));
+            let tool_call_id = format!("tool-{index}");
+            notifications.extend(s.translate(PiEvent::ToolExecutionStart {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: "bash".into(),
+                args: json!({"command": format!("echo {index}")}),
+            }));
+            notifications.extend(s.translate(PiEvent::ToolExecutionEnd {
+                tool_call_id,
+                tool_name: "bash".into(),
+                result: json!({"content": [{"type": "text", "text": index.to_string()}]}),
+                is_error: false,
+            }));
+        }
+        notifications.extend(s.translate(PiEvent::AgentEnd {
+            messages: final_messages.clone(),
+        }));
+
+        let started_ids = notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemStarted(n)
+                    if matches!(
+                        n.item,
+                        ThreadItem::Reasoning { .. } | ThreadItem::AgentMessage { .. }
+                    ) =>
+                {
+                    Some(n.item.id())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started_ids,
+            [
+                "reasoning_0",
+                "assistant_0",
+                "reasoning_0_1",
+                "assistant_0_1"
+            ]
+        );
+        let causal_ids = notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemStarted(notification) => Some(notification.item.id()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            causal_ids,
+            [
+                "reasoning_0",
+                "assistant_0",
+                "tool-0",
+                "reasoning_0_1",
+                "assistant_0_1",
+                "tool-1",
+            ]
+        );
+
+        let completed = notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemCompleted(n) => Some(n.item.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let replay = crate::translate::items::translate_messages(&final_messages);
+        assert_eq!(completed, replay[0].items);
+    }
+
+    #[test]
+    fn agent_end_recovers_items_when_stream_events_were_lagged() {
+        let mut state = state();
+        let messages = vec![
+            AgentMessage::Assistant(assistant_message_with_reasoning(
+                "first thought",
+                "first update",
+                10,
+            )),
+            AgentMessage::Assistant(assistant_message_with_reasoning(
+                "second thought",
+                "final answer",
+                20,
+            )),
+        ];
+
+        let notifications = state.translate(PiEvent::AgentEnd { messages });
+        let started_ids = notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemStarted(notification) => Some(notification.item.id()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            started_ids,
+            [
+                "reasoning_7",
+                "assistant_7",
+                "reasoning_7_1",
+                "assistant_7_1"
+            ]
+        );
+
+        let completed = notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemCompleted(notification) => Some(&notification.item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed.len(), 4);
+        assert!(matches!(
+            completed[0],
+            ThreadItem::Reasoning { content, .. } if content == &["first thought"]
+        ));
+        assert!(matches!(
+            completed[3],
+            ThreadItem::AgentMessage { text, .. } if text == "final answer"
+        ));
+    }
+
+    #[test]
+    fn agent_end_completes_message_started_without_a_delta() {
+        let mut state = state();
+        assert!(
+            state
+                .translate(PiEvent::MessageStart {
+                    message: agent_msg("")
+                })
+                .is_empty()
+        );
+
+        let notifications = state.translate(PiEvent::AgentEnd {
+            messages: vec![agent_msg("recovered answer")],
+        });
+        assert!(matches!(
+            &notifications[0],
+            ServerNotification::ItemStarted(notification)
+                if notification.item.id() == "assistant_7"
+        ));
+        assert!(matches!(
+            &notifications[1],
+            ServerNotification::ItemCompleted(notification)
+                if matches!(
+                    &notification.item,
+                    ThreadItem::AgentMessage { text, .. } if text == "recovered answer"
+                )
+        ));
     }
 
     #[test]
@@ -1380,6 +1930,33 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(s.open_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn bash_tool_completion_extracts_live_pi_content_array() {
+        let mut s = state();
+        s.translate(PiEvent::ToolExecutionStart {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            args: json!({"command": "printf marker"}),
+        });
+
+        let ended = s.translate(PiEvent::ToolExecutionEnd {
+            tool_call_id: "tc1".into(),
+            tool_name: "bash".into(),
+            result: json!({"content": [{"type": "text", "text": "marker"}]}),
+            is_error: false,
+        });
+
+        match &ended[0] {
+            ServerNotification::ItemCompleted(n) => match &n.item {
+                ThreadItem::CommandExecution {
+                    aggregated_output, ..
+                } => assert_eq!(aggregated_output.as_deref(), Some("marker")),
+                other => panic!("expected CommandExecution, got {other:?}"),
+            },
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]
@@ -1820,7 +2397,32 @@ mod tests {
     }
 
     #[test]
-    fn agent_end_closes_dangling_message() {
+    fn agent_end_fails_a_tool_that_never_returned() {
+        let mut state = state();
+        state.translate(PiEvent::ToolExecutionStart {
+            tool_call_id: "stalled".into(),
+            tool_name: "bash".into(),
+            args: json!({"command": "sleep 10"}),
+        });
+        let notifications = state.translate(PiEvent::AgentEnd {
+            messages: Vec::new(),
+        });
+        assert!(matches!(
+            &notifications[0],
+            ServerNotification::ItemCompleted(notification)
+                if matches!(
+                    &notification.item,
+                    ThreadItem::CommandExecution {
+                        id,
+                        status: CommandExecutionStatus::Failed,
+                        ..
+                    } if id == "stalled"
+                )
+        ));
+    }
+
+    #[test]
+    fn agent_end_does_not_duplicate_unstreamed_message_start_snapshot() {
         let mut s = state();
         s.translate(PiEvent::MessageStart {
             message: agent_msg(""),
@@ -1836,13 +2438,304 @@ mod tests {
         let out = s.translate(PiEvent::AgentEnd {
             messages: Vec::new(),
         });
-        assert_eq!(out.len(), 1);
-        match &out[0] {
-            ServerNotification::ItemCompleted(n) => {
-                assert!(matches!(n.item, ThreadItem::AgentMessage { .. }))
-            }
-            other => panic!("unexpected {other:?}"),
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn agent_end_recovers_two_fully_lagged_tool_cycles_in_order() {
+        let mut state = state();
+        let messages = vec![
+            assistant_message_with_tool("think one", "update one", "tool-1", "printf FIRST", 1),
+            tool_result_message("tool-1", "FIRST", 2),
+            assistant_message_with_tool("think two", "done", "tool-2", "printf SECOND", 3),
+            tool_result_message("tool-2", "SECOND", 4),
+        ];
+        let notifications = state.translate(PiEvent::AgentEnd {
+            messages: messages.clone(),
+        });
+        let completed = notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemCompleted(notification) => Some(&notification.item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completed.iter().map(|item| item.id()).collect::<Vec<_>>(),
+            [
+                "reasoning_7",
+                "assistant_7",
+                "tool-1",
+                "reasoning_7_1",
+                "assistant_7_1",
+                "tool-2",
+            ]
+        );
+        assert!(matches!(
+            completed[2],
+            ThreadItem::CommandExecution {
+                status: CommandExecutionStatus::Completed,
+                aggregated_output: Some(output),
+                ..
+            } if output == "FIRST"
+        ));
+    }
+
+    #[test]
+    fn agent_end_uses_authoritative_result_for_an_open_tool() {
+        let mut state = state();
+        let assistant = assistant_message_with_tool("think", "update", "tool-1", "printf FIRST", 1);
+        let AgentMessage::Assistant(assistant_message) = assistant.clone() else {
+            unreachable!()
+        };
+        state.translate(PiEvent::MessageStart {
+            message: AgentMessage::Assistant(assistant_message.clone()),
+        });
+        state.translate(PiEvent::MessageEnd {
+            message: AgentMessage::Assistant(assistant_message),
+        });
+        state.translate(PiEvent::ToolExecutionStart {
+            tool_call_id: "tool-1".into(),
+            tool_name: "bash".into(),
+            args: json!({"command": "printf FIRST"}),
+        });
+        let notifications = state.translate(PiEvent::AgentEnd {
+            messages: vec![assistant, tool_result_message("tool-1", "FIRST", 2)],
+        });
+        let tool_completions = notifications
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemCompleted(notification)
+                    if notification.item.id() == "tool-1" =>
+                {
+                    Some(&notification.item)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tool_completions.len(), 1);
+        assert!(matches!(
+            tool_completions[0],
+            ThreadItem::CommandExecution {
+                status: CommandExecutionStatus::Completed,
+                aggregated_output: Some(output),
+                ..
+            } if output == "FIRST"
+        ));
+    }
+
+    #[test]
+    fn lag_freezes_later_live_cycles_until_authoritative_reconcile() {
+        let mut state = state();
+        let mut first = assistant_message("first");
+        first.timestamp = 100;
+        let mut second = assistant_message("second");
+        second.timestamp = 200;
+
+        state.translate(PiEvent::MessageStart {
+            message: AgentMessage::Assistant(first.clone()),
+        });
+        let first_live = state.translate(PiEvent::MessageEnd {
+            message: AgentMessage::Assistant(first.clone()),
+        });
+        assert!(first_live.iter().any(|notification| matches!(
+            notification,
+            ServerNotification::ItemCompleted(notification)
+                if notification.item.id() == "assistant_7"
+        )));
+
+        state.mark_lagged();
+        assert!(
+            state
+                .translate(PiEvent::MessageStart {
+                    message: AgentMessage::Assistant(second.clone()),
+                })
+                .is_empty()
+        );
+        assert!(
+            state
+                .translate(PiEvent::MessageEnd {
+                    message: AgentMessage::Assistant(second.clone()),
+                })
+                .is_empty()
+        );
+
+        let reconciled = state.translate(PiEvent::AgentEnd {
+            messages: vec![
+                user_message("initial", 50),
+                AgentMessage::Assistant(first),
+                AgentMessage::Assistant(second),
+            ],
+        });
+        let completed_ids = reconciled
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemCompleted(notification) => Some(notification.item.id()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed_ids, ["assistant_7_1"]);
+    }
+
+    #[test]
+    fn lag_before_user_events_reconciles_every_queued_steer_once() {
+        let mut state = state();
+        let mut assistant = assistant_message("combined");
+        assistant.timestamp = 400;
+        let history = vec![
+            user_message("initial", 100),
+            user_message("steer one", 200),
+            user_message("steer two", 300),
+            AgentMessage::Assistant(assistant),
+        ];
+
+        state.mark_lagged();
+        for message in &history {
+            assert!(
+                state
+                    .translate(PiEvent::MessageStart {
+                        message: message.clone(),
+                    })
+                    .is_empty()
+            );
         }
+        let reconciled = state.translate(PiEvent::AgentEnd { messages: history });
+        let user_ids = reconciled
+            .iter()
+            .filter_map(|notification| match notification {
+                ServerNotification::ItemCompleted(notification)
+                    if matches!(notification.item, ThreadItem::UserMessage { .. }) =>
+                {
+                    Some(notification.item.id())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(user_ids, ["user_7_1", "user_7_2"]);
+    }
+
+    #[test]
+    fn queued_steer_user_message_starts_the_same_boundary_as_replay() {
+        let mut state = state();
+        let mut first_message = assistant_message("first");
+        first_message.timestamp = 300;
+        let mut second_message = assistant_message("second");
+        second_message.timestamp = 400;
+        let history = vec![
+            user_message("initial", 100),
+            AgentMessage::Assistant(first_message.clone()),
+            user_message("steer", 200),
+            AgentMessage::Assistant(second_message.clone()),
+        ];
+        assert!(
+            state
+                .translate(PiEvent::MessageStart {
+                    message: history[0].clone(),
+                })
+                .is_empty()
+        );
+        state.translate(PiEvent::MessageStart {
+            message: agent_msg(""),
+        });
+        let first = state.translate(PiEvent::MessageEnd {
+            message: AgentMessage::Assistant(first_message),
+        });
+        let steered = state.translate(PiEvent::MessageStart {
+            message: history[2].clone(),
+        });
+        state.translate(PiEvent::MessageStart {
+            message: agent_msg(""),
+        });
+        let second = state.translate(PiEvent::MessageEnd {
+            message: AgentMessage::Assistant(second_message),
+        });
+        assert!(first.iter().any(|notification| matches!(
+            notification,
+            ServerNotification::ItemCompleted(notification)
+                if notification.item.id() == "assistant_7"
+        )));
+        assert!(matches!(
+            &steered[0],
+            ServerNotification::ItemCompleted(notification)
+                if notification.item.id() == "user_7_1"
+        ));
+        assert!(second.iter().any(|notification| matches!(
+            notification,
+            ServerNotification::ItemCompleted(notification)
+                if notification.item.id() == "assistant_7_1"
+        )));
+        assert!(
+            state
+                .translate(PiEvent::AgentEnd {
+                    messages: history.clone(),
+                })
+                .is_empty()
+        );
+        let replay = crate::translate::items::translate_messages(&history);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(
+            replay[0]
+                .items
+                .iter()
+                .map(ThreadItem::id)
+                .collect::<Vec<_>>(),
+            ["user_0", "assistant_0", "user_0_1", "assistant_0_1"]
+        );
+    }
+
+    #[test]
+    fn queued_steer_before_first_assistant_matches_replay() {
+        let mut state = state();
+        let mut assistant = assistant_message("combined response");
+        assistant.timestamp = 300;
+        let history = vec![
+            user_message("initial", 100),
+            user_message("steer immediately", 200),
+            AgentMessage::Assistant(assistant.clone()),
+        ];
+        assert!(
+            state
+                .translate(PiEvent::MessageStart {
+                    message: history[0].clone(),
+                })
+                .is_empty()
+        );
+        let steered = state.translate(PiEvent::MessageStart {
+            message: history[1].clone(),
+        });
+        assert!(matches!(
+            &steered[0],
+            ServerNotification::ItemCompleted(notification)
+                if notification.item.id() == "user_7_1"
+        ));
+        state.translate(PiEvent::MessageStart {
+            message: agent_msg(""),
+        });
+        let completed = state.translate(PiEvent::MessageEnd {
+            message: AgentMessage::Assistant(assistant),
+        });
+        assert!(completed.iter().any(|notification| matches!(
+            notification,
+            ServerNotification::ItemCompleted(notification)
+                if notification.item.id() == "assistant_7"
+        )));
+        assert!(
+            state
+                .translate(PiEvent::AgentEnd {
+                    messages: history.clone(),
+                })
+                .is_empty()
+        );
+        let replay = crate::translate::items::translate_messages(&history);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(
+            replay[0]
+                .items
+                .iter()
+                .map(ThreadItem::id)
+                .collect::<Vec<_>>(),
+            ["user_0", "user_0_1", "assistant_0"]
+        );
     }
 
     #[test]
@@ -1860,5 +2753,15 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+}
+
+fn sum_breakdown(a: &TokenUsageBreakdown, b: &TokenUsageBreakdown) -> TokenUsageBreakdown {
+    TokenUsageBreakdown {
+        total_tokens: a.total_tokens + b.total_tokens,
+        input_tokens: a.input_tokens + b.input_tokens,
+        cached_input_tokens: a.cached_input_tokens + b.cached_input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        reasoning_output_tokens: a.reasoning_output_tokens + b.reasoning_output_tokens,
     }
 }
