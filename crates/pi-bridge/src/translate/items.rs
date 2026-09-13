@@ -13,57 +13,194 @@
 //! | `AssistantMessage` tool calls       | one `CommandExecution` / `FileChange` / `McpToolCall` / `DynamicToolCall` per call |
 //! | `ToolResultMessage`                 | folded into the matching tool-call item by `toolCallId` |
 //!
-//! Turn boundaries: pi sessions don't track turn boundaries explicitly. Each
-//! user message starts a new turn; everything until (but not including) the
-//! next user message lives in that turn.
+//! Turn boundaries: pi sessions don't track outer agent runs explicitly.
+//! Ordinary user messages start a new turn. A queued steer keeps its original
+//! timestamp, which precedes the assistant/tool cycle after which Pi appends
+//! it; those user messages remain inside the running turn so replay matches
+//! the live `turn/steer` lifecycle.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 
-use crate::codex_proto::common::TurnStatus;
 use crate::codex_proto::items::{
     CommandExecutionStatus, DynamicToolCallStatus, McpToolCallError, McpToolCallResult,
     McpToolCallStatus, PatchApplyStatus, ThreadItem, UserInput,
 };
 use crate::codex_proto::thread::Turn;
 use crate::pool::pi_protocol::{
-    AgentMessage, AssistantContentBlock, AssistantMessage, ToolResultContentBlock,
+    AgentMessage, AssistantContentBlock, AssistantMessage, StopReason, ToolResultContentBlock,
     ToolResultMessage, UserContentBlock, UserMessage, UserMessageContent,
 };
 use crate::translate::tool_call::{CodexToolKind, classify};
+use crate::translate::turn_terminal_state;
+
+#[derive(Debug, Clone)]
+pub(crate) enum SessionHistoryEntry {
+    Message(AgentMessage),
+    Compaction {
+        id: String,
+        timestamp_ms: Option<i64>,
+    },
+}
 
 /// Translate a flat pi message stream into the per-turn codex shape.
 pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
+    translate_messages_from(messages, 0)
+}
+
+/// Translate Pi's persisted JSONL history, preserving compaction markers that
+/// `get_messages` intentionally omits.
+pub(crate) fn translate_session_history(entries: &[SessionHistoryEntry]) -> Vec<Turn> {
+    let mut turns = Vec::new();
+    let mut messages = Vec::new();
+
+    for entry in entries {
+        match entry {
+            SessionHistoryEntry::Message(message) => messages.push(message.clone()),
+            SessionHistoryEntry::Compaction { id, timestamp_ms } => {
+                turns.extend(translate_messages_from(&messages, turns.len()));
+                messages.clear();
+
+                let turn_index = turns.len();
+                turns.push(Turn {
+                    id: format!("turn_{turn_index}"),
+                    items: vec![ThreadItem::ContextCompaction { id: id.clone() }],
+                    items_view: crate::codex_proto::default_items_view(),
+                    status: crate::codex_proto::TurnStatus::Completed,
+                    error: None,
+                    started_at: *timestamp_ms,
+                    completed_at: *timestamp_ms,
+                    duration_ms: Some(0),
+                });
+            }
+        }
+    }
+    turns.extend(translate_messages_from(&messages, turns.len()));
+    turns
+}
+
+/// Reinsert persisted compaction markers into a turn list translated from
+/// Pi's live `get_messages` response.
+///
+/// After compaction, `get_messages` intentionally exposes only the compacted
+/// active context, so its message count no longer matches the append-only
+/// JSONL journal. The journal remains authoritative for the marker itself,
+/// while the RPC response remains authoritative for the visible messages.
+pub(crate) fn merge_compaction_markers(
+    mut turns: Vec<Turn>,
+    entries: &[SessionHistoryEntry],
+) -> Vec<Turn> {
+    for entry in entries {
+        let SessionHistoryEntry::Compaction { id, timestamp_ms } = entry else {
+            continue;
+        };
+        if turns.iter().any(|turn| {
+            turn.items
+                .iter()
+                .any(|item| matches!(item, ThreadItem::ContextCompaction { id: item_id } if item_id == id))
+        }) {
+            continue;
+        }
+
+        let insertion_index = timestamp_ms
+            .and_then(|marker_timestamp| {
+                turns.iter().position(|turn| {
+                    turn.started_at
+                        .is_some_and(|started_at| started_at > marker_timestamp)
+                })
+            })
+            .unwrap_or(turns.len());
+        turns.insert(
+            insertion_index,
+            Turn {
+                id: String::new(),
+                items: vec![ThreadItem::ContextCompaction { id: id.clone() }],
+                items_view: crate::codex_proto::default_items_view(),
+                status: crate::codex_proto::TurnStatus::Completed,
+                error: None,
+                started_at: *timestamp_ms,
+                completed_at: *timestamp_ms,
+                duration_ms: Some(0),
+            },
+        );
+    }
+
+    for (index, turn) in turns.iter_mut().enumerate() {
+        turn.id = format!("turn_{index}");
+    }
+    turns
+}
+
+fn translate_messages_from(messages: &[AgentMessage], turn_offset: usize) -> Vec<Turn> {
     let tool_results = index_tool_results(messages);
 
     let mut turns: Vec<Turn> = Vec::new();
     let mut current_items: Vec<ThreadItem> = Vec::new();
     let mut current_started_at: Option<i64> = None;
     let mut current_completed_at: Option<i64> = None;
+    let mut current_stop_reason: Option<StopReason> = None;
+    let mut current_error_message: Option<String> = None;
+    let mut assistant_index = 0;
+    let mut user_index = 0;
+    let mut saw_assistant_or_tool = false;
 
     for message in messages {
         match message {
             AgentMessage::User(user) => {
-                flush_turn(
-                    &mut turns,
-                    &mut current_items,
-                    &mut current_started_at,
-                    &mut current_completed_at,
-                );
-                current_started_at = Some(user.timestamp);
-                current_completed_at = Some(user.timestamp);
-                current_items.push(user_message_to_item(user, turns.len()));
+                let is_steer = !current_items.is_empty()
+                    && (!saw_assistant_or_tool
+                        || current_completed_at
+                            .is_some_and(|timestamp| user.timestamp <= timestamp));
+                if is_steer {
+                    user_index += 1;
+                } else {
+                    flush_turn(
+                        &mut turns,
+                        turn_offset,
+                        &mut current_items,
+                        &mut current_started_at,
+                        &mut current_completed_at,
+                        &mut current_stop_reason,
+                        &mut current_error_message,
+                    );
+                    current_started_at = Some(user.timestamp);
+                    current_completed_at = Some(user.timestamp);
+                    assistant_index = 0;
+                    user_index = 0;
+                    saw_assistant_or_tool = false;
+                }
+                current_items.push(user_message_to_item(
+                    user,
+                    turn_offset + turns.len(),
+                    user_index,
+                ));
             }
             AgentMessage::Assistant(asst) => {
+                saw_assistant_or_tool = true;
                 if current_started_at.is_none() {
                     current_started_at = Some(asst.timestamp);
                 }
                 current_completed_at = Some(asst.timestamp);
-                let turn_index = turns.len();
-                push_assistant_items(asst, turn_index, &mut current_items, &tool_results);
+                current_stop_reason = Some(asst.stop_reason);
+                current_error_message = asst.error_message.clone();
+                let turn_index = turn_offset + turns.len();
+                push_assistant_items(
+                    asst,
+                    turn_index,
+                    assistant_index,
+                    &mut current_items,
+                    &tool_results,
+                );
+                assistant_index += 1;
             }
-            AgentMessage::ToolResult(_) => {
+            AgentMessage::ToolResult(result) => {
+                saw_assistant_or_tool = true;
+                current_completed_at = Some(
+                    current_completed_at
+                        .map(|timestamp| timestamp.max(result.timestamp))
+                        .unwrap_or(result.timestamp),
+                );
                 // Folded into the matching tool-call item via `tool_results`.
             }
             AgentMessage::Other(_) => {
@@ -74,18 +211,24 @@ pub fn translate_messages(messages: &[AgentMessage]) -> Vec<Turn> {
 
     flush_turn(
         &mut turns,
+        turn_offset,
         &mut current_items,
         &mut current_started_at,
         &mut current_completed_at,
+        &mut current_stop_reason,
+        &mut current_error_message,
     );
     turns
 }
 
 fn flush_turn(
     turns: &mut Vec<Turn>,
+    turn_offset: usize,
     items: &mut Vec<ThreadItem>,
     started_at: &mut Option<i64>,
     completed_at: &mut Option<i64>,
+    stop_reason: &mut Option<StopReason>,
+    error_message: &mut Option<String>,
 ) {
     if items.is_empty() {
         return;
@@ -96,12 +239,14 @@ fn flush_turn(
         (Some(s), Some(c)) if c >= s => Some(c - s),
         _ => None,
     };
+    let message = error_message.take();
+    let (status, error) = turn_terminal_state(stop_reason.take(), message.as_deref());
     turns.push(Turn {
-        id: format!("turn_{}", turns.len()),
+        id: format!("turn_{}", turn_offset + turns.len()),
         items: std::mem::take(items),
         items_view: crate::codex_proto::default_items_view(),
-        status: TurnStatus::Completed,
-        error: None,
+        status,
+        error,
         started_at: s,
         completed_at: c,
         duration_ms,
@@ -119,18 +264,34 @@ fn index_tool_results(messages: &[AgentMessage]) -> HashMap<&str, &ToolResultMes
 }
 
 pub(crate) fn user_item_id(turn_index: usize) -> String {
-    format!("user_{turn_index}")
+    user_cycle_item_id(turn_index, 0)
 }
 
-pub(crate) fn assistant_item_id(turn_index: usize, timestamp: i64) -> String {
-    format!("assistant_{turn_index}_{timestamp}")
+pub(crate) fn user_cycle_item_id(turn_index: usize, user_index: usize) -> String {
+    cycle_item_id("user", turn_index, user_index)
 }
 
-pub(crate) fn reasoning_item_id(turn_index: usize, timestamp: i64) -> String {
-    format!("reasoning_{turn_index}_{timestamp}")
+pub(crate) fn assistant_item_id(turn_index: usize, assistant_index: usize) -> String {
+    cycle_item_id("assistant", turn_index, assistant_index)
 }
 
-fn user_message_to_item(message: &UserMessage, turn_index: usize) -> ThreadItem {
+pub(crate) fn reasoning_item_id(turn_index: usize, assistant_index: usize) -> String {
+    cycle_item_id("reasoning", turn_index, assistant_index)
+}
+
+fn cycle_item_id(kind: &str, turn_index: usize, assistant_index: usize) -> String {
+    if assistant_index == 0 {
+        format!("{kind}_{turn_index}")
+    } else {
+        format!("{kind}_{turn_index}_{assistant_index}")
+    }
+}
+
+pub(crate) fn user_message_to_item(
+    message: &UserMessage,
+    turn_index: usize,
+    user_index: usize,
+) -> ThreadItem {
     let content = match &message.content {
         UserMessageContent::Text(s) => vec![UserInput::Text {
             text: s.clone(),
@@ -150,7 +311,7 @@ fn user_message_to_item(message: &UserMessage, turn_index: usize) -> ThreadItem 
             .collect(),
     };
     ThreadItem::UserMessage {
-        id: user_item_id(turn_index),
+        id: user_cycle_item_id(turn_index, user_index),
         content,
     }
 }
@@ -158,33 +319,34 @@ fn user_message_to_item(message: &UserMessage, turn_index: usize) -> ThreadItem 
 fn push_assistant_items(
     message: &AssistantMessage,
     turn_index: usize,
+    assistant_index: usize,
     out: &mut Vec<ThreadItem>,
     tool_results: &HashMap<&str, &ToolResultMessage>,
 ) {
     let mut text = String::new();
-    let mut thinking: Vec<String> = Vec::new();
+    let mut thinking = String::new();
     let mut tool_calls = Vec::new();
     for block in &message.content {
         match block {
             AssistantContentBlock::Text(t) => text.push_str(&t.text),
-            AssistantContentBlock::Thinking(t) => thinking.push(t.thinking.clone()),
+            AssistantContentBlock::Thinking(t) => thinking.push_str(&t.thinking),
             AssistantContentBlock::ToolCall(tc) => tool_calls.push(tc),
         }
     }
 
+    if !thinking.is_empty() {
+        out.push(ThreadItem::Reasoning {
+            id: reasoning_item_id(turn_index, assistant_index),
+            summary: Vec::new(),
+            content: vec![thinking],
+        });
+    }
     if !text.is_empty() {
         out.push(ThreadItem::AgentMessage {
-            id: assistant_item_id(turn_index, message.timestamp),
+            id: assistant_item_id(turn_index, assistant_index),
             text,
             phase: Some(serde_json::Value::String("final_answer".into())),
             memory_citation: None,
-        });
-    }
-    if !thinking.is_empty() {
-        out.push(ThreadItem::Reasoning {
-            id: reasoning_item_id(turn_index, message.timestamp),
-            summary: Vec::new(),
-            content: thinking,
         });
     }
     for tc in tool_calls {
@@ -194,7 +356,7 @@ fn push_assistant_items(
     }
 }
 
-fn tool_call_to_item(
+pub(crate) fn tool_call_to_item(
     kind: &CodexToolKind,
     id: String,
     call: &crate::pool::pi_protocol::ToolCall,
@@ -441,6 +603,7 @@ fn merge_tool_result_text(result: &ToolResultMessage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex_proto::TurnStatus;
     use crate::pool::pi_protocol::{
         AssistantRole, ImageContent, StopReason, TextContent, ThinkingContent, ToolCall,
         ToolResultRole, Usage, UsageCost, UserRole,
@@ -456,6 +619,15 @@ mod tests {
     }
 
     fn assistant_with_blocks(blocks: Vec<AssistantContentBlock>, ts: i64) -> AgentMessage {
+        assistant_with_outcome(blocks, ts, StopReason::Stop, None)
+    }
+
+    fn assistant_with_outcome(
+        blocks: Vec<AssistantContentBlock>,
+        ts: i64,
+        stop_reason: StopReason,
+        error_message: Option<&str>,
+    ) -> AgentMessage {
         AgentMessage::Assistant(AssistantMessage {
             role: AssistantRole::Assistant,
             content: blocks,
@@ -477,8 +649,8 @@ mod tests {
                     total: 0.0,
                 },
             },
-            stop_reason: StopReason::Stop,
-            error_message: None,
+            stop_reason,
+            error_message: error_message.map(str::to_string),
             timestamp: ts,
         })
     }
@@ -507,6 +679,82 @@ mod tests {
     #[test]
     fn empty_input_yields_no_turns() {
         assert!(translate_messages(&[]).is_empty());
+    }
+
+    #[test]
+    fn persisted_compaction_stays_between_surrounding_turns() {
+        let before = user(UserMessageContent::Text("before".into()), 100);
+        let after = user(UserMessageContent::Text("after".into()), 300);
+        let turns = translate_session_history(&[
+            SessionHistoryEntry::Message(before),
+            SessionHistoryEntry::Compaction {
+                id: "compact-1".into(),
+                timestamp_ms: Some(200),
+            },
+            SessionHistoryEntry::Message(after),
+        ]);
+
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].id, "turn_0");
+        assert_eq!(turns[0].items[0].id(), "user_0");
+        assert_eq!(turns[1].id, "turn_1");
+        assert!(matches!(
+            &turns[1].items[0],
+            ThreadItem::ContextCompaction { id } if id == "compact-1"
+        ));
+        assert_eq!(turns[1].started_at, Some(200));
+        assert_eq!(turns[2].id, "turn_2");
+        assert_eq!(turns[2].items[0].id(), "user_2");
+    }
+
+    #[test]
+    fn compacted_rpc_history_merges_persisted_marker_by_timestamp() {
+        let before = user(UserMessageContent::Text("before".into()), 100);
+        let before_reply = assistant_with_blocks(Vec::new(), 150);
+        let after = user(UserMessageContent::Text("after".into()), 300);
+        let after_reply = assistant_with_blocks(Vec::new(), 350);
+        let rpc_turns = translate_messages(&[before, before_reply, after, after_reply]);
+        let turns = merge_compaction_markers(
+            rpc_turns,
+            &[SessionHistoryEntry::Compaction {
+                id: "compact-1".into(),
+                timestamp_ms: Some(200),
+            }],
+        );
+
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].id, "turn_0");
+        assert_eq!(turns[1].id, "turn_1");
+        assert!(matches!(
+            &turns[1].items[0],
+            ThreadItem::ContextCompaction { id } if id == "compact-1"
+        ));
+        assert_eq!(turns[2].id, "turn_2");
+    }
+
+    #[test]
+    fn replay_preserves_terminal_stop_reason() {
+        let cases = [
+            (StopReason::Stop, TurnStatus::Completed, None),
+            (StopReason::Length, TurnStatus::Completed, None),
+            (StopReason::ToolUse, TurnStatus::Completed, None),
+            (StopReason::Error, TurnStatus::Failed, Some("model failed")),
+            (StopReason::Aborted, TurnStatus::Interrupted, None),
+        ];
+
+        for (reason, expected_status, expected_error) in cases {
+            let turns = translate_messages(&[
+                user(UserMessageContent::Text("q".into()), 1),
+                assistant_with_outcome(Vec::new(), 2, reason, expected_error),
+            ]);
+            assert_eq!(turns.len(), 1, "reason: {reason:?}");
+            assert_eq!(turns[0].status, expected_status, "reason: {reason:?}");
+            assert_eq!(
+                turns[0].error.as_ref().map(|error| error.message.as_str()),
+                expected_error,
+                "reason: {reason:?}"
+            );
+        }
     }
 
     #[test]
@@ -587,10 +835,77 @@ mod tests {
                 _ => "other",
             })
             .collect();
-        assert_eq!(kinds, vec!["user", "agent", "reasoning"]);
+        assert_eq!(kinds, vec!["user", "reasoning", "agent"]);
         assert_eq!(turns[0].items[0].id(), "user_0");
-        assert_eq!(turns[0].items[1].id(), "assistant_0_2");
-        assert_eq!(turns[0].items[2].id(), "reasoning_0_2");
+        assert_eq!(turns[0].items[1].id(), "reasoning_0");
+        assert_eq!(turns[0].items[2].id(), "assistant_0");
+    }
+
+    #[test]
+    fn assistant_tool_cycles_preserve_reasoning_and_message_boundaries() {
+        let turns = translate_messages(&[
+            user(UserMessageContent::Text("q".into()), 1),
+            assistant_with_blocks(
+                vec![
+                    AssistantContentBlock::Thinking(ThinkingContent {
+                        thinking: "first thought".into(),
+                        thinking_signature: None,
+                        redacted: None,
+                    }),
+                    AssistantContentBlock::Text(TextContent {
+                        text: "first update".into(),
+                        text_signature: None,
+                    }),
+                    AssistantContentBlock::ToolCall(ToolCall {
+                        id: "tool-0".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "printf FIRST"}),
+                        thought_signature: None,
+                    }),
+                ],
+                2,
+            ),
+            tool_result("tool-0", "bash", "FIRST", false, 3),
+            assistant_with_blocks(
+                vec![
+                    AssistantContentBlock::Thinking(ThinkingContent {
+                        thinking: "second thought".into(),
+                        thinking_signature: None,
+                        redacted: None,
+                    }),
+                    AssistantContentBlock::Text(TextContent {
+                        text: "final answer".into(),
+                        text_signature: None,
+                    }),
+                    AssistantContentBlock::ToolCall(ToolCall {
+                        id: "tool-1".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "printf SECOND"}),
+                        thought_signature: None,
+                    }),
+                ],
+                4,
+            ),
+            tool_result("tool-1", "bash", "SECOND", false, 5),
+        ]);
+
+        assert_eq!(turns[0].items.len(), 7);
+        match &turns[0].items[1] {
+            ThreadItem::Reasoning { content, .. } => {
+                assert_eq!(content, &["first thought"]);
+            }
+            other => panic!("expected Reasoning, got {other:?}"),
+        }
+        match &turns[0].items[2] {
+            ThreadItem::AgentMessage { text, .. } => {
+                assert_eq!(text, "first update");
+            }
+            other => panic!("expected AgentMessage, got {other:?}"),
+        }
+        assert_eq!(turns[0].items[3].id(), "tool-0");
+        assert_eq!(turns[0].items[4].id(), "reasoning_0_1");
+        assert_eq!(turns[0].items[5].id(), "assistant_0_1");
+        assert_eq!(turns[0].items[6].id(), "tool-1");
     }
 
     #[test]
@@ -748,6 +1063,67 @@ mod tests {
         assert_eq!(turns[0].completed_at, Some(2));
         assert_eq!(turns[1].started_at, Some(3));
         assert_eq!(turns[1].completed_at, Some(4));
+    }
+
+    #[test]
+    fn queued_steer_stays_inside_the_running_turn() {
+        let messages = vec![
+            user(UserMessageContent::Text("initial".into()), 100),
+            assistant_with_blocks(
+                vec![AssistantContentBlock::Text(TextContent {
+                    text: "first".into(),
+                    text_signature: None,
+                })],
+                300,
+            ),
+            user(UserMessageContent::Text("steer".into()), 200),
+            assistant_with_blocks(
+                vec![AssistantContentBlock::Text(TextContent {
+                    text: "second".into(),
+                    text_signature: None,
+                })],
+                400,
+            ),
+            user(UserMessageContent::Text("next prompt".into()), 500),
+        ];
+        let turns = translate_messages(&messages);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+            turns[0]
+                .items
+                .iter()
+                .map(ThreadItem::id)
+                .collect::<Vec<_>>(),
+            ["user_0", "assistant_0", "user_0_1", "assistant_0_1"]
+        );
+        assert_eq!(turns[1].items[0].id(), "user_1");
+    }
+
+    #[test]
+    fn queued_steer_before_first_assistant_stays_inside_the_running_turn() {
+        let messages = vec![
+            user(UserMessageContent::Text("initial".into()), 100),
+            user(UserMessageContent::Text("steer immediately".into()), 200),
+            assistant_with_blocks(
+                vec![AssistantContentBlock::Text(TextContent {
+                    text: "combined response".into(),
+                    text_signature: None,
+                })],
+                300,
+            ),
+            user(UserMessageContent::Text("next prompt".into()), 500),
+        ];
+        let turns = translate_messages(&messages);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(
+            turns[0]
+                .items
+                .iter()
+                .map(ThreadItem::id)
+                .collect::<Vec<_>>(),
+            ["user_0", "user_0_1", "assistant_0"]
+        );
+        assert_eq!(turns[1].items[0].id(), "user_1");
     }
 
     #[test]

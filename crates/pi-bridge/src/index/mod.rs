@@ -21,7 +21,9 @@ use uuid::Uuid;
 
 use crate::codex_proto::{SessionSource, Thread, ThreadSourceKind, ThreadStatus};
 
-pub use pi_session_scan::{PiSessionInfo, list_all, list_sessions_from_dir, pi_sessions_dir};
+pub use pi_session_scan::{
+    PiSessionInfo, list_all, list_sessions_from_dir, list_sessions_modified_since, pi_sessions_dir,
+};
 
 pub use alleycat_bridge_core::{ListFilter, ListPage, ListSort};
 
@@ -90,14 +92,15 @@ impl ThreadIndex {
         // Step 1: scan and insert any rows we haven't seen before.
         let scanned = hydrator.scan_sessions().await;
         if !scanned.is_empty() {
-            let known_paths: std::collections::HashSet<PathBuf> = inner
+            let known_paths: std::collections::HashMap<PathBuf, IndexEntry> = inner
                 .snapshot()
                 .await
                 .into_iter()
-                .map(|e| e.metadata.pi_session_path)
+                .map(|entry| (entry.metadata.pi_session_path.clone(), entry))
                 .collect();
             for info in &scanned {
-                if known_paths.contains(&info.path) {
+                if let Some(existing) = known_paths.get(&info.path) {
+                    refresh_entry_summary(&inner, existing, info, false).await?;
                     continue;
                 }
                 inner.insert(entry_from_pi(info)).await.with_context(|| {
@@ -205,6 +208,62 @@ impl ThreadIndex {
         }
         Ok(added)
     }
+
+    pub async fn hydrate_modified_since(
+        &self,
+        sessions_root: &Path,
+        modified_after: std::time::SystemTime,
+    ) -> Result<usize> {
+        let scanned = list_sessions_modified_since(sessions_root, modified_after).await;
+        if scanned.is_empty() {
+            return Ok(0);
+        }
+        let known_paths: std::collections::HashMap<PathBuf, IndexEntry> = self
+            .0
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|entry| (entry.metadata.pi_session_path.clone(), entry))
+            .collect();
+        let mut added = 0;
+        for info in scanned {
+            if let Some(existing) = known_paths.get(&info.path) {
+                refresh_entry_summary(&self.0, existing, &info, true).await?;
+                continue;
+            }
+            self.0.insert(entry_from_pi(&info)).await?;
+            added += 1;
+        }
+        Ok(added)
+    }
+}
+
+async fn refresh_entry_summary(
+    index: &alleycat_bridge_core::ThreadIndex<PiSessionRef>,
+    existing: &IndexEntry,
+    info: &PiSessionInfo,
+    include_freshness: bool,
+) -> Result<()> {
+    let missing_preview = existing.preview.trim().is_empty() || existing.preview == "(no messages)";
+    if (missing_preview && info.first_message != "(no messages)")
+        || (include_freshness
+            && (existing.preview != info.first_message
+                || existing.updated_at != info.modified.timestamp_millis()))
+    {
+        index
+            .update_preview_and_updated_at(
+                &existing.thread_id,
+                info.first_message.clone(),
+                info.modified,
+            )
+            .await?;
+    }
+    if existing.name != info.name && (include_freshness || existing.name.is_none()) {
+        index
+            .set_name(&existing.thread_id, info.name.clone())
+            .await?;
+    }
+    Ok(())
 }
 
 impl std::ops::Deref for ThreadIndex {
@@ -499,11 +558,114 @@ mod tests {
             Some(parent_row.thread_id.as_str())
         );
 
-        // Re-running hydrate is idempotent.
+        let parent_thread_id = parent_row.thread_id.clone();
+        let mut parent_file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&parent_path)
+            .unwrap();
+        parent_file
+            .write_all(
+                br#"{"type":"message","timestamp":"2026-04-27T11:30:00Z","message":{"role":"user","content":"Startup refresh title"}}
+"#,
+            )
+            .unwrap();
+        drop(parent_file);
+
         let reopened = ThreadIndex::open_and_hydrate_with(&codex_home, &hydrator)
             .await
             .unwrap();
         assert_eq!(reopened.snapshot().await.len(), 2);
+        assert_eq!(
+            reopened.lookup(&parent_thread_id).await.unwrap().preview,
+            "Startup refresh title"
+        );
+    }
+
+    #[tokio::test]
+    async fn incremental_hydration_discovers_external_session_once() {
+        let dir = TempDir::new().unwrap();
+        let pi_root = dir.path().join("sessions");
+        let cwd_dir = pi_root.join("encoded");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        let index = ThreadIndex::open_at(dir.path().join("threads.json"))
+            .await
+            .unwrap();
+
+        std::fs::write(
+            cwd_dir.join("external.jsonl"),
+            r#"{"type":"session","version":3,"id":"external","timestamp":"2026-07-24T23:59:00Z","cwd":"/shared"}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            index
+                .hydrate_modified_since(&pi_root, std::time::SystemTime::UNIX_EPOCH)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            index
+                .hydrate_modified_since(&pi_root, std::time::SystemTime::UNIX_EPOCH)
+                .await
+                .unwrap(),
+            0
+        );
+        let rows = index.snapshot().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].metadata.pi_session_id, "external");
+    }
+
+    #[tokio::test]
+    async fn incremental_hydration_refreshes_existing_session_summary() {
+        let dir = TempDir::new().unwrap();
+        let pi_root = dir.path().join("sessions");
+        let cwd_dir = pi_root.join("encoded");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        let index = ThreadIndex::open_at(dir.path().join("threads.json"))
+            .await
+            .unwrap();
+        let session_path = cwd_dir.join("existing.jsonl");
+
+        std::fs::write(
+            &session_path,
+            r#"{"type":"session","version":3,"id":"existing","timestamp":"2026-07-24T23:59:00Z","cwd":"/shared"}
+"#,
+        )
+        .unwrap();
+        index
+            .hydrate_modified_since(&pi_root, std::time::SystemTime::UNIX_EPOCH)
+            .await
+            .unwrap();
+
+        std::fs::write(
+            &session_path,
+            r#"{"type":"session","version":3,"id":"existing","timestamp":"2026-07-24T23:59:00Z","cwd":"/shared"}
+{"type":"session_info","timestamp":"2026-07-25T00:00:00Z","name":"Named session"}
+{"type":"message","timestamp":"2026-07-25T00:00:01Z","message":{"role":"user","content":"Real first prompt"}}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            index
+                .hydrate_modified_since(&pi_root, std::time::SystemTime::UNIX_EPOCH)
+                .await
+                .unwrap(),
+            0,
+            "refreshing an existing row must not count as a new session"
+        );
+        let rows = index.snapshot().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].preview, "Real first prompt");
+        assert_eq!(rows[0].name.as_deref(), Some("Named session"));
+        assert_eq!(
+            rows[0].updated_at,
+            chrono::DateTime::parse_from_rfc3339("2026-07-25T00:00:01Z")
+                .unwrap()
+                .timestamp_millis()
+        );
     }
 
     #[tokio::test]

@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex as SyncMutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use thiserror::Error;
 use tokio::sync::broadcast;
@@ -53,9 +53,10 @@ use crate::codex_proto as p;
 use crate::pool::PiProcessHandle;
 use crate::pool::pi_protocol as pi;
 use crate::state::ConnectionState;
-use crate::translate::events::{EventTranslatorState, turn_status_from_agent_end};
+use crate::translate::events::EventTranslatorState;
 use crate::translate::input::translate_user_input;
 use crate::translate::items::{translate_messages, user_item_id};
+use crate::translate::turn_terminal_state;
 
 /// Per-thread active-turn registry. Pi only allows one active turn per
 /// process, so this is a 1:1 map. Keyed by codex `thread_id`.
@@ -82,6 +83,8 @@ pub enum TurnError {
     TurnIdMismatch { expected: String, actual: String },
     #[error("no active turn for thread `{0}`")]
     NoActiveTurn(String),
+    #[error("thread `{thread_id}` already has active turn `{turn_id}`")]
+    TurnAlreadyActive { thread_id: String, turn_id: String },
     #[error("input translation failed: {0}")]
     InputTranslation(String),
     #[error("pi rpc error: {0}")]
@@ -97,6 +100,7 @@ impl TurnError {
             | TurnError::TurnIdMismatch { .. }
             | TurnError::ThreadNotLoaded(_)
             | TurnError::NoActiveTurn(_)
+            | TurnError::TurnAlreadyActive { .. }
             | TurnError::InputTranslation(_) => p::error_codes::INVALID_PARAMS,
             TurnError::ReviewUnsupported => p::error_codes::METHOD_NOT_FOUND,
             TurnError::PiRpc(_) => p::error_codes::INTERNAL_ERROR,
@@ -112,16 +116,45 @@ pub async fn handle_turn_start(
     state: &Arc<ConnectionState>,
     params: p::TurnStartParams,
 ) -> Result<p::TurnStartResponse, TurnError> {
-    let handle = state
-        .pi_pool()
-        .get(&params.thread_id)
-        .await
-        .ok_or_else(|| TurnError::ThreadNotLoaded(params.thread_id.clone()))?;
+    // Resume the thread from its persisted session if the pool has no live
+    // process for it (idle-reaped, or cleared by a daemon restart). Without
+    // this, a follow-up turn from a backgrounded client fails with
+    // `ThreadNotLoaded` instead of continuing the conversation.
+    let handle = match state.pi_pool().get(&params.thread_id).await {
+        Some(handle) => handle,
+        None => {
+            let entry = state
+                .thread_index()
+                .lookup(&params.thread_id)
+                .await
+                .ok_or_else(|| TurnError::ThreadNotLoaded(params.thread_id.clone()))?;
+            crate::handlers::thread::load_or_resume_handle(state, &params.thread_id, &entry)
+                .await
+                .map_err(|e| match e {
+                    crate::handlers::thread::ThreadError::NotFound(id) => {
+                        TurnError::ThreadNotLoaded(id)
+                    }
+                    other => TurnError::PiRpc(other.to_string()),
+                })?
+        }
+    };
 
     apply_overrides(&handle, &params).await;
 
     let prompt = translate_user_input(&params.input)
         .map_err(|e| TurnError::InputTranslation(e.to_string()))?;
+    let index_preview = state
+        .thread_index()
+        .lookup(&params.thread_id)
+        .await
+        .map(|entry| {
+            if entry.preview.trim().is_empty() || entry.preview == "(no messages)" {
+                prompt.message.clone()
+            } else {
+                entry.preview
+            }
+        })
+        .unwrap_or_else(|| prompt.message.clone());
 
     let next_turn_index = next_turn_index(&handle).await?;
 
@@ -132,7 +165,12 @@ pub async fn handle_turn_start(
         .or(state.defaults().approval_policy)
         .unwrap_or(p::AskForApproval::OnRequest);
 
-    register_active_turn(&params.thread_id, &turn_id, approval_policy.clone());
+    register_active_turn(&params.thread_id, &turn_id, approval_policy.clone()).map_err(
+        |active_turn_id| TurnError::TurnAlreadyActive {
+            thread_id: params.thread_id.clone(),
+            turn_id: active_turn_id,
+        },
+    )?;
 
     // Mark the pool entry active so the LRU reaper doesn't snipe a turn
     // mid-flight. Cleared by the pump on `agent_end`.
@@ -202,7 +240,7 @@ pub async fn handle_turn_start(
 
     // Send pi `prompt`. Per the pi RPC contract, `success: true` arrives
     // after preflight only — pi continues async.
-    let resp = handle
+    let resp = match handle
         .send_request(pi::RpcCommand::Prompt(pi::PromptCmd {
             id: None,
             message: prompt.message,
@@ -210,15 +248,45 @@ pub async fn handle_turn_start(
             streaming_behavior: None,
         }))
         .await
-        .map_err(|e| TurnError::PiRpc(e.to_string()))?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let message = error.to_string();
+            clear_active_turn(&params.thread_id);
+            state.pi_pool().mark_idle(&params.thread_id).await;
+            emit_turn_completed(
+                state,
+                &params.thread_id,
+                &turn_id,
+                started_at,
+                p::TurnStatus::Failed,
+                Some(p::TurnError {
+                    message: message.clone(),
+                    codex_error_info: None,
+                    additional_details: None,
+                }),
+            );
+            return Err(TurnError::PiRpc(message));
+        }
+    };
     if !resp.success {
+        let message = resp.error.unwrap_or_else(|| "prompt failed".into());
         clear_active_turn(&params.thread_id);
         state.pi_pool().mark_idle(&params.thread_id).await;
-        return Err(TurnError::PiRpc(
-            resp.error.unwrap_or_else(|| "prompt failed".into()),
-        ));
+        emit_turn_completed(
+            state,
+            &params.thread_id,
+            &turn_id,
+            started_at,
+            p::TurnStatus::Failed,
+            Some(p::TurnError {
+                message: message.clone(),
+                codex_error_info: None,
+                additional_details: None,
+            }),
+        );
+        return Err(TurnError::PiRpc(message));
     }
-
     spawn_event_pump(EventPumpArgs {
         state: Arc::clone(state),
         handle: Arc::clone(&handle),
@@ -228,6 +296,21 @@ pub async fn handle_turn_start(
         events_rx,
         started_at,
         turn_index: next_turn_index,
+    });
+    let summary_state = Arc::clone(state);
+    let summary_thread_id = params.thread_id.clone();
+    tokio::spawn(async move {
+        if let Err(error) = summary_state
+            .thread_index()
+            .update_preview_and_updated_at(&summary_thread_id, index_preview, chrono::Utc::now())
+            .await
+        {
+            tracing::warn!(
+                thread_id = %summary_thread_id,
+                %error,
+                "failed to refresh pi thread list summary"
+            );
+        }
     });
 
     Ok(p::TurnStartResponse { turn })
@@ -340,18 +423,31 @@ fn now_unix_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn register_active_turn(thread_id: &str, turn_id: &str, approval_policy: p::AskForApproval) {
-    ACTIVE_TURNS.lock().unwrap().insert(
+fn register_active_turn(
+    thread_id: &str,
+    turn_id: &str,
+    approval_policy: p::AskForApproval,
+) -> Result<(), String> {
+    let mut active_turns = ACTIVE_TURNS.lock().unwrap();
+    if let Some(active) = active_turns.get(thread_id) {
+        return Err(active.turn_id.clone());
+    }
+    active_turns.insert(
         thread_id.to_string(),
         ActiveTurn {
             turn_id: turn_id.to_string(),
             approval_policy,
         },
     );
+    Ok(())
 }
 
 fn active_turn(thread_id: &str) -> Option<ActiveTurn> {
     ACTIVE_TURNS.lock().unwrap().get(thread_id).cloned()
+}
+
+pub(crate) fn active_turn_id(thread_id: &str) -> Option<String> {
+    active_turn(thread_id).map(|turn| turn.turn_id)
 }
 
 fn clear_active_turn(thread_id: &str) {
@@ -376,7 +472,7 @@ async fn apply_overrides(handle: &Arc<PiProcessHandle>, params: &p::TurnStartPar
             p::ReasoningEffort::Medium => pi::ThinkingLevel::Medium,
             p::ReasoningEffort::High => pi::ThinkingLevel::High,
             p::ReasoningEffort::XHigh => pi::ThinkingLevel::Xhigh,
-            p::ReasoningEffort::Max => pi::ThinkingLevel::Xhigh,
+            p::ReasoningEffort::Max => pi::ThinkingLevel::Max,
         };
         let _ = handle
             .send_request(pi::RpcCommand::SetThinkingLevel(pi::SetThinkingLevelCmd {
@@ -444,14 +540,63 @@ fn spawn_event_pump(args: EventPumpArgs) {
     });
 }
 
+pub(crate) fn spawn_compaction_event_pump(
+    state: Arc<ConnectionState>,
+    thread_id: String,
+    turn_id: String,
+    mut events_rx: broadcast::Receiver<pi::PiEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut translator = EventTranslatorState::new(thread_id.clone(), turn_id);
+        loop {
+            let event = match tokio::time::timeout(Duration::from_secs(300), events_rx.recv()).await
+            {
+                Err(_) => {
+                    tracing::warn!(
+                        thread_id = %thread_id,
+                        "compaction event pump timed out waiting for lifecycle completion"
+                    );
+                    return;
+                }
+                Ok(result) => match result {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(count)) => {
+                        tracing::warn!(
+                            thread_id = %thread_id,
+                            "compaction event pump lagged by {count} events"
+                        );
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+            };
+
+            let finished = matches!(event, pi::PiEvent::CompactionEnd { .. });
+            if matches!(
+                event,
+                pi::PiEvent::CompactionStart { .. } | pi::PiEvent::CompactionEnd { .. }
+            ) {
+                for notification in translator.translate(event) {
+                    if state_should_emit(&state, &notification) {
+                        let _ = state.send(notification_frame(notification));
+                    }
+                }
+            }
+            if finished {
+                return;
+            }
+        }
+    })
+}
+
 async fn run_event_pump(mut args: EventPumpArgs) {
     let mut translator = EventTranslatorState::with_turn_index(
         args.thread_id.clone(),
         args.turn_id.clone(),
         args.turn_index,
     );
+    let mut stop_reason: Option<pi::StopReason> = None;
     let mut error_message: Option<String> = None;
-    let mut sent_completed = false;
 
     loop {
         let event = match args.events_rx.recv().await {
@@ -460,14 +605,17 @@ async fn run_event_pump(mut args: EventPumpArgs) {
                 tracing::warn!(
                     thread_id = %args.thread_id,
                     turn_id = %args.turn_id,
-                    "event pump lagged by {n} events; some notifications dropped"
+                    "event pump lagged by {n} events; reconciling from agent history"
                 );
+                translator.mark_lagged();
                 continue;
             }
             Err(broadcast::error::RecvError::Closed) => {
                 // Pi process exited unexpectedly — fall through to emit
                 // a synthetic agent_end.
-                error_message = Some("pi process exited".into());
+                if stop_reason.is_none() && error_message.is_none() {
+                    error_message = Some("pi process exited".into());
+                }
                 break;
             }
         };
@@ -531,20 +679,12 @@ async fn run_event_pump(mut args: EventPumpArgs) {
             continue;
         }
 
-        // Capture agent_end error message before consuming event for
-        // translation; the translator emits item/completed for any open
-        // items but does not emit turn/completed (that's our job).
-        if let pi::PiEvent::AgentEnd { messages } = &event
-            && let Some(pi::AgentMessage::Assistant(a)) = messages.last()
-            && let Some(text) = a.content.iter().find_map(|b| match b {
-                pi::AssistantContentBlock::Text(t) => Some(t.text.clone()),
-                _ => None,
-            })
-        {
-            // No-op; this is just a hook for richer error
-            // capture. Real failures show up via auto-retry
-            // events upstream.
-            let _ = text;
+        // Capture Pi's terminal reason before consuming the event for
+        // translation. The translator closes items but the pump owns the
+        // enclosing codex turn lifecycle.
+        if let Some((reason, message)) = event_terminal_state(&event) {
+            stop_reason = Some(reason);
+            error_message = message;
         }
 
         let notifications = translator.translate(event.clone());
@@ -561,36 +701,93 @@ async fn run_event_pump(mut args: EventPumpArgs) {
         }
     }
 
-    // Emit turn/completed unless a prior path already sent it.
-    if !sent_completed {
-        let (status, error) = turn_status_from_agent_end(error_message.as_deref());
-        let completed_at = now_unix_secs();
-        let duration_ms = ((completed_at - args.started_at) * 1000).max(0);
-        let turn = p::Turn {
-            id: args.turn_id.clone(),
-            items: Vec::new(),
-            items_view: p::default_items_view(),
-            status,
-            error,
-            started_at: Some(args.started_at),
-            completed_at: Some(completed_at),
-            duration_ms: Some(duration_ms),
-        };
-        if args.state.should_emit("turn/completed") {
-            let frame = notification_frame(p::ServerNotification::TurnCompleted(
-                p::TurnCompletedNotification {
-                    thread_id: args.thread_id.clone(),
-                    turn,
-                },
-            ));
+    for notif in translator.finish() {
+        if state_should_emit(&args.state, &notif) {
+            let frame = notification_frame(notif);
             let _ = args.state.send(frame);
         }
-        sent_completed = true;
     }
-    let _ = sent_completed; // silence unused-assignment lint when no other path sets it.
+
+    let (status, error) = turn_terminal_state(stop_reason, error_message.as_deref());
+    emit_turn_completed(
+        &args.state,
+        &args.thread_id,
+        &args.turn_id,
+        args.started_at,
+        status,
+        error,
+    );
 
     clear_active_turn(&args.thread_id);
     args.state.pi_pool().mark_idle(&args.thread_id).await;
+}
+
+fn event_terminal_state(event: &pi::PiEvent) -> Option<(pi::StopReason, Option<String>)> {
+    let assistant = match event {
+        pi::PiEvent::MessageUpdate {
+            assistant_message_event: pi::AssistantMessageEvent::Done { reason, message },
+            ..
+        } => return Some((*reason, normalized_error(message.error_message.as_deref()))),
+        pi::PiEvent::MessageUpdate {
+            assistant_message_event: pi::AssistantMessageEvent::Error { reason, error },
+            ..
+        } => return Some((*reason, normalized_error(error.error_message.as_deref()))),
+        pi::PiEvent::MessageEnd {
+            message: pi::AgentMessage::Assistant(message),
+        }
+        | pi::PiEvent::TurnEnd {
+            message: pi::AgentMessage::Assistant(message),
+            ..
+        } => message,
+        pi::PiEvent::AgentEnd { messages } => {
+            messages.iter().rev().find_map(|message| match message {
+                pi::AgentMessage::Assistant(message) => Some(message),
+                _ => None,
+            })?
+        }
+        _ => return None,
+    };
+    Some((
+        assistant.stop_reason,
+        normalized_error(assistant.error_message.as_deref()),
+    ))
+}
+
+fn normalized_error(message: Option<&str>) -> Option<String> {
+    message
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+}
+
+fn emit_turn_completed(
+    state: &Arc<ConnectionState>,
+    thread_id: &str,
+    turn_id: &str,
+    started_at: i64,
+    status: p::TurnStatus,
+    error: Option<p::TurnError>,
+) {
+    let completed_at = now_unix_secs();
+    let turn = p::Turn {
+        id: turn_id.to_string(),
+        items: Vec::new(),
+        items_view: p::default_items_view(),
+        status,
+        error,
+        started_at: Some(started_at),
+        completed_at: Some(completed_at),
+        duration_ms: Some(((completed_at - started_at) * 1000).max(0)),
+    };
+    if state.should_emit("turn/completed") {
+        let frame = notification_frame(p::ServerNotification::TurnCompleted(
+            p::TurnCompletedNotification {
+                thread_id: thread_id.to_string(),
+                turn,
+            },
+        ));
+        let _ = state.send(frame);
+    }
 }
 
 /// Map a `ServerNotification` to its `method` string and consult the
@@ -874,7 +1071,7 @@ mod tests {
     #[test]
     fn active_turn_table_round_trip() {
         let thread_id = format!("test-{}", Uuid::now_v7());
-        register_active_turn(&thread_id, "tu1", p::AskForApproval::OnRequest);
+        register_active_turn(&thread_id, "tu1", p::AskForApproval::OnRequest).unwrap();
         let active = active_turn(&thread_id).unwrap();
         assert_eq!(active.turn_id, "tu1");
         assert!(matches!(
@@ -883,6 +1080,19 @@ mod tests {
         ));
         clear_active_turn(&thread_id);
         assert!(active_turn(&thread_id).is_none());
+    }
+
+    #[test]
+    fn active_turn_registration_rejects_overlapping_turns() {
+        let thread_id = format!("test-{}", Uuid::now_v7());
+        register_active_turn(&thread_id, "turn-one", p::AskForApproval::Never).unwrap();
+
+        let existing =
+            register_active_turn(&thread_id, "turn-two", p::AskForApproval::Never).unwrap_err();
+
+        assert_eq!(existing, "turn-one");
+        assert_eq!(active_turn(&thread_id).unwrap().turn_id, "turn-one");
+        clear_active_turn(&thread_id);
     }
 
     #[test]
@@ -898,6 +1108,43 @@ mod tests {
         assert_eq!(
             TurnError::PiRpc("oops".into()).rpc_code(),
             p::error_codes::INTERNAL_ERROR
+        );
+    }
+
+    #[test]
+    fn agent_end_carries_the_final_assistant_outcome() {
+        let messages: Vec<pi::AgentMessage> = serde_json::from_value(serde_json::json!([{
+            "role": "assistant",
+            "content": [],
+            "api": "openai-completions",
+            "provider": "local-studio",
+            "model": "offline-model",
+            "usage": {
+                "input": 0,
+                "output": 0,
+                "cacheRead": 0,
+                "cacheWrite": 0,
+                "totalTokens": 0,
+                "cost": {
+                    "input": 0,
+                    "output": 0,
+                    "cacheRead": 0,
+                    "cacheWrite": 0,
+                    "total": 0
+                }
+            },
+            "stopReason": "error",
+            "errorMessage": "  model is not running  ",
+            "timestamp": 1
+        }]))
+        .unwrap();
+
+        assert_eq!(
+            event_terminal_state(&pi::PiEvent::AgentEnd { messages }),
+            Some((
+                pi::StopReason::Error,
+                Some("model is not running".to_string())
+            ))
         );
     }
 }

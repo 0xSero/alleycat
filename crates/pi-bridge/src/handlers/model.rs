@@ -16,8 +16,10 @@
 //! `mock/experimentalMethod` are inlined in `main.rs`'s dispatcher; this
 //! module deliberately does not duplicate them.
 
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::Value;
 use serde_json::json;
@@ -27,17 +29,27 @@ use crate::pool::pi_protocol as pi;
 use crate::state::ConnectionState;
 
 const PI_SETTINGS_PATH_ENV: &str = "PI_AGENT_SETTINGS_PATH";
-const THINKING_SUFFIXES: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
+const MODEL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_MODEL_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+const THINKING_SUFFIXES: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 pub async fn handle_model_list(
     state: &Arc<ConnectionState>,
     _params: p::ModelListParams,
 ) -> p::ModelListResponse {
     let pi_models = fetch_models_via_pool(state).await;
+    let default_index = pi_models
+        .iter()
+        .position(|model| model.active == Some(true));
     let data = pi_models
         .into_iter()
         .enumerate()
-        .map(|(idx, model)| translate_pi_model(&model, idx == 0))
+        .map(|(idx, model)| {
+            translate_pi_model(
+                &model,
+                default_index.map_or(idx == 0, |default| idx == default),
+            )
+        })
         .collect();
     p::ModelListResponse {
         data,
@@ -45,25 +57,122 @@ pub async fn handle_model_list(
     }
 }
 
+/// Return the controller's currently active model as a provider-qualified id.
+///
+/// A prewarmed Pi process can outlive a model switch in Local Studio. New
+/// threads that omit an explicit model must therefore consult the controller
+/// catalog instead of inheriting the stale model captured when that process
+/// started.
+pub(crate) async fn active_controller_model(state: &ConnectionState) -> Option<String> {
+    let path = state.model_catalog_path()?;
+    let models = fetch_models_from_catalog(path, state.model_provider_prefixes())
+        .await
+        .ok()?;
+    qualified_active_model(&models)
+}
+
+fn qualified_active_model(models: &[PiAvailableModel]) -> Option<String> {
+    let model = models.iter().find(|model| model.active == Some(true))?;
+    let provider = model.provider.as_deref()?.trim();
+    let model_id = model.model_id.as_deref().or(model.id.as_deref())?.trim();
+    (!provider.is_empty() && !model_id.is_empty()).then(|| format!("{provider}/{model_id}"))
+}
+
 /// Fetch `Model[]` via the pool. Returns `Vec::new()` on any spawn or RPC
 /// failure — the codex client interprets an empty list as "no model
 /// picker today" and falls back to the thread's active model. Spawn
 /// failure is logged at WARN so it's visible in bridge logs.
 async fn fetch_models_via_pool(state: &Arc<ConnectionState>) -> Vec<PiAvailableModel> {
-    let handle = match state.pi_pool().acquire_utility(None).await {
-        Ok(h) => h,
-        Err(err) => {
-            tracing::warn!(%err, "model/list: failed to acquire utility pi handle");
-            return Vec::new();
+    if let Some(path) = state.model_catalog_path() {
+        match fetch_models_from_catalog(path, state.model_provider_prefixes()).await {
+            Ok(models) => return filter_models_by_enabled_models(models),
+            Err(err) => {
+                tracing::warn!(%err, path = %path.display(), "model/list: controller catalog unavailable; falling back to pi RPC");
+            }
         }
-    };
-    match fetch_models_from_handle(&handle).await {
-        Ok(models) => filter_models_by_enabled_models(models),
-        Err(err) => {
-            tracing::warn!(%err, "model/list: get_available_models RPC failed");
+    }
+
+    match tokio::time::timeout(MODEL_RPC_TIMEOUT, fetch_models_via_rpc(state)).await {
+        Ok(Ok(models)) => filter_models_by_enabled_models(filter_models_by_provider(
+            models,
+            state.model_provider_prefixes(),
+        )),
+        Ok(Err(err)) => {
+            tracing::warn!(%err, "model/list: pi RPC failed");
+            Vec::new()
+        }
+        Err(_) => {
+            tracing::warn!("model/list: pi RPC timed out");
             Vec::new()
         }
     }
+}
+
+async fn fetch_models_via_rpc(
+    state: &Arc<ConnectionState>,
+) -> anyhow::Result<Vec<PiAvailableModel>> {
+    let handle = state.pi_pool().acquire_utility(None).await?;
+    Ok(fetch_models_from_handle(&handle).await?)
+}
+
+async fn fetch_models_from_catalog(
+    path: &Path,
+    prefixes: &[String],
+) -> anyhow::Result<Vec<PiAvailableModel>> {
+    let bytes = tokio::fs::read(path).await?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_MODEL_CATALOG_BYTES,
+        "controller model catalog exceeds size limit"
+    );
+    let value: Value = serde_json::from_slice(&bytes)?;
+    Ok(parse_pi_models_catalog(&value, prefixes))
+}
+
+fn parse_pi_models_catalog(value: &Value, prefixes: &[String]) -> Vec<PiAvailableModel> {
+    let Some(providers) = value.get("providers").and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    providers
+        .iter()
+        .filter(|(provider, _)| {
+            prefixes.is_empty()
+                || prefixes.iter().any(|prefix| {
+                    provider.as_str() == prefix || provider.starts_with(&format!("{prefix}-"))
+                })
+        })
+        .flat_map(|(provider, config)| {
+            config
+                .get("models")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(move |model| {
+                    let mut model = model.clone();
+                    model
+                        .as_object_mut()?
+                        .insert("provider".to_string(), Value::String(provider.clone()));
+                    serde_json::from_value(model).ok()
+                })
+        })
+        .collect()
+}
+
+fn filter_models_by_provider(
+    models: Vec<PiAvailableModel>,
+    prefixes: &[String],
+) -> Vec<PiAvailableModel> {
+    if prefixes.is_empty() {
+        return models;
+    }
+    models
+        .into_iter()
+        .filter(|model| {
+            let provider = model.provider.as_deref().unwrap_or_default();
+            prefixes
+                .iter()
+                .any(|prefix| provider == prefix || provider.starts_with(&format!("{prefix}-")))
+        })
+        .collect()
 }
 
 /// Translate one pi `Model<any>` into codex `Model`. Pi's catalog is loose
@@ -87,9 +196,8 @@ fn translate_pi_model(model: &PiAvailableModel, is_default: bool) -> p::Model {
 
     // Codex contract: `supported_reasoning_efforts` is a list of
     // `{ reasoning_effort, description }` pairs. Pi's `ThinkingLevel`
-    // vocabulary is wider than codex's `ReasoningEffort` (it includes "off"
-    // and "xhigh" which codex doesn't expose), so we always advertise the
-    // full codex set and let the bridge map at `set_thinking_level` time.
+    // vocabulary maps directly to the app-server effort levels. Advertising
+    // both xhigh and max matters for controller models that distinguish them.
     let supported_reasoning_efforts = vec![
         p::ReasoningEffortOption {
             reasoning_effort: p::ReasoningEffort::Minimal,
@@ -105,6 +213,14 @@ fn translate_pi_model(model: &PiAvailableModel, is_default: bool) -> p::Model {
         },
         p::ReasoningEffortOption {
             reasoning_effort: p::ReasoningEffort::High,
+            description: "Deep reasoning".to_string(),
+        },
+        p::ReasoningEffortOption {
+            reasoning_effort: p::ReasoningEffort::XHigh,
+            description: "Very deep reasoning".to_string(),
+        },
+        p::ReasoningEffortOption {
+            reasoning_effort: p::ReasoningEffort::Max,
             description: "Maximum reasoning effort".to_string(),
         },
     ];
@@ -135,6 +251,16 @@ fn filter_models_by_enabled_models(models: Vec<PiAvailableModel>) -> Vec<PiAvail
     let Some(patterns) = enabled_model_patterns_from_settings() else {
         return models;
     };
+    filter_models_with_patterns(models, &patterns)
+}
+
+fn filter_models_with_patterns(
+    models: Vec<PiAvailableModel>,
+    patterns: &[String],
+) -> Vec<PiAvailableModel> {
+    if patterns.is_empty() {
+        return models;
+    }
     let filtered: Vec<PiAvailableModel> = models
         .iter()
         .filter(|model| model_matches_enabled_patterns(model, &patterns))
@@ -166,14 +292,9 @@ fn enabled_model_patterns_from_settings() -> Option<Vec<String>> {
 }
 
 fn pi_settings_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var(PI_SETTINGS_PATH_ENV) {
-        let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            return Some(PathBuf::from(trimmed));
-        }
-    }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".pi/agent/settings.json"))
+    let path = std::env::var(PI_SETTINGS_PATH_ENV).ok()?;
+    let trimmed = path.trim();
+    (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
 }
 
 fn strip_thinking_suffix(pattern: &str) -> String {
@@ -311,14 +432,17 @@ struct PiAvailableModel {
     #[serde(default)]
     model_id: Option<String>,
     #[serde(default)]
+    #[serde(alias = "name")]
     display_name: Option<String>,
     #[serde(default)]
     label: Option<String>,
     #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    active: Option<bool>,
     /// Free-form modalities list pi exposes (`text`, `image`, etc.). We
     /// pass through verbatim and let codex pick what it understands.
-    #[serde(default)]
+    #[serde(default, alias = "input")]
     input_modalities: Option<Vec<Value>>,
 }
 
@@ -364,7 +488,7 @@ mod tests {
         assert_eq!(m.model, "gpt-5");
         assert_eq!(m.display_name, "GPT-5 (openai)");
         assert!(m.is_default);
-        assert_eq!(m.supported_reasoning_efforts.len(), 4);
+        assert_eq!(m.supported_reasoning_efforts.len(), 6);
         assert!(matches!(
             m.default_reasoning_effort,
             p::ReasoningEffort::Medium
@@ -414,6 +538,57 @@ mod tests {
     }
 
     #[test]
+    fn active_catalog_model_becomes_the_default() {
+        let models = vec![
+            PiAvailableModel {
+                id: Some("inactive".into()),
+                active: Some(false),
+                ..Default::default()
+            },
+            PiAvailableModel {
+                id: Some("running".into()),
+                active: Some(true),
+                ..Default::default()
+            },
+        ];
+        let default_index = models.iter().position(|model| model.active == Some(true));
+        let translated = models
+            .iter()
+            .enumerate()
+            .map(|(index, model)| {
+                translate_pi_model(
+                    model,
+                    default_index.map_or(index == 0, |default| index == default),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!translated[0].is_default);
+        assert!(translated[1].is_default);
+    }
+
+    #[test]
+    fn active_catalog_model_is_provider_qualified_for_thread_start() {
+        let models = vec![
+            PiAvailableModel {
+                provider: Some("local-studio".into()),
+                id: Some("stale".into()),
+                active: Some(false),
+                ..Default::default()
+            },
+            PiAvailableModel {
+                provider: Some("local-studio".into()),
+                model_id: Some("glm-5.2".into()),
+                active: Some(true),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            qualified_active_model(&models).as_deref(),
+            Some("local-studio/glm-5.2")
+        );
+    }
+
+    #[test]
     fn enabled_model_filter_matches_full_ids_suffixes_and_globs() {
         let model = PiAvailableModel {
             provider: Some("fireworks".into()),
@@ -455,6 +630,65 @@ mod tests {
     fn parse_pi_models_response_empty_on_missing_field() {
         let raw = json!({ "other": [] });
         assert!(parse_pi_models_response(&raw).is_empty());
+    }
+
+    #[test]
+    fn empty_enabled_models_keeps_the_full_catalog() {
+        let models = vec![PiAvailableModel {
+            provider: Some("local-studio".into()),
+            model_id: Some("glm-5.2".into()),
+            ..Default::default()
+        }];
+        let filtered = filter_models_with_patterns(models, &[]);
+        assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn provider_filter_keeps_only_controller_variants() {
+        let models = [
+            "local-studio",
+            "local-studio-spark",
+            "openrouter",
+            "user-pi-local",
+        ]
+        .into_iter()
+        .map(|provider| PiAvailableModel {
+            provider: Some(provider.into()),
+            model_id: Some("model".into()),
+            ..Default::default()
+        })
+        .collect();
+        let filtered = filter_models_by_provider(models, &["local-studio".into()]);
+        assert_eq!(
+            filtered
+                .iter()
+                .filter_map(|model| model.provider.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["local-studio", "local-studio-spark"]
+        );
+    }
+
+    #[test]
+    fn controller_catalog_reads_only_scoped_provider() {
+        let catalog = json!({
+            "providers": {
+                "local-studio": {
+                    "models": [
+                        {"id": "glm-5.2", "name": "GLM 5.2"}
+                    ]
+                },
+                "openrouter": {
+                    "models": [
+                        {"id": "other", "name": "Other"}
+                    ]
+                }
+            }
+        });
+        let models = parse_pi_models_catalog(&catalog, &["local-studio".to_string()]);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].provider.as_deref(), Some("local-studio"));
+        assert_eq!(models[0].id.as_deref(), Some("glm-5.2"));
+        assert_eq!(models[0].display_name.as_deref(), Some("GLM 5.2"));
     }
 
     #[tokio::test]

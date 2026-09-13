@@ -1,5 +1,6 @@
 pub mod command_exec;
 pub mod config;
+pub mod file_search;
 pub mod lifecycle;
 pub mod mcp;
 pub mod model;

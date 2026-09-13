@@ -124,6 +124,12 @@ pub fn daemon_pid_file() -> anyhow::Result<PathBuf> {
     Ok(state_dir()?.join("daemon.pid"))
 }
 
+/// `<state_dir>/paired-nodes.json` — capability grants keyed by the
+/// authenticated remote Iroh endpoint ID.
+pub fn paired_nodes_file() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("paired-nodes.json"))
+}
+
 /// `sockaddr_un.sun_path` size on Darwin/BSD (104) and Linux (108). Minus the
 /// trailing NUL the kernel needs.
 #[cfg(target_os = "linux")]
@@ -332,6 +338,14 @@ mod tests {
         let kf = host_key_file().unwrap();
         assert_eq!(kf.file_name().unwrap(), "host.key");
         assert!(kf.starts_with(state_dir().unwrap()));
+    }
+
+    #[test]
+    fn paired_nodes_file_lives_under_state_dir() {
+        let _h = TempHome::new();
+        let grants = paired_nodes_file().unwrap();
+        assert_eq!(grants.file_name().unwrap(), "paired-nodes.json");
+        assert!(grants.starts_with(state_dir().unwrap()));
     }
 
     #[cfg(unix)]

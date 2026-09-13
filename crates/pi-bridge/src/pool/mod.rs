@@ -23,6 +23,8 @@
 pub mod pi_protocol;
 pub mod process;
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,19 +103,68 @@ impl PiPool {
         &self.launcher
     }
 
-    /// Spawn a fresh pi process for a brand-new codex thread, mint a thread
-    /// id, and return both. The handler is responsible for sending pi the
-    /// `new_session` (and any `set_model`/`set_thinking_level` overrides)
-    /// before the first `prompt`.
+    /// Claim a prewarmed pi process for a brand-new codex thread, or spawn one
+    /// when no matching warm process exists, then mint and return a thread id.
+    /// Pi RPC mode already owns a fresh session when it becomes ready; the
+    /// handler validates and adopts that session before the first `prompt`.
+    ///
+    /// The caller schedules the replacement prewarm only after validation.
+    /// Starting it here would make two cold Pi runtimes compete while the
+    /// user-facing `thread/start` is still waiting for readiness.
     pub async fn acquire_for_new_thread(
         &self,
         cwd: impl AsRef<Path>,
     ) -> Result<(ThreadId, Arc<PiProcessHandle>), PoolError> {
         let thread_id = Uuid::now_v7().to_string();
-        let handle = self
-            .spawn_with_capacity_check(thread_id.clone(), cwd.as_ref())
-            .await?;
+        let handle = if let Some((_previous_id, handle)) = self
+            .inner
+            .reassign_lru_idle_with_prefix_for_cwd(thread_id.clone(), cwd.as_ref(), "utility_")
+            .await?
+        {
+            handle
+        } else {
+            self.spawn_with_capacity_check(thread_id.clone(), cwd.as_ref())
+                .await?
+        };
         Ok((thread_id, handle))
+    }
+
+    pub(crate) fn schedule_prewarm(&self, cwd: PathBuf) {
+        let pool = self.clone();
+        tokio::spawn(async move {
+            let mut hasher = DefaultHasher::new();
+            cwd.hash(&mut hasher);
+            let utility_id = format!("utility_warm_{:x}", hasher.finish());
+            if pool.inner.get(&utility_id).await.is_some() {
+                return;
+            }
+            let Ok(handle) =
+                PiProcessHandle::launch_with(pool.launcher.as_ref(), &cwd, &pool.pi_bin).await
+            else {
+                return;
+            };
+            let handle = Arc::new(handle);
+            if pool
+                .inner
+                .track_new_if_below_capacity(utility_id.clone(), cwd, handle.clone(), true)
+                .await
+                .is_err()
+            {
+                handle.shutdown().await;
+                return;
+            }
+            let warmed = handle
+                .send_request(pi_protocol::RpcCommand::GetState(
+                    pi_protocol::BareCmd::default(),
+                ))
+                .await
+                .is_ok();
+            if !warmed {
+                pool.inner.release(&utility_id).await;
+            } else {
+                pool.inner.mark_idle(&utility_id).await;
+            }
+        });
     }
 
     /// Spawn a fresh pi process bound to `cwd` for an explicit `thread_id`,
@@ -125,6 +176,13 @@ impl PiPool {
         thread_id: ThreadId,
         cwd: impl AsRef<Path>,
     ) -> Result<Arc<PiProcessHandle>, PoolError> {
+        if let Some((_previous_id, handle)) = self
+            .inner
+            .reassign_lru_idle_with_prefix_for_cwd(thread_id.clone(), cwd.as_ref(), "utility_")
+            .await?
+        {
+            return Ok(handle);
+        }
         self.spawn_with_capacity_check(thread_id, cwd.as_ref())
             .await
     }
@@ -311,5 +369,36 @@ mod tests {
             .await
             .expect("utility");
         assert!(Arc::ptr_eq(&handle, &target_handle));
+    }
+
+    #[tokio::test]
+    async fn resume_claims_idle_warm_process_for_same_cwd() {
+        let pool = fake_pi_pool(8, Duration::from_secs(60));
+        let warm = track_dummy(&pool, "utility_warm", "/repo").await;
+
+        let resumed = pool
+            .acquire_for_resume("thread-1".into(), "/repo")
+            .await
+            .expect("resume should claim warm process");
+
+        assert!(Arc::ptr_eq(&resumed, &warm));
+        assert!(pool.get("utility_warm").await.is_none());
+        assert!(Arc::ptr_eq(
+            &pool.get("thread-1").await.expect("retagged process"),
+            &warm
+        ));
+    }
+
+    #[tokio::test]
+    async fn new_thread_reuses_idle_process_in_same_cwd() {
+        let pool = fake_pi_pool(8, Duration::from_secs(60));
+        let old = track_dummy(&pool, "utility_old", "/repo").await;
+        let (new_id, handle) = pool
+            .acquire_for_new_thread("/repo")
+            .await
+            .expect("warm acquire");
+        assert!(Arc::ptr_eq(&handle, &old));
+        assert!(pool.get("utility_old").await.is_none());
+        assert!(Arc::ptr_eq(&pool.get(&new_id).await.expect("new"), &old));
     }
 }
