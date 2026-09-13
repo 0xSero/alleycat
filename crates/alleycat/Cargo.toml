@@ -39,6 +39,7 @@ alleycat-pi-bridge = { workspace = true }
 alleycat-shell-bridge = { workspace = true }
 anyhow.workspace = true
 arc-swap.workspace = true
+async-trait.workspace = true
 clap.workspace = true
 chrono.workspace = true
 directories.workspace = true
@@ -67,3 +68,6 @@ libc.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 mslnk = "0.1"
+
+[dev-dependencies]
+tempfile.workspace = true

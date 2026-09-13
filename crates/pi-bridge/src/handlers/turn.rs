@@ -724,14 +724,17 @@ async fn run_event_pump(mut args: EventPumpArgs) {
 
 fn event_terminal_state(event: &pi::PiEvent) -> Option<(pi::StopReason, Option<String>)> {
     let assistant = match event {
-        pi::PiEvent::MessageUpdate {
-            assistant_message_event: pi::AssistantMessageEvent::Done { reason, message },
-            ..
-        } => return Some((*reason, normalized_error(message.error_message.as_deref()))),
-        pi::PiEvent::MessageUpdate {
-            assistant_message_event: pi::AssistantMessageEvent::Error { reason, error },
-            ..
-        } => return Some((*reason, normalized_error(error.error_message.as_deref()))),
+        pi::PiEvent::MessageUpdate { assistant_message_event, .. } => {
+            match &**assistant_message_event {
+                pi::AssistantMessageEvent::Done { reason, message } => {
+                    return Some((*reason, normalized_error(message.error_message.as_deref())))
+                }
+                pi::AssistantMessageEvent::Error { reason, error } => {
+                    return Some((*reason, normalized_error(error.error_message.as_deref())))
+                }
+                _ => return None,
+            }
+        }
         pi::PiEvent::MessageEnd {
             message: pi::AgentMessage::Assistant(message),
         }

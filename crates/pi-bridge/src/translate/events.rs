@@ -696,33 +696,6 @@ impl EventTranslatorState {
                 }
                 AgentMessage::ToolResult(_) | AgentMessage::Other(_) => {}
             }
-    fn translate_turn_end(&mut self, message: AgentMessage) -> Vec<ServerNotification> {
-        let AgentMessage::Assistant(a) = &message else {
-            return Vec::new();
-        };
-        if a.usage.total_tokens == 0 && a.usage.input == 0 && a.usage.output == 0 {
-            return Vec::new();
-        }
-        let breakdown = TokenUsageBreakdown {
-            total_tokens: a.usage.total_tokens as i64,
-            input_tokens: a.usage.input as i64,
-            cached_input_tokens: a.usage.cache_read as i64,
-            output_tokens: a.usage.output as i64,
-            reasoning_output_tokens: 0,
-        };
-        self.cumulative_token_usage = sum_breakdown(&self.cumulative_token_usage, &breakdown);
-        vec![ServerNotification::ThreadTokenUsageUpdated(
-            ThreadTokenUsageUpdatedNotification {
-                thread_id: self.thread_id.clone(),
-                turn_id: self.turn_id.clone(),
-                token_usage: ThreadTokenUsage {
-                    total: self.cumulative_token_usage.clone(),
-                    last: breakdown,
-                    model_context_window: None,
-                },
-            },
-        )]
-    }
 
         }
         if (self.open_message_item.is_some() || self.open_reasoning_item.is_some())
@@ -751,6 +724,34 @@ impl EventTranslatorState {
             out.push(self.item_completed(item));
         }
         out
+    }
+
+    fn translate_turn_end(&mut self, message: AgentMessage) -> Vec<ServerNotification> {
+        let AgentMessage::Assistant(a) = &message else {
+            return Vec::new();
+        };
+        if a.usage.total_tokens == 0 && a.usage.input == 0 && a.usage.output == 0 {
+            return Vec::new();
+        }
+        let breakdown = TokenUsageBreakdown {
+            total_tokens: a.usage.total_tokens as i64,
+            input_tokens: a.usage.input as i64,
+            cached_input_tokens: a.usage.cache_read as i64,
+            output_tokens: a.usage.output as i64,
+            reasoning_output_tokens: 0,
+        };
+        self.cumulative_token_usage = sum_breakdown(&self.cumulative_token_usage, &breakdown);
+        vec![ServerNotification::ThreadTokenUsageUpdated(
+            ThreadTokenUsageUpdatedNotification {
+                thread_id: self.thread_id.clone(),
+                turn_id: self.turn_id.clone(),
+                token_usage: ThreadTokenUsage {
+                    total: self.cumulative_token_usage.clone(),
+                    last: breakdown,
+                    model_context_window: None,
+                },
+            },
+        )]
     }
 
     fn reconcile_authoritative_tool(
@@ -1692,26 +1693,26 @@ mod tests {
             }));
             notifications.extend(s.translate(PiEvent::MessageUpdate {
                 message: agent_msg(""),
-                assistant_message_event: AssistantMessageEvent::ThinkingStart {
+                assistant_message_event: Box::new(AssistantMessageEvent::ThinkingStart {
                     content_index: 0,
                     partial: assistant_message(""),
-                },
+                }),
             }));
             notifications.extend(s.translate(PiEvent::MessageUpdate {
                 message: agent_msg(""),
-                assistant_message_event: AssistantMessageEvent::ThinkingDelta {
+                assistant_message_event: Box::new(AssistantMessageEvent::ThinkingDelta {
                     content_index: 0,
                     delta: thinking.into(),
                     partial: assistant_message(""),
-                },
+                }),
             }));
             notifications.extend(s.translate(PiEvent::MessageUpdate {
                 message: agent_msg(""),
-                assistant_message_event: AssistantMessageEvent::TextDelta {
+                assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
                     content_index: 0,
                     delta: text.into(),
                     partial: assistant_message(""),
-                },
+                }),
             }));
             notifications.extend(s.translate(PiEvent::MessageEnd {
                 message: agent_msg(text),
