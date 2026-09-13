@@ -11,6 +11,7 @@ use crate::framing::{read_json_frame, write_json_frame};
 use crate::ipc;
 
 pub mod agents;
+pub mod local_studio;
 pub mod logs;
 pub mod onboarding;
 pub mod pair;
@@ -19,6 +20,7 @@ pub mod reload;
 pub mod rotate;
 pub mod status;
 pub mod stop;
+pub mod studio;
 pub mod upgrade;
 
 /// Send a single request to the daemon and read back the response.

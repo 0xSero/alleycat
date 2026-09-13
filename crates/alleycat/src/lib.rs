@@ -8,12 +8,14 @@ mod cli;
 mod config;
 mod daemon;
 mod framing;
+pub mod grants;
 mod host;
 mod ipc;
 // Typed Local Studio realtime contract only. This module is intentionally
 // private until the transport and capability policy land together.
 mod local_studio_realtime;
-mod paths;
+mod local_studio;
+pub mod paths;
 mod protocol;
 mod service;
 mod state;
@@ -137,6 +139,10 @@ enum Command {
     Restart,
     /// Inspect agents.
     Agents(cli::agents::AgentsArgs),
+    /// Manage caller-scoped Local Studio access on this computer.
+    LocalStudio(cli::local_studio::LocalStudioArgs),
+    /// Install or update the exact Local Studio controller on this computer.
+    Studio(cli::studio::StudioArgs),
     /// Connect to the daemon over iroh like a phone client and run JSON-RPC
     /// methods directly. Defaults to invoking `thread/list` on the chosen agent.
     Probe(Box<cli::probe::ProbeArgs>),
@@ -147,7 +153,7 @@ enum Command {
 }
 
 async fn async_main() -> anyhow::Result<()> {
-    let matches = Cli::command().name(binary_name()).get_matches();
+    let matches = command_for(app()).get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
     match cli.command {
         None => {
@@ -201,6 +207,14 @@ async fn async_main() -> anyhow::Result<()> {
             init_cli_logging();
             cli::agents::run(args).await
         }
+        Some(Command::LocalStudio(args)) => {
+            init_cli_logging();
+            cli::local_studio::run(args).await
+        }
+        Some(Command::Studio(args)) => {
+            init_cli_logging();
+            cli::studio::run(args).await
+        }
         Some(Command::Probe(args)) => {
             init_cli_logging();
             cli::probe::run(*args).await
@@ -212,6 +226,10 @@ async fn async_main() -> anyhow::Result<()> {
     }
 }
 
+fn command_for(app: &App) -> clap::Command {
+    Cli::command().name(app.binary_name).version(app.version)
+}
+
 fn init_cli_logging() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -219,4 +237,25 @@ fn init_cli_logging() {
         }))
         .with_writer(std::io::stderr)
         .try_init();
+}
+
+#[cfg(test)]
+mod cli_version_tests {
+    use super::*;
+
+    #[test]
+    fn wrapper_version_overrides_library_package_version() {
+        let wrapper = App {
+            binary_name: "kittylitter",
+            qualifier: "com",
+            organization: "sigkitten",
+            application: "kittylitter",
+            label: "com.sigkitten.kittylitter",
+            version: "9.8.7",
+        };
+        assert_eq!(
+            command_for(&wrapper).render_version(),
+            "kittylitter 9.8.7\n"
+        );
+    }
 }

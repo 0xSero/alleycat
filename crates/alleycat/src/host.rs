@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use alleycat_bridge_core::session::{ResolvedAttach, SessionRegistry};
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use iroh::endpoint::QuicTransportConfig;
@@ -110,7 +111,8 @@ pub async fn accept_loop(
                             // `remote_id` is the cryptographic identity we
                             // key sessions on. It's stable across all
                             // bi-streams of this connection.
-                            let node_id = conn.remote_id().to_string();
+                            let remote_id = conn.remote_id();
+                            let node_id = remote_id.to_string();
                             info!(
                                 conn = conn_id,
                                 node_id = %node_id,
@@ -120,9 +122,16 @@ pub async fn accept_loop(
                                 let agents = agents.clone();
                                 let config = Arc::clone(&config);
                                 let node_id = node_id.clone();
+                                let stream_remote_id = remote_id;
                                 tokio::spawn(async move {
                                     if let Err(error) = handle_stream(
-                                        send, recv, agents, config, conn_id, node_id,
+                                        send,
+                                        recv,
+                                        agents,
+                                        config,
+                                        conn_id,
+                                        node_id,
+                                        stream_remote_id,
                                     )
                                     .await
                                     {
@@ -148,6 +157,7 @@ async fn handle_stream(
     config: Arc<ArcSwap<HostConfig>>,
     conn: usize,
     node_id: String,
+    remote_id: iroh::EndpointId,
 ) -> anyhow::Result<()> {
     let request: Request = read_json_frame(&mut recv).await?;
     if let Err(error) = validate_version(&request) {
@@ -165,7 +175,7 @@ async fn handle_stream(
     match request {
         Request::ListAgents { .. } => {
             info!(conn = conn, "list_agents");
-            let list = agents.list_agents().await;
+            let list = agents.list_agents_for(&remote_id).await;
             write_json_frame(&mut send, &Response::agents(list)).await?;
             Ok(())
         }
@@ -189,7 +199,12 @@ async fn handle_stream(
             Ok(())
         }
         Request::Connect { agent, resume, .. } => {
-            if !agents.agent_enabled(&agent) {
+            let enabled = if agent == "local-studio" {
+                agents.local_studio_gateway_available()
+            } else {
+                agents.agent_enabled(&agent)
+            };
+            if !enabled {
                 warn!(conn = conn, %agent, "rejecting: agent disabled or unknown");
                 write_json_frame(
                     &mut send,
@@ -211,10 +226,12 @@ async fn handle_stream(
             };
 
             let last_seen = resume.as_ref().map(|r: &Resume| r.last_seq);
-            let resolved =
-                agents
-                    .session_registry()
-                    .resolve_attach(node_id.clone(), agent_static, last_seen);
+            let resolved = resolve_attach(
+                agents.session_registry().as_ref(),
+                node_id.clone(),
+                agent_static,
+                last_seen,
+            );
             let session_info = SessionInfo {
                 attached: resolved.kind.into(),
                 current_seq: resolved.current_seq,
@@ -244,6 +261,7 @@ async fn handle_stream(
                     IrohStream::new(send, recv),
                     resolved.session,
                     dispatch_last_seen,
+                    remote_id,
                 )
                 .await
                 .with_context(|| format!("serving agent `{agent}`"));
@@ -254,6 +272,15 @@ async fn handle_stream(
             result
         }
     }
+}
+
+fn resolve_attach(
+    registry: &SessionRegistry,
+    node_id: String,
+    agent: &'static str,
+    last_seen: Option<u64>,
+) -> ResolvedAttach {
+    registry.resolve_attach(node_id, agent, last_seen)
 }
 
 pub fn pair_payload(
@@ -336,6 +363,40 @@ mod tests {
                 .as_deref()
                 .is_some_and(|name| !name.is_empty())
         );
+    }
+
+    #[test]
+    fn qr_pair_payload_never_creates_local_studio_authority() {
+        let _home = crate::test_support::TempHome::new();
+        let secret_key = iroh::SecretKey::generate();
+        let config = HostConfig::default();
+        let grants = crate::paths::paired_nodes_file().unwrap();
+        assert!(!grants.exists());
+        let _ = pair_payload(&secret_key, &config, None);
+        assert!(!grants.exists());
+    }
+
+    #[test]
+    fn local_studio_attach_resumes_from_client_cursor() {
+        let registry = alleycat_bridge_core::SessionRegistry::new(Default::default());
+        let node_id = iroh::SecretKey::generate().public().to_string();
+        let prior = registry.get_or_create(node_id.clone(), "local-studio");
+        prior.enqueue(serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}}));
+        prior.enqueue(serde_json::json!({"jsonrpc": "2.0", "id": 2, "result": {}}));
+
+        let resolved = resolve_attach(registry.as_ref(), node_id, "local-studio", Some(1));
+        assert_eq!(
+            resolved.kind,
+            alleycat_bridge_core::session::AttachKind::Resumed
+        );
+        assert_eq!(resolved.current_seq, 2);
+        assert_eq!(resolved.floor_seq, 1);
+        assert_eq!(resolved.effective_last_seen, Some(1));
+        assert!(Arc::ptr_eq(&prior, &resolved.session));
+        let attachment = resolved.session.install_attachment(Some(1));
+        assert_eq!(attachment.backlog.len(), 1);
+        assert_eq!(attachment.backlog[0].seq, 2);
+        assert!(attachment.replay_redelivery.is_none());
     }
 
     #[test]

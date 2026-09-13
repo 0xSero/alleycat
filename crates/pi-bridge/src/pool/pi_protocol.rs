@@ -255,6 +255,8 @@ pub enum ThinkingLevel {
     High,
     /// Only valid for select OpenAI gpt-5.x models.
     Xhigh,
+    /// Provider-defined maximum reasoning level.
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -562,6 +564,7 @@ pub enum PiEvent {
     AgentEnd {
         messages: Vec<AgentMessage>,
     },
+    AgentSettled,
 
     // Turn lifecycle (one assistant response + tool calls/results)
     TurnStart,
@@ -619,6 +622,9 @@ pub enum PiEvent {
         steering: Vec<String>,
         #[serde(rename = "followUp")]
         follow_up: Vec<String>,
+    },
+    EntryAppended {
+        entry: Value,
     },
     CompactionStart {
         reason: CompactionReason,
@@ -1351,6 +1357,25 @@ mod tests {
     }
 
     #[test]
+    fn pi_event_entry_appended_accepts_custom_session_entries() {
+        let body = json!({
+            "type": "entry_appended",
+            "entry": {
+                "type": "custom",
+                "customType": "goal",
+                "data": {"status": "complete"}
+            }
+        });
+        let event: PiOutboundMessage = serde_json::from_value(body.clone()).unwrap();
+        match event {
+            PiOutboundMessage::Event(PiEvent::EntryAppended { entry }) => {
+                assert_eq!(entry["customType"], "goal");
+            }
+            other => panic!("expected entry_appended event, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn pi_event_tool_execution_start() {
         let body = json!({
             "type": "tool_execution_start",
@@ -1508,6 +1533,7 @@ mod tests {
             ThinkingLevel::Medium,
             ThinkingLevel::High,
             ThinkingLevel::Xhigh,
+            ThinkingLevel::Max,
         ] {
             let event = PiEvent::ThinkingLevelChanged { level };
             let body = serde_json::to_value(&event).unwrap();
@@ -1650,6 +1676,14 @@ mod tests {
             PiEvent::AgentEnd { messages } => assert_eq!(messages.len(), 1),
             _ => panic!("expected agent_end"),
         }
+        assert_eq!(serde_json::to_value(&event).unwrap(), body);
+    }
+
+    #[test]
+    fn agent_settled_event_round_trips() {
+        let body = json!({"type": "agent_settled"});
+        let event: PiEvent = serde_json::from_value(body.clone()).unwrap();
+        assert_eq!(event, PiEvent::AgentSettled);
         assert_eq!(serde_json::to_value(&event).unwrap(), body);
     }
 }

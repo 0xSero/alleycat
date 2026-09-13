@@ -10,12 +10,20 @@ use crate::paths;
 
 pub async fn load_or_create_secret_key() -> anyhow::Result<SecretKey> {
     let path = paths::host_key_file()?;
-    match fs::read_to_string(&path).await {
+    load_or_create_secret_key_at(&path).await
+}
+
+/// Load a stable iroh identity from `path`, creating it with owner-only
+/// permissions when it does not exist. The daemon uses the standard host-key
+/// path; diagnostic clients may opt into their own persistent identity so a
+/// reconnect is authenticated as the same device.
+pub(crate) async fn load_or_create_secret_key_at(path: &Path) -> anyhow::Result<SecretKey> {
+    match fs::read_to_string(path).await {
         Ok(raw) => parse_secret_key(raw.trim())
-            .with_context(|| format!("parsing host key {}", path.display())),
+            .with_context(|| format!("parsing secret key {}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let key = SecretKey::generate();
-            write_secret_key(&path, &key).await?;
+            write_secret_key(path, &key).await?;
             Ok(key)
         }
         Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
@@ -139,5 +147,24 @@ mod tests {
         let key = SecretKey::generate();
         let parsed = parse_secret_key(&hex::encode(key.to_bytes())).unwrap();
         assert_eq!(parsed.public(), key.public());
+    }
+
+    #[tokio::test]
+    async fn path_loader_reuses_the_same_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.key");
+
+        let first = load_or_create_secret_key_at(&path).await.unwrap();
+        let second = load_or_create_secret_key_at(&path).await.unwrap();
+
+        assert_eq!(first.public(), second.public());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

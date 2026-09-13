@@ -12,8 +12,10 @@
 //! holds an `Arc<Session>` and delegates `send` / `register_pending_request` /
 //! `resolve_pending_request` / `cancel_all_pending_requests` to it.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::{Duration, SystemTime};
 
 use alleycat_bridge_core::ProcessLauncher;
 use alleycat_bridge_core::session::Session;
@@ -24,7 +26,7 @@ use crate::codex_proto::{
     ApprovalsReviewer, AskForApproval, InitializeCapabilities, JsonRpcMessage, ReasoningEffort,
     RequestId, SandboxMode,
 };
-use crate::index::PiSessionRef;
+use crate::index::{PiSessionRef, ThreadIndex};
 use crate::pool::PiPool;
 
 /// Per-connection bridge state. Cheap to clone: every field is either copy
@@ -57,6 +59,60 @@ pub struct ConnectionState {
     /// existence. Embedders that run the agent somewhere else, like Litter's
     /// SSH launcher, need the cwd to be validated by that remote process.
     trust_persisted_cwd: bool,
+
+    /// Optional provider scope for this bridge's model catalog.
+    model_provider_prefixes: Arc<Vec<String>>,
+
+    /// Optional Pi `models.json` owned by the embedding controller.
+    model_catalog_path: Option<PathBuf>,
+
+    session_index_refresh: Option<SessionIndexRefresh>,
+}
+
+#[derive(Clone)]
+pub struct SessionIndexRefresh {
+    index: Arc<ThreadIndex>,
+    sessions_root: PathBuf,
+    model_provider: Option<String>,
+    last_scan: Arc<tokio::sync::Mutex<SystemTime>>,
+}
+
+impl SessionIndexRefresh {
+    pub fn new(
+        index: Arc<ThreadIndex>,
+        sessions_root: PathBuf,
+        model_provider: Option<String>,
+    ) -> Self {
+        Self {
+            index,
+            sessions_root,
+            model_provider,
+            last_scan: Arc::new(tokio::sync::Mutex::new(
+                SystemTime::now()
+                    .checked_sub(Duration::from_secs(2))
+                    .unwrap_or(SystemTime::UNIX_EPOCH),
+            )),
+        }
+    }
+
+    async fn refresh(&self) -> anyhow::Result<usize> {
+        let mut last_scan = self.last_scan.lock().await;
+        let scan_started = SystemTime::now();
+        let added = self
+            .index
+            .hydrate_modified_since(&self.sessions_root, *last_scan)
+            .await?;
+        if let Some(model_provider) = self.model_provider.as_deref() {
+            self.index
+                .inner()
+                .set_all_model_providers(model_provider)
+                .await?;
+        }
+        *last_scan = scan_started
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        Ok(added)
+    }
 }
 
 /// Negotiated client capabilities. Defaults to "no opt-outs, no experimental
@@ -123,6 +179,9 @@ impl ConnectionState {
         defaults: Arc<Mutex<ThreadDefaults>>,
         launcher: Arc<dyn ProcessLauncher>,
         trust_persisted_cwd: bool,
+        model_provider_prefixes: Arc<Vec<String>>,
+        model_catalog_path: Option<PathBuf>,
+        session_index_refresh: Option<SessionIndexRefresh>,
     ) -> Self {
         Self {
             defaults,
@@ -131,6 +190,26 @@ impl ConnectionState {
             thread_index,
             launcher,
             trust_persisted_cwd,
+            model_provider_prefixes,
+            model_catalog_path,
+            session_index_refresh,
+        }
+    }
+
+    pub fn model_provider_prefixes(&self) -> &[String] {
+        self.model_provider_prefixes.as_slice()
+    }
+
+    pub fn model_catalog_path(&self) -> Option<&std::path::Path> {
+        self.model_catalog_path.as_deref()
+    }
+
+    pub async fn refresh_session_index(&self) {
+        let Some(refresh) = &self.session_index_refresh else {
+            return;
+        };
+        if let Err(error) = refresh.refresh().await {
+            tracing::warn!(%error, "failed to refresh pi session index");
         }
     }
 
@@ -287,6 +366,19 @@ impl ConnectionState {
         Arc<Self>,
         tokio::sync::mpsc::UnboundedReceiver<alleycat_bridge_core::session::Sequenced>,
     ) {
+        Self::for_test_with_model_scope(pi_pool, thread_index, defaults, Vec::new())
+    }
+
+    #[doc(hidden)]
+    pub fn for_test_with_model_scope(
+        pi_pool: Arc<PiPool>,
+        thread_index: Arc<dyn ThreadIndexHandle>,
+        defaults: ThreadDefaults,
+        model_provider_prefixes: Vec<String>,
+    ) -> (
+        Arc<Self>,
+        tokio::sync::mpsc::UnboundedReceiver<alleycat_bridge_core::session::Sequenced>,
+    ) {
         let session = Arc::new(Session::new("pi", "test".into(), 64, 1 << 20));
         let attach = session.install_attachment(None);
         let launcher: Arc<dyn ProcessLauncher> = Arc::new(alleycat_bridge_core::LocalLauncher);
@@ -297,6 +389,9 @@ impl ConnectionState {
             Arc::new(Mutex::new(defaults)),
             launcher,
             false,
+            Arc::new(model_provider_prefixes),
+            None,
+            None,
         ));
         (state, attach.live_rx)
     }
