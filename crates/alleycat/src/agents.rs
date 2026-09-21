@@ -698,6 +698,7 @@ impl AgentManager {
         match name {
             "codex" => Some("codex"),
             "pi" => Some("pi"),
+            "omp" => Some("omp"),
             "amp" => Some("amp"),
             "opencode" => Some("opencode"),
             "claude" => Some("claude"),
@@ -2088,6 +2089,7 @@ mod tests {
 
     #[test]
     fn omp_routes_independently_from_pi() {
+        assert_eq!(AgentManager::agent_id("omp"), Some("omp"));
         assert_eq!(agent_kind_from_str("omp"), Some(AgentKind::Omp));
         assert_eq!(agent_kind_str(AgentKind::Omp), "omp");
         let mut config = crate::config::AgentsConfig::default();

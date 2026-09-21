@@ -3,7 +3,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command as StdCommand;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alleycat_bridge_core::{LaunchEnvironment, LaunchEnvironmentResolver};
 use rand::RngCore;
@@ -81,9 +81,12 @@ impl OpencodeRuntime {
         if let Some(token) = explicit_auth_token.as_deref() {
             command.arg(format!("--auth-token={token}"));
         }
-        let child = command.spawn()?;
+        let mut child = command.spawn()?;
         let base_url = format!("http://127.0.0.1:{port}");
-        wait_until_healthy(&base_url, READINESS_TIMEOUT).await?;
+        if let Err(error) = wait_until_healthy(&base_url, READINESS_TIMEOUT).await {
+            let _ = tokio::time::timeout(Duration::from_secs(2), child.kill()).await;
+            return Err(error);
+        }
         Ok(Self {
             base_url,
             auth_token,
@@ -93,6 +96,7 @@ impl OpencodeRuntime {
 }
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+const READINESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Poll `GET {base_url}/global/health` until it returns `{healthy:true}` or
@@ -101,22 +105,30 @@ const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 async fn wait_until_healthy(base_url: &str, timeout: Duration) -> anyhow::Result<()> {
     let client = reqwest::Client::new();
     let url = format!("{}/global/health", base_url.trim_end_matches('/'));
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(resp) = client.get(&url).send().await
-            && resp.status().is_success()
-            && let Ok(body) = resp.json::<serde_json::Value>().await
-            && body.get("healthy").and_then(serde_json::Value::as_bool) == Some(true)
-        {
-            return Ok(());
+    // Include connecting and reading the response body in the readiness budget.
+    // A backend can accept HTTP before it is ready to answer; checking the
+    // deadline only between requests leaves the daemon's lazy OnceCell wedged.
+    tokio::time::timeout(timeout, async {
+        loop {
+            let healthy = tokio::time::timeout(READINESS_REQUEST_TIMEOUT, async {
+                if let Ok(resp) = client.get(&url).send().await
+                    && resp.status().is_success()
+                    && let Ok(body) = resp.json::<serde_json::Value>().await
+                {
+                    return body.get("healthy").and_then(serde_json::Value::as_bool) == Some(true);
+                }
+                false
+            })
+            .await
+            .unwrap_or(false);
+            if healthy {
+                return;
+            }
+            tokio::time::sleep(READINESS_POLL_INTERVAL).await;
         }
-        if Instant::now() >= deadline {
-            return Err(anyhow::anyhow!(
-                "opencode did not report healthy at {url} within {timeout:?}"
-            ));
-        }
-        tokio::time::sleep(READINESS_POLL_INTERVAL).await;
-    }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("opencode did not report healthy at {url} within {timeout:?}"))
 }
 
 fn pick_port() -> anyhow::Result<u16> {
@@ -190,6 +202,71 @@ fn random_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn readiness_deadline_covers_silent_http_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_until_healthy(&url, Duration::from_millis(50)),
+        )
+        .await
+        .expect("readiness must not hang after HTTP accepts the connection");
+        assert!(result.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_deadline_covers_incomplete_http_body() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{")
+                .await
+                .unwrap();
+            std::future::pending::<()>().await;
+        });
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_until_healthy(&url, Duration::from_millis(50)),
+        )
+        .await
+        .expect("readiness must not hang reading an incomplete HTTP body");
+        assert!(result.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_retries_after_a_stalled_startup_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (_first, _) = listener.accept().await.unwrap();
+            let (mut second, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            second.read(&mut request).await.unwrap();
+            let body = br#"{"healthy":true}"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            second.write_all(header.as_bytes()).await.unwrap();
+            second.write_all(body).await.unwrap();
+        });
+        wait_until_healthy(&url, Duration::from_secs(3))
+            .await
+            .expect("a fresh health connection must succeed within the original total budget");
+        server.await.unwrap();
+    }
 
     #[test]
     fn external_constructor_stores_fields_and_spawns_no_child() {
