@@ -61,12 +61,12 @@ pub fn require_ok(resp: &Response) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Make sure a daemon of *this* binary's version is running and reachable
+/// Make sure a daemon at least as new as this binary is running and reachable
 /// on the IPC socket. Handles every state the user might be in:
 ///
 /// - no daemon at all              → spawn detached
-/// - daemon up, version matches    → no-op
-/// - daemon up, version mismatch   → gracefully restart onto current_exe
+/// - daemon up, version matches or is newer → no-op
+/// - daemon up, older version      → gracefully restart onto current_exe
 /// - daemon up, version unknown    → assume stale, restart
 /// - autostart installed but wedged (launchd throttle, stale plist path) →
 ///   fall through to manual spawn
@@ -90,7 +90,7 @@ pub async fn ensure_current_daemon() -> anyhow::Result<()> {
             Ok(status) => {
                 let cli_version = crate::binary_version();
                 let daemon_version = status.version.as_deref().unwrap_or("<unknown>");
-                if daemon_version == cli_version {
+                if daemon_is_current_or_newer(daemon_version, cli_version) {
                     None
                 } else {
                     Some(daemon_version.to_string())
@@ -111,6 +111,19 @@ pub async fn ensure_current_daemon() -> anyhow::Result<()> {
         cur = crate::binary_version()
     );
     restart_daemon().await
+}
+
+/// An older cached CLI must not replace a newer daemon during pairing or upgrade.
+/// Build metadata does not change SemVer precedence; unknown legacy versions
+/// keep the existing repair behavior.
+fn daemon_is_current_or_newer(daemon: &str, cli: &str) -> bool {
+    if daemon == cli {
+        return true;
+    }
+    match (semver::Version::parse(daemon), semver::Version::parse(cli)) {
+        (Ok(daemon), Ok(cli)) => !daemon.cmp_precedence(&cli).is_lt(),
+        _ => false,
+    }
 }
 
 /// Stop any running daemon and start a fresh one from `current_exe`.
@@ -228,5 +241,32 @@ where
             return Err(anyhow!("timed out waiting for daemon state"));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::daemon_is_current_or_newer;
+
+    #[test]
+    fn cached_cli_preserves_equal_and_newer_daemons() {
+        for (daemon, cli) in [
+            ("0.3.10", "0.3.9"),
+            ("0.3.10", "0.3.10"),
+            ("1.0.0", "0.99.99"),
+            ("0.4.0-rc.1", "0.3.10"),
+            ("0.3.10", "0.3.10-rc.2"),
+            ("0.3.10-rc.10", "0.3.10-rc.2"),
+            ("0.3.10+build.1", "0.3.10+build.2"),
+        ] {
+            assert!(daemon_is_current_or_newer(daemon, cli), "{daemon} vs {cli}");
+        }
+    }
+
+    #[test]
+    fn newer_cli_still_upgrades_older_or_unknown_daemons() {
+        for daemon in ["0.3.9", "0.3.10-rc.2", "<unknown>", "legacy", ""] {
+            assert!(!daemon_is_current_or_newer(daemon, "0.3.10"), "{daemon}");
+        }
     }
 }
