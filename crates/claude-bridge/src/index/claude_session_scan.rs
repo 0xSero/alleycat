@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaudeSessionInfo {
@@ -123,11 +124,14 @@ async fn build_session_info(path: &Path) -> Option<ClaudeSessionInfo> {
         })
         .unwrap_or(modified);
 
-    let text = fs::read_to_string(path).await.ok()?;
+    let file = fs::File::open(path).await.ok()?;
+    let mut lines = BufReader::new(file).lines();
     let mut cwd = String::new();
     let mut first_message = String::new();
     let mut first_message_ts: Option<DateTime<Utc>> = None;
-    for line in text.lines() {
+    // History after the first message cannot affect these summary fields.
+    // Stop reading it as well as parsing it; transcripts can be very large.
+    while let Some(line) = lines.next_line().await.ok()? {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -188,7 +192,7 @@ async fn build_session_info(path: &Path) -> Option<ClaudeSessionInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Seek, SeekFrom, Write};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -217,6 +221,33 @@ mod tests {
         assert_eq!(sessions[0].session_id, "abc-123");
         assert_eq!(sessions[0].cwd, "/private/tmp");
         assert_eq!(sessions[0].first_message, "hello world");
+    }
+
+    #[tokio::test]
+    async fn stops_before_large_invalid_tail_and_preserves_summary_fields() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("large-session.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "not json").unwrap();
+        writeln!(file, r#"{{"type":"system","cwd":"/work/project"}}"#).unwrap();
+        writeln!(
+            file,
+            "{}",
+            r#"{"type":"user","message":{"content":[{"type":"image"},{"type":"text","text":"first line\nsecond line"}]},"timestamp":"2026-04-27T10:00:00Z"}"#
+        )
+        .unwrap();
+        // Sparse history keeps the fixture cheap while catching any full-file
+        // read: the unread tail is both large and invalid UTF-8.
+        file.seek(SeekFrom::Start(64 * 1024 * 1024)).unwrap();
+        file.write_all(&[0xff, 0xfe]).unwrap();
+        drop(file);
+
+        let summary = build_session_info(&path).await.unwrap();
+        assert_eq!(summary.session_id, "large-session");
+        assert_eq!(summary.cwd, "/work/project");
+        assert_eq!(summary.first_message, "first line");
+        assert_eq!(summary.created.to_rfc3339(), "2026-04-27T10:00:00+00:00");
+        assert_eq!(summary.path, path);
     }
 
     #[tokio::test]
