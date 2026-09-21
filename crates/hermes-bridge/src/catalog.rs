@@ -9,13 +9,19 @@ use tokio::io::AsyncReadExt;
 // pricing/featured decoration. Export only identifiers; native provider rows may
 // contain endpoint/configuration metadata.
 const INVENTORY_SCRIPT: &str = r#"
-import contextlib, json, logging, os, threading, time
+import contextlib, inspect, json, logging, os, threading, time
 logging.disable(logging.CRITICAL)
 with open(os.devnull, 'w') as sink, contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
     from hermes_cli.env_loader import load_hermes_dotenv
     load_hermes_dotenv()
     from hermes_cli.inventory import build_models_payload, load_picker_context
-    payload = build_models_payload(load_picker_context())
+    # Match the native GUI read path: cached catalogs refresh in the background,
+    # and offline saved endpoints must not block unrelated provider rows.
+    options = dict(non_blocking_catalogs=True, probe_custom_providers=False,
+                   probe_current_custom_provider=True)
+    parameters = inspect.signature(build_models_payload).parameters
+    options = {key: value for key, value in options.items() if key in parameters}
+    payload = build_models_payload(load_picker_context(), **options)
     # Native stale-while-revalidate workers are daemons. Let healthy refreshes
     # persist before this short-lived interpreter exits; failures retry next open.
     refresh_deadline = time.monotonic() + 5
@@ -117,6 +123,58 @@ mod tests {
                 .to_string()
                 .contains("timed out")
         );
+    }
+
+    #[test]
+    fn native_gui_options_preserve_custom_routes_and_support_older_signatures() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("hermes_cli");
+        std::fs::create_dir(&package).unwrap();
+        std::fs::write(package.join("__init__.py"), "").unwrap();
+        std::fs::write(
+            package.join("env_loader.py"),
+            "def load_hermes_dotenv(): pass\n",
+        )
+        .unwrap();
+        let payload = serde_json::json!({
+            "provider": "custom:local", "model": "latest-local-model",
+            "providers": [{"slug": "custom:local", "authenticated": true,
+                "models": ["latest-local-model", "custom/model-id"],
+                "endpoint": "must-not-be-exported"}]
+        });
+        let definitions = [
+            "def build_models_payload(ctx, *, non_blocking_catalogs=False, probe_custom_providers=True, probe_current_custom_provider=False):\n    assert non_blocking_catalogs is True\n    assert probe_custom_providers is False\n    assert probe_current_custom_provider is True\n",
+            "def build_models_payload(ctx):\n",
+        ];
+        for definition in definitions {
+            std::fs::write(
+                package.join("inventory.py"),
+                format!(
+                    "import json\ndef load_picker_context(): return 'native-context'\n{definition}    assert ctx == 'native-context'\n    return json.loads({:?})\n",
+                    payload.to_string()
+                ),
+            )
+            .unwrap();
+            let output = std::process::Command::new("python3")
+                .args(["-B", "-c", INVENTORY_SCRIPT])
+                .env("PYTHONPATH", dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let actual: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(actual["provider"], payload["provider"]);
+            assert_eq!(actual["model"], payload["model"]);
+            assert_eq!(
+                actual["providers"][0]["models"],
+                payload["providers"][0]["models"]
+            );
+            assert_eq!(actual["providers"][0]["authenticated"], true);
+            assert!(actual["providers"][0].get("endpoint").is_none());
+        }
     }
 
     #[tokio::test]
