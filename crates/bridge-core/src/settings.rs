@@ -7,6 +7,10 @@ use std::{
     path::{Path, PathBuf},
     sync::Mutex,
 };
+#[path = "settings_schema.rs"]
+mod public_schema;
+pub use public_schema::{append_claude_declared_settings, append_droid_declared_settings};
+
 static WRITES: Mutex<()> = Mutex::new(());
 
 pub fn sensitive(key: &str) -> bool {

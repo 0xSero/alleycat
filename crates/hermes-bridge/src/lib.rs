@@ -17,6 +17,7 @@
 
 mod api_client;
 mod bridge;
+mod catalog;
 mod cli_adapter;
 mod config;
 mod index;

@@ -21,17 +21,20 @@ pub async fn handle_config_read(
     _: &Path,
     _: p::ConfigReadParams,
 ) -> Result<p::ConfigReadResponse> {
-    if state.trust_persisted_cwd() {
-        return settings::remote_read(
+    let mut response = if state.trust_persisted_cwd() {
+        settings::remote_read(
             state
                 .launcher()
                 .ok_or_else(|| anyhow::anyhow!("remote launcher unavailable"))?
                 .as_ref(),
             "claude",
         )
-        .await;
-    }
-    settings::read_response(&path()?)
+        .await?
+    } else {
+        settings::read_response(&path()?)?
+    };
+    settings::append_claude_declared_settings(&mut response).await;
+    Ok(response)
 }
 pub async fn handle_config_value_write(
     state: &Arc<ConnectionState>,

@@ -226,8 +226,10 @@ impl Bridge for DroidBridge {
             "config/read" => {
                 let path = alleycat_bridge_core::settings::home_path(".factory/settings.json")
                     .map_err(|e| internal(e.to_string()))?;
-                ok(alleycat_bridge_core::settings::read_response(&path)
-                    .map_err(|e| internal(e.to_string()))?)
+                let mut response = alleycat_bridge_core::settings::read_response(&path)
+                    .map_err(|e| internal(e.to_string()))?;
+                alleycat_bridge_core::settings::append_droid_declared_settings(&mut response).await;
+                ok(response)
             }
             "config/value/write" => {
                 let typed: p::ConfigValueWriteParams = decode(params)?;
@@ -433,19 +435,44 @@ impl Bridge for DroidBridge {
 
 impl DroidBridge {
     async fn refresh_models(&self) -> Result<Vec<p::Model>, JsonRpcError> {
-        let models = crate::models::discover(self.launcher.as_ref(), &self.droid_bin).await.map_err(internal_err)?;
+        let models = crate::models::discover(self.launcher.as_ref(), &self.droid_bin)
+            .await
+            .map_err(internal_err)?;
         *self.model_catalog.lock().await = models.clone();
         Ok(models)
     }
 
-    async fn native_effort(&self, model: &str, effort: p::ReasoningEffort) -> Result<String, JsonRpcError> {
-        if !self.model_catalog.lock().await.iter().any(|entry| entry.id == model) {
+    async fn native_effort(
+        &self,
+        model: &str,
+        effort: p::ReasoningEffort,
+    ) -> Result<String, JsonRpcError> {
+        if !self
+            .model_catalog
+            .lock()
+            .await
+            .iter()
+            .any(|entry| entry.id == model)
+        {
             self.refresh_models().await?;
         }
-        self.model_catalog.lock().await.iter().find(|entry| entry.id == model)
-            .and_then(|entry| entry.supported_reasoning_efforts.iter().find(|item| item.reasoning_effort == effort))
+        self.model_catalog
+            .lock()
+            .await
+            .iter()
+            .find(|entry| entry.id == model)
+            .and_then(|entry| {
+                entry
+                    .supported_reasoning_efforts
+                    .iter()
+                    .find(|item| item.reasoning_effort == effort)
+            })
             .map(|item| item.description.clone())
-            .ok_or_else(|| invalid_params(format!("Requested reasoning effort is not supported by {model}")))
+            .ok_or_else(|| {
+                invalid_params(format!(
+                    "Requested reasoning effort is not supported by {model}"
+                ))
+            })
     }
 
     async fn handle_thread_start(
@@ -478,14 +505,15 @@ impl DroidBridge {
             sandbox,
             turns: Vec::new(),
         };
-        let process = self.spawn_process(
-            &thread_id,
-            &cwd,
-            (!model.is_empty()).then(|| model.clone()),
-            &approval_policy,
-            SessionOpenMode::Initialize,
-        )
-        .await?;
+        let process = self
+            .spawn_process(
+                &thread_id,
+                &cwd,
+                (!model.is_empty()).then(|| model.clone()),
+                &approval_policy,
+                SessionOpenMode::Initialize,
+            )
+            .await?;
         apply_native_settings(&mut record, &*process.settings.lock().await);
         self.threads
             .lock()
@@ -538,17 +566,21 @@ impl DroidBridge {
             record.turns = self.transcript_turn_values(Path::new(path)).await?;
         }
         let cwd = PathBuf::from(&record.cwd);
-        let process = self.spawn_process(
-            &record.id,
-            &cwd,
-            Some(record.model.clone()),
-            &record.approval_policy,
-            SessionOpenMode::Load,
-        )
-        .await?;
+        let process = self
+            .spawn_process(
+                &record.id,
+                &cwd,
+                Some(record.model.clone()),
+                &record.approval_policy,
+                SessionOpenMode::Load,
+            )
+            .await?;
         apply_native_settings(&mut record, &*process.settings.lock().await);
         if let Some(model) = normalize_model(params.model.as_deref()) {
-            process.request("droid.update_session_settings", json!({"modelId":model})).await.map_err(internal_err)?;
+            process
+                .request("droid.update_session_settings", json!({"modelId":model}))
+                .await
+                .map_err(internal_err)?;
             record.model = model;
         }
         self.threads
@@ -791,7 +823,8 @@ impl DroidBridge {
             .ok_or_else(|| {
                 invalid_params(format!("thread `{}` is not loaded", params.thread_id))
             })?;
-        let target_model = normalize_model(params.model.as_deref()).unwrap_or_else(|| record.model.clone());
+        let target_model =
+            normalize_model(params.model.as_deref()).unwrap_or_else(|| record.model.clone());
         let mut settings = json!({});
         if target_model != record.model {
             settings["modelId"] = json!(target_model);
@@ -800,10 +833,15 @@ impl DroidBridge {
             settings["reasoningEffort"] = json!(self.native_effort(&target_model, effort).await?);
         }
         if !settings.as_object().unwrap().is_empty() {
-            process.request("droid.update_session_settings", settings).await.map_err(internal_err)?;
+            process
+                .request("droid.update_session_settings", settings)
+                .await
+                .map_err(internal_err)?;
             if let Some(stored) = self.threads.lock().await.get_mut(&params.thread_id) {
                 stored.model = target_model;
-                if params.effort.is_some() { stored.effort = params.effort; }
+                if params.effort.is_some() {
+                    stored.effort = params.effort;
+                }
             }
         }
         let prompt = input_to_text(&params.input);
@@ -1217,7 +1255,9 @@ fn apply_native_settings(record: &mut ThreadRecord, settings: &Value) {
     if let Some(model) = settings["modelId"].as_str() {
         record.model = model.to_owned();
     }
-    record.effort = settings["reasoningEffort"].as_str().and_then(crate::models::effort);
+    record.effort = settings["reasoningEffort"]
+        .as_str()
+        .and_then(crate::models::effort);
 }
 
 fn thread_attach_response(record: &ThreadRecord, model: &str) -> Value {

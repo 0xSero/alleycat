@@ -53,7 +53,7 @@ use crate::config::HermesBridgeConfig;
 use crate::index::{HermesBinding, ThreadIndex};
 use crate::state::{ActiveTurn, TurnState};
 
-fn gateway_model_ids(catalog: &Value) -> anyhow::Result<Vec<String>> {
+pub(crate) fn gateway_model_ids(catalog: &Value) -> anyhow::Result<Vec<String>> {
     let mut seen = std::collections::HashSet::new();
     let mut ids = Vec::new();
     if let Some(providers) = catalog["providers"].as_array() {
@@ -844,13 +844,22 @@ impl HermesBridge {
 
 impl HermesBridge {
     async fn handle_model_list(&self, _ctx: &Conn, _params: Value) -> Result<Value, JsonRpcError> {
-        let ids = match &self.config.mode {
-            crate::config::HermesMode::Cli { .. } => return Err(rpc_error(-32603,
-                "Hermes CLI does not expose a model catalog; connect the Hermes gateway API to discover configured models")),
-            crate::config::HermesMode::Api { .. } | crate::config::HermesMode::Auto { .. } => gateway_model_ids(
-                &self.api_client.models().await.map_err(|error| rpc_error(-32603, error.to_string()))?,
-            ).map_err(|error| rpc_error(-32603, error.to_string()))?,
-        };
+        let catalog = match &self.config.mode {
+            crate::config::HermesMode::Cli { bin } => crate::catalog::discover(bin.as_deref()).await,
+            crate::config::HermesMode::Api { .. } => self.api_client.models().await,
+            crate::config::HermesMode::Auto { bin, .. } => {
+                // Match turn routing: a healthy gateway owns its catalog; a
+                // missing gateway uses the installed CLI's native inventory.
+                let gateway = tokio::time::timeout(Duration::from_secs(3), self.api_client.health())
+                    .await.ok().and_then(Result::ok).is_some_and(|h| h.status == "ok");
+                if gateway {
+                    self.api_client.models().await
+                } else {
+                    crate::catalog::discover(bin.as_deref()).await
+                }
+            }
+        }.map_err(|error| rpc_error(-32603, error.to_string()))?;
+        let ids = gateway_model_ids(&catalog).map_err(|error| rpc_error(-32603, error.to_string()))?;
         to_value(ModelListResponse {
             data: ids
                 .into_iter()
@@ -1749,8 +1758,8 @@ mod model_catalog_tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         for mode in [
-            crate::config::HermesMode::Auto { api_base: endpoint, bin: None },
-            crate::config::HermesMode::Cli { bin: None },
+            crate::config::HermesMode::Auto { api_base: endpoint, bin: Some("/missing-hermes-test".into()) },
+            crate::config::HermesMode::Cli { bin: Some("/missing-hermes-test".into()) },
         ] {
             let bridge = HermesBridge::new(HermesBridgeConfig {
                 mode, state_dir: Some(dir.path().to_string_lossy().into_owned()),

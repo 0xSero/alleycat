@@ -43,8 +43,24 @@ fn test_acp_to_codex_initialize_result() {
     assert!(codex_result.is_ok());
 
     let codex_result = codex_result.unwrap();
-    assert_eq!(codex_result["serverInfo"]["name"], "TestAgent");
-    assert_eq!(codex_result["serverInfo"]["version"], "2.0.0");
+    let response: alleycat_codex_proto::InitializeResponse =
+        serde_json::from_value(codex_result).expect("current Codex initialize response");
+    assert_eq!(
+        response.user_agent,
+        format!(
+            "alleycat-acp-bridge/{} (TestAgent 2.0.0)",
+            env!("CARGO_PKG_VERSION")
+        )
+    );
+    assert!(std::path::Path::new(&response.codex_home).is_absolute());
+    assert_eq!(
+        response.codex_home,
+        std::env::var("HOME")
+            .map(|home| format!("{home}/.alleycat-acp-bridge"))
+            .unwrap_or_else(|_| "/tmp/alleycat-acp-bridge".into())
+    );
+    assert_eq!(response.platform_family, std::env::consts::FAMILY);
+    assert_eq!(response.platform_os, std::env::consts::OS);
 }
 
 #[test]
