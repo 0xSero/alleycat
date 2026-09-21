@@ -93,6 +93,36 @@ fn parse_json_schema(bytes: &[u8]) -> Result<Value> {
     Ok(document)
 }
 
+/// Read a fixed official metadata document. Callers must supply a constant URL,
+/// never a config-controlled location. Fetch failures retain configured values.
+pub async fn append_published_settings(
+    response: &mut p::ConfigReadResponse,
+    url: &'static str,
+    parser: fn(&[u8]) -> Result<Value>,
+) {
+    static CACHE: OnceLock<
+        tokio::sync::Mutex<std::collections::BTreeMap<&'static str, SchemaCache>>,
+    > = OnceLock::new();
+    let Some(schema) = CACHE
+        .get_or_init(Default::default)
+        .lock()
+        .await
+        .entry(url)
+        .or_default()
+        .read(url, parser)
+        .await
+    else {
+        return;
+    };
+    append_schema(
+        response,
+        &schema,
+        &format!(
+            "Published native settings reference ({url}; may lag installed CLI; unset override, not an effective default)"
+        ),
+    );
+}
+
 pub async fn append_claude_declared_settings(response: &mut p::ConfigReadResponse) {
     static CACHE: OnceLock<tokio::sync::Mutex<SchemaCache>> = OnceLock::new();
     let Some(schema) = CACHE
@@ -224,6 +254,7 @@ fn read_only_reason(node: &Value) -> Option<&'static str> {
 struct Field {
     key: String,
     choices: Vec<String>,
+    kind: &'static str,
     reason: Option<&'static str>,
 }
 fn fields(
@@ -275,6 +306,21 @@ fn fields(
         out.push(Field {
             key: prefix.into(),
             choices,
+            kind: match node["type"].as_str().or_else(|| {
+                node["type"].as_array().and_then(|types| {
+                    let mut types = types
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|kind| *kind != "null");
+                    let kind = types.next()?;
+                    types.next().is_none().then_some(kind)
+                })
+            }) {
+                Some("boolean") => "boolean",
+                Some("string") => "string",
+                Some("number" | "integer") => "number",
+                _ => "json",
+            },
             reason,
         });
     }
@@ -304,7 +350,7 @@ fn append_schema(response: &mut p::ConfigReadResponse, schema: &Value, source: &
         if configured {
             continue;
         }
-        rows.push(json!({"key":field.key,"label":field.key,"valueJson":"null","valueKind":"json",
+        rows.push(json!({"key":field.key,"label":field.key,"valueJson":"null","valueKind":field.kind,
             "choices":field.choices,"scope":if field.reason.is_some(){"native source is read-only here"}else{"user override (unset)"},
             "source":source,"writable":field.reason.is_none(),"readOnlyReason":field.reason}));
     }
@@ -313,6 +359,36 @@ fn append_schema(response: &mut p::ConfigReadResponse, schema: &Value, source: &
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn declared_primitives_keep_null_values_and_explicit_choices() {
+        let mut response = super::super::response(json!({}), "native", true, None);
+        append_schema(
+            &mut response,
+            &json!({"properties":{
+                "flag":{"type":"boolean","default":false},
+                "name":{"type":["string","null"],"default":"never-use"},
+                "mode":{"type":"string","enum":["first","second"]},
+                "number":{"type":"integer","default":42}
+            }}),
+            "official fixture",
+        );
+        let rows = response.config["_litterSettings"].as_array().unwrap();
+        for (key, kind) in [
+            ("flag", "boolean"),
+            ("name", "string"),
+            ("mode", "string"),
+            ("number", "number"),
+        ] {
+            let row = rows.iter().find(|r| r["key"] == key).unwrap();
+            assert_eq!(row["valueJson"], "null");
+            assert_eq!(row["valueKind"], kind);
+        }
+        assert_eq!(
+            rows.iter().find(|r| r["key"] == "mode").unwrap()["choices"],
+            json!(["first", "second"])
+        );
+        assert!(!response.config.to_string().contains("never-use"));
+    }
     #[test]
     fn public_schema_preserves_values_and_declares_unset_scoped_fields() {
         let mut response = super::super::response(

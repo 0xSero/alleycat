@@ -18,6 +18,8 @@ back the value from the selected runtime. Unsupported operations return errors.
 | Hermes CLI | Installed `hermes_cli.config.load_config_readonly()` effective defaults and overrides. `$native` edits only the user override file, not a copy of every default. Managed configuration is read-only. |
 | Hermes gateway | Read-only when the selected gateway has no settings API. No unrelated local file is presented as gateway settings. |
 | OpenCode | Native `/config` GET/PATCH. |
+| Devin | Native user `~/.config/devin/config.json` (JSON comments supported) and separate `mcp_config.json`. Configured fields, full native JSON editors, and unset fields from the [official configuration reference](https://docs.devin.ai/cli/reference/configuration/config-file.md). ACP session settings remain separately read-only. |
+| Grok | Native user `$GROK_HOME/config.toml` (default `~/.grok/config.toml`), configured fields/full JSON editor, and unset fields from the [official TOML reference](https://docs.x.ai/build/settings/reference.md). Separate `sandbox.toml` profile JSON editing and read-only managed-source rows are included. Requirements pins are read-only and writes touching pinned settings are rejected. ACP session settings remain separately read-only. |
 | ACP | Native session `configOptions`, current values and choices; read-only because there is no global settings setter. |
 
 Pi package discovery follows the configured executable on the selected host;
@@ -53,3 +55,18 @@ personal/enterprise boundary is missing or the metadata format changes,
 discovery falls back to the last good metadata and configured native fields.
 Factory's separate OpenAPI managed-settings schema is not used to advertise
 writable user settings.
+
+Devin/Grok public references use the same bounded cache as other public metadata.
+Only documented option/section identifiers are discovered; examples and default
+values are never populated as current settings. Grok environment-variable rows
+and its separate `sandbox.toml` profile schema are not treated as `config.toml`
+keys. Native JSON/TOML writes preserve unknown fields, value types, symlinks and
+hidden credential values, but normalize formatting and omit source comments.
+Invalid input files fail closed; they are never replaced with empty defaults.
+
+Published primitive types and closed string choices select the existing typed
+mobile controls, while the current value remains `null` for an unset override.
+Editors label it Unset and require an explicit edit before saving; document
+examples/defaults never become persisted values. TOML date/time values have no
+lossless JSON representation here: files containing them require the native
+editor and fail before any write, preserving the original contents.

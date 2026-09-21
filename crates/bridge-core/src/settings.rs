@@ -9,7 +9,9 @@ use std::{
 };
 #[path = "settings_schema.rs"]
 mod public_schema;
-pub use public_schema::{append_claude_declared_settings, append_droid_declared_settings};
+pub use public_schema::{
+    append_claude_declared_settings, append_droid_declared_settings, append_published_settings,
+};
 
 static WRITES: Mutex<()> = Mutex::new(());
 
@@ -60,13 +62,91 @@ pub fn read(path: &Path) -> Result<Value> {
         Some("yaml" | "yml")
     ) {
         serde_yaml::from_str(&text)?
+    } else if path.extension().and_then(|s| s.to_str()) == Some("toml") {
+        let native: toml::Value =
+            toml::from_str(&text).map_err(|_| anyhow::anyhow!("invalid native TOML settings"))?;
+        ensure_json_toml(&native)?;
+        serde_json::to_value(native)?
     } else {
-        serde_json::from_str(&text)?
+        serde_json::from_str(&strip_json_comments(&text)?)
+            .map_err(|_| anyhow::anyhow!("invalid native JSON settings"))?
     };
     if !value.is_object() {
         bail!("native settings must be an object");
     }
     Ok(value)
+}
+// JSON has no date/time type. Refuse these documents rather than silently
+// changing an unknown native TOML datetime into a string or private serde table.
+fn ensure_json_toml(value: &toml::Value) -> Result<()> {
+    match value {
+        toml::Value::Datetime(_) => {
+            bail!("native TOML date/time values require the native configuration editor")
+        }
+        toml::Value::Float(value) if !value.is_finite() => {
+            bail!("non-finite native TOML numbers require the native configuration editor")
+        }
+        toml::Value::Array(values) => {
+            for value in values {
+                ensure_json_toml(value)?;
+            }
+        }
+        toml::Value::Table(values) => {
+            for value in values.values() {
+                ensure_json_toml(value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+// Native Devin configuration permits JSON comments. Preserve string contents,
+// including URLs and escaped quotes; malformed block comments fail closed.
+fn strip_json_comments(text: &str) -> Result<String> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut bytes = text.bytes().peekable();
+    let mut quoted = false;
+    let mut escaped = false;
+    while let Some(c) = bytes.next() {
+        if quoted {
+            out.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                quoted = false;
+            }
+        } else if c == b'"' {
+            quoted = true;
+            out.push(c);
+        } else if c == b'/' && bytes.peek() == Some(&b'/') {
+            bytes.next();
+            for c in bytes.by_ref() {
+                if c == b'\n' {
+                    break;
+                }
+            }
+            out.push(b'\n');
+        } else if c == b'/' && bytes.peek() == Some(&b'*') {
+            bytes.next();
+            let mut closed = false;
+            while let Some(c) = bytes.next() {
+                if c == b'*' && bytes.peek() == Some(&b'/') {
+                    bytes.next();
+                    closed = true;
+                    break;
+                }
+            }
+            if !closed {
+                bail!("unterminated native JSON comment");
+            }
+            out.push(b' ');
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(String::from_utf8(out)?)
 }
 pub fn response(
     config: Value,
@@ -137,7 +217,14 @@ pub fn set(root: &mut Value, key: &str, value: Value, merge: p::MergeStrategy) -
             replace_visible(target, value)?;
         }
     } else {
-        let (head, tail) = key.split_once('.').unwrap();
+        // Native provider/model IDs may contain dots (for example grok-4.6).
+        let (head, tail) = key
+            .rmatch_indices('.')
+            .find_map(|(i, _)| {
+                map.contains_key(&key[..i])
+                    .then_some((&key[..i], &key[i + 1..]))
+            })
+            .unwrap_or_else(|| key.split_once('.').unwrap());
         set(
             map.entry(head).or_insert_with(|| json!({})),
             tail,
@@ -188,8 +275,11 @@ fn write_mode(
         Ok(metadata) if metadata.file_type().is_symlink() => Some(path.canonicalize()?),
         _ => None,
     };
+    // Format follows the native filename even when a dotfiles symlink target
+    // has no extension. Persistence follows the target without replacing the link.
+    let source_path = path;
     let path = resolved.as_deref().unwrap_or(path);
-    let mut value = read(path)?;
+    let mut value = read(source_path)?;
     for edit in params.edits {
         if edit.key_path == "$native" {
             if !edit.value.is_object() || sanitize(&edit.value) != edit.value {
@@ -208,10 +298,14 @@ fn write_mode(
         }
     }
     let bytes = if matches!(
-        path.extension().and_then(|s| s.to_str()),
+        source_path.extension().and_then(|s| s.to_str()),
         Some("yaml" | "yml")
     ) {
         serde_yaml::to_string(&value)?.into_bytes()
+    } else if source_path.extension().and_then(|s| s.to_str()) == Some("toml") {
+        toml::to_string_pretty(&value)
+            .map_err(|_| anyhow::anyhow!("settings contain a value unsupported by TOML"))?
+            .into_bytes()
     } else {
         serde_json::to_vec_pretty(&value)?
     };
@@ -225,7 +319,7 @@ fn write_mode(
     file.write_all(&bytes)?;
     file.as_file().sync_all()?;
     file.persist(path).map_err(|e| e.error)?;
-    if read(path)? != value {
+    if read(source_path)? != value {
         bail!("native settings read-back did not match write");
     }
     Ok(p::ConfigWriteResponse {
@@ -684,5 +778,118 @@ mod remote_tests {
                 persisted
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod native_format_tests {
+    use super::*;
+    #[test]
+    fn unknown_toml_datetime_is_rejected_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        for value in [
+            "1979-05-27T07:32:00Z",
+            "1979-05-27",
+            "07:32:00",
+            "[1979-05-27T07:32:00-07:00]",
+        ] {
+            let path = dir.path().join("config.toml");
+            let text = format!("flag=false\n[unknown]\ndate={value}\n");
+            std::fs::write(&path, &text).unwrap();
+            let params = serde_json::from_value(
+                json!({"edits":[{"keyPath":"flag","value":true,"mergeStrategy":"replace"}]}),
+            )
+            .unwrap();
+            assert!(
+                write(&path, params)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("date/time")
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+    #[test]
+    fn malformed_native_files_fail_closed_and_toml_types_survive() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, text) in [
+            ("config.json", "{ /* missing end"),
+            ("config.toml", "[invalid"),
+        ] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, text).unwrap();
+            let params = serde_json::from_value(
+                json!({"edits":[{"keyPath":"flag","value":true,"mergeStrategy":"replace"}]}),
+            )
+            .unwrap();
+            assert!(write(&path, params).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        }
+        let path = dir.path().join("types.toml");
+        std::fs::write(
+            &path,
+            "future_unknown = [1, 2]\nflag = false\nname = 'old'\n",
+        )
+        .unwrap();
+        let params=serde_json::from_value(json!({"edits":[{"keyPath":"flag","value":true,"mergeStrategy":"replace"},{"keyPath":"name","value":"new","mergeStrategy":"replace"},{"keyPath":"number","value":42,"mergeStrategy":"replace"}]})).unwrap();
+        write(&path, params).unwrap();
+        assert_eq!(
+            read(&path).unwrap(),
+            json!({"future_unknown":[1,2],"flag":true,"name":"new","number":42})
+        );
+    }
+    #[test]
+    fn comments_preserve_escaped_strings_and_toml_symlinks_preserve_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("config.json");
+        std::fs::write(
+            &json_path,
+            r#"{/* note */"url":"https://host/a//b","quote":"a\"/*b*/",// tail
+            "flag":true}"#,
+        )
+        .unwrap();
+        let data = read(&json_path).unwrap();
+        assert_eq!(data["url"], "https://host/a//b");
+        assert_eq!(data["quote"], "a\"/*b*/");
+        std::fs::write(&json_path, "{/* unfinished").unwrap();
+        assert!(read(&json_path).is_err());
+        let target = dir.path().join("native-dotfile");
+        std::fs::write(
+            &target,
+            "[model.'grok-4.6']\nname='old'\napi_key='PRIVATE'\n",
+        )
+        .unwrap();
+        let path = dir.path().join("config.toml");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        #[cfg(not(unix))]
+        std::fs::copy(&target, &path).unwrap();
+        let params = serde_json::from_value(json!({"edits":[{"keyPath":"$native", "value":{"model":{"grok-4.6":{"name":"new"}}},"mergeStrategy":"replace"}]})).unwrap();
+        write(&path, params).unwrap();
+        assert_eq!(
+            read(&path).unwrap()["model"]["grok-4.6"]["api_key"],
+            "PRIVATE"
+        );
+        #[cfg(unix)]
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !read_response(&path)
+                .unwrap()
+                .config
+                .to_string()
+                .contains("PRIVATE")
+        );
+        let original = std::fs::read(&path).unwrap();
+        let params = serde_json::from_value(
+            json!({"edits":[{"keyPath":"ui.theme", "value":null,"mergeStrategy":"replace"}]}),
+        )
+        .unwrap();
+        assert!(write(&path, params).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 }

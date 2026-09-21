@@ -24,6 +24,7 @@ futures = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-std", "process", "time"] }
 tracing = { workspace = true }

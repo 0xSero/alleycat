@@ -193,6 +193,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -258,6 +259,7 @@ version = "0.1.0"
 dependencies = [
  "alleycat-acp-bridge",
  "alleycat-bridge-core",
+ "alleycat-codex-proto",
  "anyhow",
  "async-trait",
  "rusqlite",
@@ -292,11 +294,13 @@ version = "0.1.0"
 dependencies = [
  "alleycat-acp-bridge",
  "alleycat-bridge-core",
+ "alleycat-codex-proto",
  "anyhow",
  "async-trait",
  "chrono",
  "rusqlite",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
