@@ -1,6 +1,7 @@
 //! launchd user-agent install for macOS. Writes a plist under
 //! `~/Library/LaunchAgents/` and bootstraps it into `gui/$UID`. No admin.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -137,7 +138,16 @@ pub(super) fn write_plist(
             .with_context(|| format!("creating {}", parent.display()))?;
     }
 
-    let body = render_plist(exe, log_path, inherit_path, inherit_shell);
+    // Explicit service overrides must survive upgrades and `restart`, which
+    // reinstall this plist. Never copy the caller's whole environment.
+    let mut environment = read_plist_environment(plist_path)?;
+    if let Some(path) = inherit_path {
+        environment.insert("PATH".to_owned(), path.to_owned());
+    }
+    if let Some(shell) = inherit_shell {
+        environment.insert("SHELL".to_owned(), shell.to_owned());
+    }
+    let body = render_plist(exe, log_path, &environment);
     let tmp = plist_path.with_extension("plist.tmp");
     std::fs::write(&tmp, body.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, plist_path)
@@ -145,12 +155,34 @@ pub(super) fn write_plist(
     Ok(())
 }
 
-fn render_plist(
-    exe: &Path,
-    log_path: &Path,
-    inherit_path: Option<&str>,
-    inherit_shell: Option<&str>,
-) -> String {
+fn read_plist_environment(plist_path: &Path) -> anyhow::Result<BTreeMap<String, String>> {
+    if !plist_path
+        .try_exists()
+        .context("checking existing launchd plist")?
+    {
+        return Ok(BTreeMap::new());
+    }
+    // plutil handles both XML and binary native plists. Keep its output out of
+    // diagnostics: an existing service environment may contain credentials.
+    let output = Command::new("/usr/bin/plutil")
+        .args(["-convert", "json", "-o", "-"])
+        .arg(plist_path)
+        .output()
+        .context("reading existing launchd plist")?;
+    anyhow::ensure!(output.status.success(), "existing launchd plist is invalid");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|_| anyhow!("existing launchd plist is not a valid object"))?;
+    let root = value
+        .as_object()
+        .ok_or_else(|| anyhow!("existing launchd plist is not an object"))?;
+    match root.get("EnvironmentVariables") {
+        None => Ok(BTreeMap::new()),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|_| anyhow!("existing launchd environment must contain only strings")),
+    }
+}
+
+fn render_plist(exe: &Path, log_path: &Path, environment: &BTreeMap<String, String>) -> String {
     let label = service_label();
     let exe = xml_escape(&exe.to_string_lossy());
     let log = xml_escape(&log_path.to_string_lossy());
@@ -162,16 +194,11 @@ fn render_plist(
     // safe to persist and lets the launch-environment resolver choose fish,
     // zsh, bash, or sh the same way the user does.
     let mut env_entries = String::new();
-    if let Some(path) = inherit_path {
+    for (key, value) in environment {
         env_entries.push_str(&format!(
-            "        <key>PATH</key>\n        <string>{}</string>\n",
-            xml_escape(path)
-        ));
-    }
-    if let Some(shell) = inherit_shell {
-        env_entries.push_str(&format!(
-            "        <key>SHELL</key>\n        <string>{}</string>\n",
-            xml_escape(shell)
+            "        <key>{}</key>\n        <string>{}</string>\n",
+            xml_escape(key),
+            xml_escape(value)
         ));
     }
     let env_block = if env_entries.is_empty() {
@@ -274,6 +301,77 @@ mod tests {
         assert!(body.contains("<key>SHELL</key>"));
         assert!(body.contains("/opt/homebrew/bin/fish"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn reinstall_preserves_explicit_environment_and_updates_executable() {
+        let tmp = tempdir();
+        let plist = tmp.join("service.plist");
+        let log = tmp.join("daemon.log");
+        let environment = BTreeMap::from([
+            ("PATH".to_owned(), "/old/bin".to_owned()),
+            ("SHELL".to_owned(), "/bin/zsh".to_owned()),
+            (
+                "LOCAL_STUDIO_DATA_DIR".to_owned(),
+                "/Users/me/Library/Application Support/Local Studio".to_owned(),
+            ),
+            ("CUSTOM<&".to_owned(), "preserve <&> exactly".to_owned()),
+        ]);
+        std::fs::write(
+            &plist,
+            render_plist(Path::new("/old/kittylitter"), &log, &environment),
+        )
+        .unwrap();
+        // Native binary plists are supported as well as our generated XML.
+        assert!(
+            Command::new("/usr/bin/plutil")
+                .args(["-convert", "binary1"])
+                .arg(&plist)
+                .status()
+                .unwrap()
+                .success()
+        );
+        write_plist(
+            &plist,
+            Path::new("/new/kittylitter"),
+            &log,
+            Some("/new/bin"),
+            None,
+        )
+        .unwrap();
+        let mut expected = environment;
+        expected.insert("PATH".to_owned(), "/new/bin".to_owned());
+        assert_eq!(read_plist_environment(&plist).unwrap(), expected);
+        assert!(
+            std::fs::read_to_string(&plist)
+                .unwrap()
+                .contains("<string>/new/kittylitter</string>")
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn reinstall_rejects_malformed_plist_without_overwriting() {
+        let tmp = tempdir();
+        let plist = tmp.join("service.plist");
+        for contents in [
+            "not a plist",
+            r#"<?xml version="1.0"?><plist version="1.0"><dict><key>EnvironmentVariables</key><dict><key>BAD</key><integer>7</integer></dict></dict></plist>"#,
+        ] {
+            std::fs::write(&plist, contents).unwrap();
+            assert!(
+                write_plist(
+                    &plist,
+                    Path::new("/new/kittylitter"),
+                    &tmp.join("daemon.log"),
+                    Some("/bin"),
+                    None
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read_to_string(&plist).unwrap(), contents);
+        }
+        std::fs::remove_dir_all(tmp).unwrap();
     }
 
     #[test]
