@@ -2077,6 +2077,55 @@ mod local_studio_launcher_tests {
     }
 
     #[tokio::test]
+    async fn bundled_settings_discovery_runs_python_through_the_launcher() {
+        let fixture = tempfile::tempdir().unwrap();
+        let package = fixture.path().join("pi");
+        std::fs::create_dir_all(package.join("dist")).unwrap();
+        std::fs::create_dir_all(package.join("docs")).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"@earendil-works/pi-coding-agent","version":"0.84.2"}"#,
+        )
+        .unwrap();
+        let cli = package.join("dist/cli.js");
+        std::fs::write(&cli, "throw Error('metadata must not execute the CLI')").unwrap();
+        std::fs::write(
+            package.join("docs/settings.md"),
+            "# Settings\n## All Settings\n| Setting | Type | Default | Description |\n| `retry.enabled` | boolean | true | Native retry |\n",
+        ).unwrap();
+        let launcher = LocalStudioLauncher::new(
+            Arc::new(alleycat_bridge_core::LocalLauncher),
+            fixture.path().join("agent"),
+            local_studio::PiRuntimeCommand {
+                // An accidental Agent-role metadata helper must fail this test.
+                program: PathBuf::from("/bin/false"),
+                prefix_args: vec![cli.into_os_string()],
+                env: vec![],
+            },
+        );
+        let mut response = alleycat_bridge_core::settings::response(
+            serde_json::json!({"existing": 7}),
+            "fixture",
+            true,
+            None,
+        );
+        alleycat_bridge_core::settings::append_pi_declared_settings(
+            &mut response,
+            &launcher,
+            Path::new("/bin/false"),
+        )
+        .await;
+        let rows = response.config["_litterSettings"].as_array().unwrap();
+        let native = rows
+            .iter()
+            .find(|row| row["key"] == "retry.enabled")
+            .expect("Python metadata helper must retain its utility process role");
+        assert_eq!(native["valueJson"], "null");
+        assert!(native["source"].as_str().unwrap().contains("Pi 0.84.2"));
+        assert_eq!(response.config["existing"], 7);
+    }
+
+    #[tokio::test]
     async fn an_explicit_agent_dir_is_never_overridden() {
         let mut spec = alleycat_bridge_core::ProcessSpec::new("/usr/bin/pi");
         spec.role = alleycat_bridge_core::ProcessRole::Agent;

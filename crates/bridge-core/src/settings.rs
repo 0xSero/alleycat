@@ -586,6 +586,9 @@ async fn python_json(
 ) -> Result<Value> {
     use tokio::io::AsyncReadExt;
     let mut spec = crate::ProcessSpec::new("python3");
+    // Adapter launchers may replace Agent commands with their own runtime.
+    // This helper must execute Python on the selected host unchanged.
+    spec.role = crate::ProcessRole::ToolCommand;
     spec.args = vec!["-c".into(), script.into()];
     spec.args.extend(args);
     spec.stdin = crate::StdioMode::Null;
