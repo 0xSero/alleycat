@@ -1312,6 +1312,15 @@ impl ProcessLauncher for LocalStudioLauncher {
                 spec.env
                     .push((OsString::from("PI_CODING_AGENT_DIR"), agent_dir));
             }
+            // Settings discovery must inspect the same bundled Pi package even
+            // when the executable is Node and the CLI is a prefix argument.
+            if let Some(cli) = command.prefix_args.first() {
+                spec.env.retain(|(key, _)| key != "ALLEYCAT_PI_SETTINGS_CLI");
+                spec.env.push((
+                    OsString::from("ALLEYCAT_PI_SETTINGS_CLI"),
+                    cli.clone(),
+                ));
+            }
             if spec.role == alleycat_bridge_core::ProcessRole::Agent {
                 let mut args = command.prefix_args;
                 args.extend(spec.args);
@@ -2031,6 +2040,10 @@ mod local_studio_launcher_tests {
         let mut spec = alleycat_bridge_core::ProcessSpec::new("/bin/sh");
         spec.role = alleycat_bridge_core::ProcessRole::ToolCommand;
         spec.args = vec![OsString::from("-c"), OsString::from("pwd")];
+        spec.env.push((
+            OsString::from("ALLEYCAT_PI_SETTINGS_CLI"),
+            OsString::from("/different/pi/cli.js"),
+        ));
 
         let launched = launch_capturing(spec).await;
 
@@ -2053,6 +2066,13 @@ mod local_studio_launcher_tests {
         assert!(
             env_value(&launched, "ELECTRON_RUN_AS_NODE").is_none(),
             "ELECTRON_RUN_AS_NODE is an agent-only concern"
+        );
+        assert_eq!(
+            env_value(&launched, "ALLEYCAT_PI_SETTINGS_CLI"),
+            Some(std::ffi::OsStr::new(
+                "/Applications/Local Studio.app/Contents/Resources/cli.js"
+            )),
+            "metadata probes must inspect the selected bundle, not Node's package"
         );
     }
 
