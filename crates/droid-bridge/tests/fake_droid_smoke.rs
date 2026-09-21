@@ -29,6 +29,11 @@ async fn initialize_thread_start_turn_start_smoke() {
     let init = read_until_response(&mut read, 1).await;
     assert_eq!(init["result"]["userAgent"], "alleycat-droid-bridge/0.1.0");
 
+    send(&mut write, 10, "model/list", json!({})).await;
+    let catalog = read_until_response(&mut read, 10).await;
+    assert_eq!(catalog["result"]["data"].as_array().unwrap().len(), 4);
+    assert!(catalog["result"]["data"].as_array().unwrap().iter().any(|model| model["id"] == "claude-opus-5"));
+
     let cwd = tempfile::TempDir::new().unwrap();
     send(
         &mut write,
@@ -43,6 +48,8 @@ async fn initialize_thread_start_turn_start_smoke() {
         .unwrap()
         .to_string();
     assert_eq!(start["result"]["modelProvider"], "droid");
+    assert_eq!(start["result"]["model"], "gpt-5.6-sol");
+    assert_eq!(start["result"]["reasoningEffort"], "medium");
 
     send(
         &mut write,
@@ -50,7 +57,8 @@ async fn initialize_thread_start_turn_start_smoke() {
         "turn/start",
         json!({
             "threadId": thread_id,
-            "input": [{"type":"text","text":"Reply with exactly OK."}]
+            "model": "claude-opus-5", "effort": "max",
+            "input": [{"type":"text","text":"check-native-model-effort Reply with exactly OK."}]
         }),
     )
     .await;

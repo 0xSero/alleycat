@@ -28,6 +28,7 @@ pub struct OpencodeBridge {
     state: Arc<BridgeState>,
     pty: Arc<PtyState>,
     sse: SseConsumer,
+    models_with_none_variant: std::sync::RwLock<Option<std::collections::HashSet<String>>>,
 }
 
 impl OpencodeBridge {
@@ -52,6 +53,7 @@ impl OpencodeBridge {
             state: Arc::new(BridgeState::default()),
             pty: Arc::new(PtyState::new()),
             sse,
+            models_with_none_variant: std::sync::RwLock::new(None),
         })
     }
 
@@ -152,9 +154,21 @@ impl OpencodeBridge {
             "reasoningEffort": params
                 .get("reasoningEffort")
                 .cloned()
-                .unwrap_or_else(|| json!("high")),
+                .unwrap_or(Value::Null),
             "serviceTier": null,
         }))
+    }
+
+    async fn native_variant(&self, params: &Value) -> Result<Option<String>, JsonRpcError> {
+        let Some(variant) = params.get("effort").and_then(Value::as_str) else { return Ok(None) };
+        if variant != "none" { return Ok(Some(variant.to_owned())) }
+        let Some(model) = params.get("model").and_then(Value::as_str) else { return Ok(None) };
+        let needs_catalog = self.models_with_none_variant.read().unwrap().is_none();
+        if needs_catalog { self.handle_model_list().await?; }
+        // Codex uses none as its default sentinel; it is a native variant only
+        // when the selected model actually advertises that key.
+        Ok(self.models_with_none_variant.read().unwrap().as_ref()
+            .is_some_and(|models| models.contains(model)).then(|| variant.to_owned()))
     }
 
     async fn handle_turn_start(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
@@ -166,6 +180,7 @@ impl OpencodeBridge {
             .index
             .by_thread(thread_id)
             .ok_or_else(|| JsonRpcError::invalid_params(format!("unknown thread `{thread_id}`")))?;
+        let variant = self.native_variant(&params).await?;
         let input = params
             .get("input")
             .and_then(Value::as_array)
@@ -215,6 +230,9 @@ impl OpencodeBridge {
         let mut body = json!({ "parts": parts });
         if let Some((provider_id, model_id)) = model {
             body["model"] = json!({"providerID":provider_id,"modelID":model_id});
+        }
+        if let Some(variant) = variant {
+            body["variant"] = json!(variant);
         }
         // Async dispatch: opencode acks the prompt with 204 immediately and
         // streams every subsequent item over SSE. The bridge replies to codex
@@ -388,7 +406,7 @@ impl OpencodeBridge {
             "reasoningEffort": params
                 .get("reasoningEffort")
                 .cloned()
-                .unwrap_or_else(|| json!("high")),
+                .unwrap_or(Value::Null),
             "serviceTier": null
         }))
     }
@@ -772,7 +790,7 @@ impl OpencodeBridge {
                 "sandbox": {"type": "dangerFullAccess"},
                 "permissionProfile": {"type": "disabled"},
                 "activePermissionProfile": null,
-                "reasoningEffort": "high",
+                "reasoningEffort": null,
             }))
         }
     }
@@ -930,32 +948,88 @@ impl OpencodeBridge {
     }
 
     async fn handle_model_list(&self) -> Result<Value, JsonRpcError> {
-        let configured = self
-            .client
-            .get("/config/providers")
-            .await
-            .unwrap_or(json!({}));
-        let mut models = flatten_models(configured);
+        let configured = tokio::time::timeout(std::time::Duration::from_secs(10), self.client.get("/config/providers"))
+            .await.map_err(|_| JsonRpcError::internal("OpenCode catalog timed out"))?
+            .map_err(|error| JsonRpcError::internal(error.to_string()))?;
+        let models = flatten_models(configured);
         if models.is_empty() {
-            let providers = self.client.get("/provider").await.unwrap_or(json!({}));
-            models = flatten_models(providers);
+            return Err(JsonRpcError::internal("OpenCode returned no configured models"));
         }
-        if models.is_empty() {
-            models.push(default_model_entry("opencode", "opencode", "OpenCode"));
-        }
+        *self.models_with_none_variant.write().unwrap() = Some(models.iter().filter(|model| {
+            model["supportedReasoningEfforts"].as_array().is_some_and(|efforts| efforts.iter().any(|effort| effort["reasoningEffort"] == "none"))
+        }).filter_map(|model| model["model"].as_str().map(str::to_owned)).collect());
         Ok(json!({"data":models,"nextCursor":null}))
     }
 
     async fn handle_config_read(&self) -> Result<Value, JsonRpcError> {
-        Ok(json!({
-            "config": self.client.get("/config").await.unwrap_or(json!({})),
-            "origins": {},
-        }))
+        let config = self
+            .client
+            .get("/config")
+            .await
+            .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+        if !config.is_object() {
+            return Err(JsonRpcError::internal(
+                "OpenCode returned invalid native configuration",
+            ));
+        }
+        serde_json::to_value(alleycat_bridge_core::settings::response(
+            config,
+            "OpenCode /config",
+            true,
+            None,
+        ))
+        .map_err(|e| JsonRpcError::internal(e.to_string()))
     }
 
     async fn handle_config_write(&self, params: Value) -> Result<Value, JsonRpcError> {
-        let _ = self.client.patch("/config", params).await;
-        Ok(json!({}))
+        let batch: alleycat_codex_proto::ConfigBatchWriteParams = if params.get("edits").is_some() {
+            serde_json::from_value(params).map_err(|e| JsonRpcError::internal(e.to_string()))?
+        } else {
+            let one: alleycat_codex_proto::ConfigValueWriteParams = serde_json::from_value(params)
+                .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+            alleycat_codex_proto::ConfigBatchWriteParams {
+                edits: vec![alleycat_codex_proto::ConfigEdit {
+                    key_path: one.key_path,
+                    value: one.value,
+                    merge_strategy: one.merge_strategy,
+                }],
+                file_path: one.file_path,
+                expected_version: one.expected_version,
+                reload_user_config: false,
+            }
+        };
+        if batch.file_path.is_some() || batch.expected_version.is_some() {
+            return Err(JsonRpcError::internal(
+                "OpenCode config API does not support file/version overrides",
+            ));
+        }
+        let mut patch = serde_json::json!({});
+        for edit in batch.edits {
+            if edit.key_path == "$native" {
+                if !edit.value.is_object()
+                    || alleycat_bridge_core::settings::sanitize(&edit.value) != edit.value
+                {
+                    return Err(JsonRpcError::internal(
+                        "Native settings require a credential-free object",
+                    ));
+                }
+                patch = edit.value;
+                continue;
+            }
+            alleycat_bridge_core::settings::set(
+                &mut patch,
+                &edit.key_path,
+                edit.value,
+                edit.merge_strategy,
+            )
+            .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+        }
+        self.client
+            .patch("/config", patch)
+            .await
+            .map_err(|e| JsonRpcError::internal(e.to_string()))?;
+        // The mobile caller re-reads /config and compares the requested setting.
+        Ok(json!({"status":"ok","version":"","filePath":"OpenCode /config"}))
     }
 
     async fn handle_mcp_server_status_list(&self) -> Result<Value, JsonRpcError> {
@@ -1406,38 +1480,13 @@ fn split_model(model: &str) -> (&str, &str) {
 
 fn flatten_models(providers: Value) -> Vec<Value> {
     let defaults = provider_defaults(&providers);
-    let provider_list = providers
-        .get("providers")
-        .or_else(|| providers.get("all"))
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut models: Vec<Value> = provider_list
-        .into_iter()
-        .flat_map(|provider| {
-            let provider_id = provider
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("opencode")
-                .to_string();
-            let defaults = defaults.clone();
-            models_for_provider(provider)
-                .into_iter()
-                .map(move |(model_id, model)| {
-                    let is_default = defaults
-                        .iter()
-                        .any(|(p, m)| p == &provider_id && m == &model_id);
-                    model_entry(&provider_id, &model_id, &model, is_default)
-                })
-        })
-        .collect();
-    if !models.is_empty()
-        && !models
-            .iter()
-            .any(|model| model.get("isDefault").and_then(Value::as_bool) == Some(true))
-        && let Some(first) = models.first_mut()
-    {
-        first["isDefault"] = json!(true);
+    let mut models = Vec::new();
+    for provider in providers.get("providers").or_else(|| providers.get("all")).and_then(Value::as_array).into_iter().flatten() {
+        let Some(provider_id) = provider["id"].as_str().filter(|id| !id.is_empty()) else { continue };
+        for (model_id, model) in models_for_provider(provider.clone()) {
+            let is_default = defaults.iter().any(|(p, m)| p == provider_id && m == &model_id);
+            models.push(model_entry(provider_id, &model_id, &model, is_default));
+        }
     }
     models
 }
@@ -1459,18 +1508,10 @@ fn provider_defaults(providers: &Value) -> Vec<(String, String)> {
 
 fn models_for_provider(provider: Value) -> Vec<(String, Value)> {
     match provider.get("models") {
-        Some(Value::Array(models)) => models
-            .iter()
-            .cloned()
-            .map(|model| {
-                let id = model
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("model")
-                    .to_string();
-                (id, model)
-            })
-            .collect(),
+        Some(Value::Array(models)) => models.iter().filter_map(|model| {
+            let id = model["id"].as_str().filter(|id| !id.is_empty())?;
+            Some((id.to_owned(), model.clone()))
+        }).collect(),
         Some(Value::Object(models)) => models
             .iter()
             .map(|(key, model)| {
@@ -1489,12 +1530,12 @@ fn models_for_provider(provider: Value) -> Vec<(String, Value)> {
 fn model_entry(provider_id: &str, model_id: &str, model: &Value, is_default: bool) -> Value {
     json!({
         "id": format!("{provider_id}/{model_id}"),
-        "model": model_id,
+        "model": format!("{provider_id}/{model_id}"),
         "displayName": model.get("name").and_then(Value::as_str).unwrap_or(model_id),
         "description": model.get("description").and_then(Value::as_str).unwrap_or(""),
         "hidden": false,
         "supportedReasoningEfforts": reasoning_efforts_for_model(model),
-        "defaultReasoningEffort": "medium",
+        "defaultReasoningEffort": "none",
         "inputModalities": input_modalities_for_model(model),
         "supportsPersonality": false,
         "additionalSpeedTiers": [],
@@ -1508,24 +1549,10 @@ fn model_entry(provider_id: &str, model_id: &str, model: &Value, is_default: boo
 }
 
 fn reasoning_efforts_for_model(model: &Value) -> Value {
-    let supports_reasoning = model
-        .pointer("/capabilities/reasoning")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let efforts = if supports_reasoning {
-        vec!["minimal", "low", "medium", "high"]
-    } else {
-        vec!["medium"]
-    };
-    json!(
-        efforts
-            .into_iter()
-            .map(|reasoning_effort| json!({
-                "reasoningEffort": reasoning_effort,
-                "description": ""
-            }))
-            .collect::<Vec<_>>()
-    )
+    json!(model.get("variants").and_then(Value::as_object).into_iter().flat_map(|variants| variants.iter())
+        .filter(|(_, config)| config.get("disabled") != Some(&json!(true)))
+        .map(|(variant, _)| json!({"reasoningEffort":variant,"description":variant}))
+        .collect::<Vec<_>>())
 }
 
 fn input_modalities_for_model(model: &Value) -> Value {
@@ -1541,30 +1568,6 @@ fn input_modalities_for_model(model: &Value) -> Value {
         modalities.push(json!("image"));
     }
     Value::Array(modalities)
-}
-
-fn default_model_entry(provider_id: &str, model_id: &str, display_name: &str) -> Value {
-    json!({
-        "id": format!("{provider_id}/{model_id}"),
-        "model": model_id,
-        "displayName": display_name,
-        "description": "",
-        "hidden": false,
-        "supportedReasoningEfforts": [{
-            "reasoningEffort": "medium",
-            "description": ""
-        }],
-        "defaultReasoningEffort": "medium",
-        "inputModalities": ["text"],
-        "supportsPersonality": false,
-        "additionalSpeedTiers": [],
-        "serviceTiers": [{
-            "id": "standard",
-            "name": "Standard",
-            "description": "Default bridge service tier"
-        }],
-        "isDefault": true
-    })
 }
 
 fn mcp_statuses(raw: Value) -> Vec<Value> {

@@ -56,23 +56,6 @@ const CONTROL_INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// surfaces as an error rather than hanging the turn handler.
 const CONTROL_SET_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Map codex `ReasoningEffort` onto a `--max-thinking-tokens` budget. Values
-/// match the conventions the Anthropic SDK ships with (extended-thinking docs)
-/// — tweak in lockstep with `pi-bridge`'s `ThinkingLevel` if those drift.
-fn effort_to_thinking_tokens(effort: p::ReasoningEffort) -> u32 {
-    match effort {
-        p::ReasoningEffort::None => 0,
-        p::ReasoningEffort::Minimal => 1024,
-        p::ReasoningEffort::Low => 4096,
-        p::ReasoningEffort::Medium => 16_384,
-        p::ReasoningEffort::High => 32_768,
-        // codex uses XHigh only on a few gpt-5.x models; claude has no
-        // direct equivalent so we cap at the High budget.
-        p::ReasoningEffort::XHigh => 32_768,
-        p::ReasoningEffort::Max => 32_768,
-    }
-}
-
 /// Per-thread active-turn registry. Claude only allows one active turn per
 /// process. Keyed by codex `thread_id`.
 static ACTIVE_TURNS: LazyLock<SyncMutex<HashMap<String, ActiveTurn>>> =
@@ -137,7 +120,11 @@ pub async fn handle_turn_start(
     // a turn that doesn't change the model/effort is a no-op (zero RTT).
     let normalized_model_override = params.model.as_deref().map(normalize_claude_model_id);
     let model_override = normalized_model_override.as_deref();
-    let thinking_override = params.effort.map(effort_to_thinking_tokens);
+    let thinking_override = match params.effort {
+        Some(p::ReasoningEffort::None) => Some(0),
+        Some(p::ReasoningEffort::Minimal) => Some(1024),
+        _ => None,
+    };
     if model_override.is_some() || thinking_override.is_some() {
         if let Err(err) = handle
             .apply_runtime_overrides(model_override, thinking_override, None, CONTROL_SET_TIMEOUT)
@@ -147,6 +134,18 @@ pub async fn handle_turn_start(
                 "applying runtime overrides: {err}"
             )));
         }
+    }
+
+    if let Some(effort) = params.effort.filter(|effort| {
+        !matches!(
+            effort,
+            p::ReasoningEffort::None | p::ReasoningEffort::Minimal
+        )
+    }) {
+        handle
+            .apply_effort(effort, CONTROL_SET_TIMEOUT)
+            .await
+            .map_err(|error| TurnError::ClaudeRpc(format!("applying native effort: {error}")))?;
     }
 
     let turn_id = Uuid::now_v7().to_string();

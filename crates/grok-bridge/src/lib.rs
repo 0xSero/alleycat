@@ -27,6 +27,8 @@
 //! The `acp-bridge` crate itself remains completely unaware of Grok's CLI
 //! structure (`agent`, `stdio`, `--no-leader`, etc.).
 
+mod models;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -89,6 +91,7 @@ impl GrokBridge {
         let acp = AcpBridge::builder()
             .agent_bin(bin)
             .agent_args(args)
+            .model_catalog_command(vec!["models".into()], models::parse_model_catalog)
             .launcher(launcher)
             .build()
             .await

@@ -27,5 +27,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-std", "process", "time"] }
 tracing = { workspace = true }
 
+serde_yaml = "0.9.34"
+tempfile = { workspace = true }
+
 [dev-dependencies]
 tempfile = { workspace = true }

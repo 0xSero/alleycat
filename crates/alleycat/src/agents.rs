@@ -46,6 +46,7 @@ use crate::stream::IrohStream;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentKind {
     Pi,
+    Omp,
     Amp,
     Claude,
     Opencode,
@@ -120,6 +121,7 @@ impl CodexUnixEndpoint {
 struct BridgeStateLayout {
     base: PathBuf,
     pi: PathBuf,
+    omp: PathBuf,
     amp: PathBuf,
     claude: PathBuf,
     droid: PathBuf,
@@ -132,6 +134,7 @@ impl BridgeStateLayout {
     fn new(base: PathBuf) -> Self {
         Self {
             pi: base.join("pi"),
+            omp: base.join("omp"),
             amp: base.join("amp"),
             claude: base.join("claude"),
             droid: base.join("droid"),
@@ -146,6 +149,7 @@ impl BridgeStateLayout {
         for directory in [
             &self.base,
             &self.pi,
+            &self.omp,
             &self.amp,
             &self.claude,
             &self.droid,
@@ -314,6 +318,30 @@ impl AgentManager {
         }
         let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
 
+        // OMP speaks Pi RPC, but owns its own sessions, credentials and settings.
+        // Never hydrate its index from the standalone Pi home.
+        let omp_agent_dir = directories::UserDirs::new()
+            .map(|dirs| dirs.home_dir().join(".omp/agent"))
+            .context("locating OMP agent home")?;
+        let omp_bridge = PiBridge::builder()
+            .agent_bin(PathBuf::from(&snapshot.agents.omp.bin))
+            .launcher(Arc::new(EnvironmentOverlayLauncher::new(
+                Arc::new(EnvironmentOverlayLauncher::new(
+                    Arc::clone(&launcher),
+                    "OMP_PROFILE",
+                    std::ffi::OsStr::new(""),
+                )),
+                "PI_CODING_AGENT_DIR",
+                omp_agent_dir.as_os_str(),
+            )))
+            .defer_initial_hydration(true)
+            .hydrator(PiHydrator::with_override(omp_agent_dir.join("sessions")))
+            .native_settings_path(omp_agent_dir.join("config.yml"))
+            .codex_home(bridge_state.omp.clone())
+            .build()
+            .await
+            .context("building OMP bridge")?;
+
         // Local Studio owns a separate Pi home containing its controller
         // catalog and sessions. Expose it as its own standard app-server
         // runtime instead of redirecting the user's standalone `pi` runtime.
@@ -341,6 +369,7 @@ impl AgentManager {
                 .hydrator(PiHydrator::with_override(agent_dir.join("sessions")))
                 .model_provider_prefix("local-studio")
                 .model_catalog_path(agent_dir.join("models.json"))
+                .native_settings_path(agent_dir.join("settings.json"))
                 .codex_home(agent_dir.join("bridge-index"));
             Some(
                 builder
@@ -380,6 +409,10 @@ impl AgentManager {
             .context("building droid bridge")?;
 
         let devin_builder = AcpBridge::builder()
+            .model_catalog_command(
+                ["models", "list", "--format", "json"].map(str::to_owned).to_vec(),
+                alleycat_devin_bridge::parse_model_catalog,
+            )
             .agent_bin(PathBuf::from(&snapshot.agents.devin.bin))
             .launcher(Arc::clone(&launcher))
             .state_dir(bridge_state.devin.clone());
@@ -419,6 +452,7 @@ impl AgentManager {
 
         let mut bridges: HashMap<AgentKind, Arc<dyn Bridge>> = HashMap::new();
         bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
+        bridges.insert(AgentKind::Omp, omp_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Amp, amp_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
@@ -529,6 +563,7 @@ impl AgentManager {
             let available = match manifest.name {
                 "codex" => self.codex_available(),
                 "pi" => self.pi_available(&launch_env),
+                "omp" => self.omp_available(&launch_env),
                 "amp" => self.amp_available(&launch_env),
                 "opencode" => self.opencode_available(&launch_env),
                 "claude" => self.claude_available(&launch_env),
@@ -685,6 +720,7 @@ impl AgentManager {
         match agent {
             "codex" => cfg.agents.codex.enabled,
             "pi" => cfg.agents.pi.enabled,
+            "omp" => cfg.agents.omp.enabled,
             "amp" => cfg.agents.amp.enabled,
             "opencode" => cfg.agents.opencode.enabled,
             "claude" => cfg.agents.claude.enabled,
@@ -1170,6 +1206,11 @@ impl AgentManager {
     fn pi_available(&self, env: &LaunchEnvironment) -> bool {
         let cfg = self.config.load();
         cfg.agents.pi.enabled && resolve_pi_bin(&cfg.agents.pi.bin, env).is_some()
+    }
+
+    fn omp_available(&self, env: &LaunchEnvironment) -> bool {
+        let cfg = self.config.load();
+        cfg.agents.omp.enabled && program_available(env, &cfg.agents.omp.bin)
     }
 
     fn opencode_available(&self, env: &LaunchEnvironment) -> bool {
@@ -1746,6 +1787,7 @@ fn resolve_pi_bin(configured: &str, env: &LaunchEnvironment) -> Option<PathBuf> 
 fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
     match name {
         "pi" => Some(AgentKind::Pi),
+        "omp" => Some(AgentKind::Omp),
         "amp" => Some(AgentKind::Amp),
         "claude" => Some(AgentKind::Claude),
         "opencode" => Some(AgentKind::Opencode),
@@ -1761,6 +1803,7 @@ fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
 fn agent_kind_str(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::Pi => "pi",
+        AgentKind::Omp => "omp",
         AgentKind::Amp => "amp",
         AgentKind::Claude => "claude",
         AgentKind::Opencode => "opencode",
@@ -1776,6 +1819,7 @@ impl crate::config::AgentsConfig {
     fn is_enabled(&self, kind: AgentKind) -> bool {
         match kind {
             AgentKind::Pi => self.pi.enabled,
+            AgentKind::Omp => self.omp.enabled,
             AgentKind::Amp => self.amp.enabled,
             AgentKind::Claude => self.claude.enabled,
             AgentKind::Opencode => self.opencode.enabled,
@@ -1882,10 +1926,32 @@ mod local_studio_launcher_tests {
             std::io::Result<Box<dyn alleycat_bridge_core::ChildProcess>>,
         > {
             *self.captured.lock().expect("capture mutex poisoned") = Some(spec);
-            Box::pin(async {
-                Err(std::io::Error::other("capturing launcher does not spawn"))
-            })
+            Box::pin(async { Err(std::io::Error::other("capturing launcher does not spawn")) })
         }
+    }
+
+    #[tokio::test]
+    async fn omp_launch_uses_its_own_home_and_rpc_binary() {
+        let captured = CapturingLauncher::new();
+        let launcher = EnvironmentOverlayLauncher::new(
+            captured.clone(),
+            "PI_CODING_AGENT_DIR",
+            std::ffi::OsStr::new("/home/test/.omp/agent"),
+        );
+        let _ = alleycat_pi_bridge::pool::process::PiProcessHandle::launch_with(
+            &launcher, "/tmp", "omp",
+        )
+        .await;
+        let spec = captured.take();
+        assert_eq!(spec.program, PathBuf::from("omp"));
+        assert_eq!(
+            spec.args,
+            vec![OsString::from("--mode"), OsString::from("rpc")]
+        );
+        assert_eq!(
+            env_value(&spec, "PI_CODING_AGENT_DIR"),
+            Some(std::ffi::OsStr::new("/home/test/.omp/agent"))
+        );
     }
 
     fn electron_command() -> local_studio::PiRuntimeCommand {
@@ -1894,10 +1960,7 @@ mod local_studio_launcher_tests {
             prefix_args: vec![OsString::from(
                 "/Applications/Local Studio.app/Contents/Resources/cli.js",
             )],
-            env: vec![(
-                OsString::from("ELECTRON_RUN_AS_NODE"),
-                OsString::from("1"),
-            )],
+            env: vec![(OsString::from("ELECTRON_RUN_AS_NODE"), OsString::from("1"))],
         }
     }
 
@@ -2024,6 +2087,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn omp_routes_independently_from_pi() {
+        assert_eq!(agent_kind_from_str("omp"), Some(AgentKind::Omp));
+        assert_eq!(agent_kind_str(AgentKind::Omp), "omp");
+        let mut config = crate::config::AgentsConfig::default();
+        config.pi.enabled = false;
+        assert!(config.is_enabled(AgentKind::Omp));
+        assert!(!config.is_enabled(AgentKind::Pi));
+        let layout = BridgeStateLayout::new(PathBuf::from("/bridge-state"));
+        assert_eq!(layout.omp, PathBuf::from("/bridge-state/omp"));
+        assert_ne!(layout.omp, layout.pi);
+        let omp = manifest_for("omp").unwrap();
+        assert!(!omp.aliases.contains(&"pi"));
+    }
+
+    #[test]
     fn default_bridge_state_layout_is_stable_and_namespaced() {
         let mut home = crate::test_support::TempHome::new();
         home.override_env(&[("CODEX_HOME", "")]);
@@ -2041,6 +2119,7 @@ mod tests {
 
         let roots = [
             &layout.pi,
+            &layout.omp,
             &layout.amp,
             &layout.claude,
             &layout.droid,

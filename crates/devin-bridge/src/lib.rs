@@ -12,6 +12,9 @@
 //! Keeping this devin-aware logic out of `acp-bridge` lets that crate stay a
 //! generic adapter usable by any ACP agent.
 
+mod models;
+pub use models::parse_model_catalog;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

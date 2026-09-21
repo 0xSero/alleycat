@@ -54,11 +54,12 @@ impl OpencodeClient {
         if let Some(body) = body {
             req = req.json(&body);
         }
-        let resp = req.send().await?.error_for_status()?;
+        let resp = req.send().await.map_err(reqwest::Error::without_url)?
+            .error_for_status().map_err(reqwest::Error::without_url)?;
         if resp.status() == reqwest::StatusCode::NO_CONTENT {
             return Ok(Value::Null);
         }
-        Ok(resp.json().await?)
+        Ok(resp.json().await.map_err(reqwest::Error::without_url)?)
     }
 
     fn url(&self, path: &str) -> String {

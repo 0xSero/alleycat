@@ -69,6 +69,37 @@ struct ThreadStartShape {
 }
 
 impl AmpBridge {
+    async fn native_settings_help(&self) -> Result<String, JsonRpcError> {
+        self.native_output(&["--help"]).await
+    }
+
+    async fn native_output(&self, args: &[&str]) -> Result<String, JsonRpcError> {
+        use tokio::io::AsyncReadExt;
+        let mut spec = alleycat_bridge_core::ProcessSpec::new(&self.amp_bin);
+        spec.args = args.iter().map(Into::into).collect();
+        spec.stdin = alleycat_bridge_core::StdioMode::Null;
+        spec.stderr = alleycat_bridge_core::StdioMode::Null;
+        let mut child = tokio::time::timeout(std::time::Duration::from_secs(5), self.launcher.launch(spec))
+            .await.map_err(|_| internal("Amp discovery launch timed out"))?
+            .map_err(|e| internal(e.to_string()))?;
+        let mut output = child
+            .take_stdout()
+            .ok_or_else(|| internal("Amp help stdout unavailable"))?
+            .take(1024 * 1024 + 1);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut bytes = Vec::new();
+            output.read_to_end(&mut bytes).await?;
+            anyhow::ensure!(bytes.len() <= 1024 * 1024, "Amp discovery exceeded output limit");
+            if !child.wait().await?.success() {
+                anyhow::bail!("Amp settings reference failed");
+            }
+            Ok::<String, anyhow::Error>(String::from_utf8(bytes)?)
+        })
+        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.kill()).await;
+        result.map_err(|_| internal("Amp native discovery timed out"))?
+            .map_err(|e| internal(e.to_string()))
+    }
     pub fn builder() -> AmpBridgeBuilder {
         AmpBridgeBuilder::default()
     }
@@ -247,25 +278,40 @@ impl Bridge for AmpBridge {
                 ok(p::FeedbackUploadResponse::default())
             }
             "config/read" => {
-                let typed: p::ConfigReadParams = decode_or_default(params)?;
-                ok(p::ConfigReadResponse {
-                    config: json!({
-                        "model_provider": MODEL_PROVIDER,
-                        "model": DEFAULT_MODEL,
-                        "cwd": typed.cwd,
-                        "approval_policy": if self.dangerously_allow_all { "never" } else { "on-request" },
-                    }),
-                    origins: HashMap::new(),
-                    layers: typed.include_layers.then(Vec::new),
-                })
+                let path = amp_settings_path().map_err(|e| internal(e.to_string()))?;
+                let mut response = alleycat_bridge_core::settings::read_response(&path)
+                    .map_err(|e| internal(e.to_string()))?;
+                let help = self.native_settings_help().await?;
+                let descriptors = response.config["_litterSettings"].as_array_mut().unwrap();
+                for key in help
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("  amp."))
+                    .filter(|line| !line.is_empty() && !line.contains(char::is_whitespace))
+                    .map(|suffix| format!("amp.{suffix}"))
+                {
+                    if alleycat_bridge_core::settings::sensitive(&key)
+                        || descriptors.iter().any(|row| row["key"] == key)
+                    {
+                        continue;
+                    }
+                    descriptors.push(json!({"key":key,"label":key,"valueJson":"null","valueKind":"json","choices":[],"scope":"user override (unset)","source":"Installed Amp settings reference; effective default is chosen by Amp","writable":true,"readOnlyReason":null}));
+                }
+                ok(response)
             }
             "config/value/write" => {
-                let _typed: p::ConfigValueWriteParams = decode(params)?;
-                ok(config_write_response(&self.codex_home))
+                let typed: p::ConfigValueWriteParams = decode(params)?;
+                let path = amp_settings_path().map_err(|e| internal(e.to_string()))?;
+                ok(alleycat_bridge_core::settings::write_flat(
+                    &path,
+                    alleycat_bridge_core::settings::batch_from_one(typed),
+                )
+                .map_err(|e| internal(e.to_string()))?)
             }
             "config/batchWrite" => {
-                let _typed: p::ConfigBatchWriteParams = decode(params)?;
-                ok(config_write_response(&self.codex_home))
+                let typed: p::ConfigBatchWriteParams = decode(params)?;
+                let path = amp_settings_path().map_err(|e| internal(e.to_string()))?;
+                ok(alleycat_bridge_core::settings::write_flat(&path, typed)
+                    .map_err(|e| internal(e.to_string()))?)
             }
             "configRequirements/read" => ok(p::ConfigRequirementsReadResponse::default()),
             "mcpServerStatus/list" => {
@@ -302,10 +348,20 @@ impl Bridge for AmpBridge {
             "collaborationMode/list" => ok(p::CollaborationModeListResponse { data: Vec::new() }),
             "model/list" => {
                 let typed: p::ModelListParams = decode_or_default(params)?;
-                ok(p::ModelListResponse {
-                    data: amp_models(typed.include_hidden.unwrap_or(false)),
-                    next_cursor: None,
-                })
+                let mut models = amp_models(typed.include_hidden.unwrap_or(false));
+                let output = self.native_output(&["plugins", "list"]).await?;
+                for mode in plugin_modes(&output) {
+                    if !models.iter().any(|model| model.id == mode) {
+                        let mut model = models[0].clone();
+                        model.id = mode.clone();
+                        model.model = mode.clone();
+                        model.display_name = mode;
+                        model.description = "Native Amp plugin mode".into();
+                        model.is_default = false;
+                        models.push(model);
+                    }
+                }
+                ok(p::ModelListResponse { data: models, next_cursor: None })
             }
             "skills/list" => {
                 let typed: p::SkillsListParams = decode_or_default(params)?;
@@ -1859,18 +1915,6 @@ fn thread_start_response(shape: ThreadStartShape) -> p::ThreadStartResponse {
     }
 }
 
-fn config_write_response(codex_home: &Path) -> p::ConfigWriteResponse {
-    p::ConfigWriteResponse {
-        status: p::WriteStatus::Ok,
-        version: "0".to_string(),
-        file_path: codex_home
-            .join("config.toml")
-            .to_string_lossy()
-            .into_owned(),
-        overridden_metadata: None,
-    }
-}
-
 fn amp_models(_include_hidden: bool) -> Vec<p::Model> {
     AMP_VISIBLE_MODES
         .into_iter()
@@ -1898,6 +1942,24 @@ fn amp_models(_include_hidden: bool) -> Vec<p::Model> {
         .collect()
 }
 
+fn plugin_modes(output: &str) -> Vec<String> {
+    let mut active = false;
+    let mut modes = Vec::new();
+    for line in output.lines() {
+        if !line.starts_with(char::is_whitespace) && !line.is_empty() {
+            active = line.starts_with('✓') && line.ends_with(" active");
+        }
+        if active {
+            if let Some(mode) = line.trim().strip_prefix("agent mode: ") {
+                if !mode.is_empty() && !modes.iter().any(|existing| existing == mode) {
+                    modes.push(mode.to_owned());
+                }
+            }
+        }
+    }
+    modes
+}
+
 const AMP_VISIBLE_MODES: [&str; 4] = ["low", "medium", "high", "ultra"];
 
 fn normalize_model(model: Option<&str>) -> String {
@@ -1915,13 +1977,10 @@ fn normalize_model(model: Option<&str>) -> String {
         "rush" => "low".to_string(),
         "smart" | "deep" => "medium".to_string(),
         "large" => "ultra".to_string(),
-        _ if is_supported_amp_mode(&mode) => mode,
-        _ => DEFAULT_MODEL.to_string(),
+        // The CLI also accepts plugin mode keys/labels. Let it validate
+        // those rather than silently executing a different built-in mode.
+        _ => mode,
     }
-}
-
-fn is_supported_amp_mode(mode: &str) -> bool {
-    AMP_VISIBLE_MODES.contains(&mode)
 }
 
 fn amp_mode_description(mode: &str) -> &'static str {
@@ -2036,6 +2095,40 @@ fn method_not_found(method: &str) -> JsonRpcError {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn plugin_catalog_refresh_and_failure_are_authoritative() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("amp");
+        let fixture = dir.path().join("plugins.txt");
+        std::fs::write(&binary, format!("#!/bin/sh\ntest \"$*\" = 'plugins list' || exit 2\ncat '{}'\n", fixture.display())).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bridge = AmpBridge::builder().agent_bin(&binary).codex_home(dir.path().join("state"))
+            .transcripts_dir(dir.path().join("threads")).build().await.unwrap();
+        let registry = alleycat_bridge_core::SessionRegistry::new(Default::default());
+        let conn = Conn::from_session(registry.get_or_create("test".into(), "amp"));
+        for mode in ["mode-old", "mode-new"] {
+            std::fs::write(&fixture, format!("✓ plugin active\n  agent mode: {mode}\n")).unwrap();
+            let response = bridge.dispatch(&conn, "model/list", json!({})).await.unwrap();
+            let models = response["data"].as_array().unwrap();
+            assert_eq!(models.len(), 5);
+            assert_eq!(models[4]["model"], mode);
+        }
+        std::fs::write(&binary, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(bridge.dispatch(&conn, "model/list", json!({})).await.is_err());
+    }
+
+    #[test]
+    fn native_plugin_modes_keep_mode_keys_and_ignore_agent_names() {
+        let modes = plugin_modes(include_str!("../tests/fixtures/plugin-modes.txt"));
+        assert!(modes.contains(&"astra".to_string()));
+        assert!(modes.contains(&"claude-fable-5-1".to_string()));
+        assert!(!modes.contains(&"gpt-6-astra".to_string()));
+        assert_eq!(modes.iter().filter(|m| m.as_str() == "glm-5.2").count(), 1);
+        assert!(plugin_modes("✗ disabled plugin\n  agent mode: unavailable\n").is_empty());
+    }
+
     #[test]
     fn normalizes_current_and_legacy_amp_modes() {
         for mode in AMP_VISIBLE_MODES {
@@ -2049,6 +2142,14 @@ mod tests {
         assert_eq!(normalize_model(Some("large")), "ultra");
         assert_eq!(normalize_model(Some("amp:SMART")), "medium");
         assert_eq!(normalize_model(Some("amp/ultra")), "ultra");
-        assert_eq!(normalize_model(Some("unknown")), "medium");
+        assert_eq!(normalize_model(Some("My Plugin")), "my plugin");
+        assert_eq!(normalize_model(Some("amp/plugin:review")), "plugin:review");
     }
+}
+
+fn amp_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("AMP_SETTINGS_FILE").filter(|v| !v.is_empty()) {
+        return Ok(path.into());
+    }
+    alleycat_bridge_core::settings::home_path(".config/amp/settings.json")
 }

@@ -65,6 +65,7 @@ pub struct ConnectionState {
 
     /// Optional Pi `models.json` owned by the embedding controller.
     model_catalog_path: Option<PathBuf>,
+    native_settings_path: Option<PathBuf>,
 
     session_index_refresh: Option<SessionIndexRefresh>,
 }
@@ -192,8 +193,17 @@ impl ConnectionState {
             trust_persisted_cwd,
             model_provider_prefixes,
             model_catalog_path,
+            native_settings_path: None,
             session_index_refresh,
         }
+    }
+
+    pub fn with_native_settings_path(mut self, path: Option<PathBuf>) -> Self {
+        self.native_settings_path = path;
+        self
+    }
+    pub fn native_settings_path(&self) -> Option<&std::path::Path> {
+        self.native_settings_path.as_deref()
     }
 
     pub fn model_provider_prefixes(&self) -> &[String] {

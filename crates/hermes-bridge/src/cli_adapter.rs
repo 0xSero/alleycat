@@ -35,6 +35,7 @@ impl HermesCliProcess {
         prompt: &str,
         session_id: Option<&str>,
         cwd: Option<&PathBuf>,
+        model: Option<&str>,
     ) -> Result<Self> {
         let bin = resolve_bin(&config.bin)?;
         let mut cmd = Command::new(&bin);
@@ -47,6 +48,14 @@ impl HermesCliProcess {
 
         if let Some(sid) = session_id {
             cmd.arg("--resume").arg(sid);
+        }
+
+        let (model, provider) = crate::bridge::hermes_model_selection(model);
+        if let Some(model) = model {
+            cmd.arg("--model").arg(model);
+        }
+        if let Some(provider) = provider {
+            cmd.arg("--provider").arg(provider);
         }
 
         // Prefer the per-turn cwd, then the config-level default.
@@ -126,12 +135,13 @@ pub async fn run_hermes_cli(
     prompt: &str,
     session_id: Option<&str>,
     cwd: Option<&PathBuf>,
+    model: Option<&str>,
 ) -> Result<String> {
     let config = CliConfig {
         bin: bin.to_string(),
         cwd: cwd.cloned(),
     };
-    let process = HermesCliProcess::spawn(&config, prompt, session_id, cwd).await?;
+    let process = HermesCliProcess::spawn(&config, prompt, session_id, cwd, model).await?;
     let output = process.wait_for_output().await?;
     if output.exit_code.unwrap_or(1) != 0 {
         anyhow::bail!(
@@ -164,13 +174,21 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
 
-        let output = run_hermes_cli(bin.to_str().unwrap(), "hello", Some("session-1"), None)
-            .await
-            .unwrap();
+        let output = run_hermes_cli(
+            bin.to_str().unwrap(),
+            "hello",
+            Some("session-1"),
+            None,
+            Some("hermes/openrouter/vendor/new-model"),
+        )
+        .await
+        .unwrap();
         assert_eq!(output, "ok");
         let args = std::fs::read_to_string(log).unwrap();
         assert!(args.contains("-z\nhello"));
         assert!(args.contains("--resume\nsession-1"));
+        assert!(args.contains("--model\nvendor/new-model"));
+        assert!(args.contains("--provider\nopenrouter"));
         assert!(!args.contains("run"));
         assert!(!args.contains("--prompt"));
     }

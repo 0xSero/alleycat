@@ -24,13 +24,13 @@ use crate::translate::{CompletedTurn, DroidTurnTranslator};
 
 const DEFAULT_DROID_BIN: &str = "droid";
 const MODEL_PROVIDER: &str = "droid";
-const DEFAULT_MODEL: &str = "claude-sonnet-4-5-20250929";
 const USER_AGENT: &str = concat!("alleycat-droid-bridge/", env!("CARGO_PKG_VERSION"));
 const DEFAULT_OUTPUT_BYTES_CAP: usize = 256 * 1024;
 const DEFAULT_TIMEOUT_MS: i64 = 60_000;
 
 pub struct DroidBridge {
     droid_bin: PathBuf,
+    model_catalog: Mutex<Vec<p::Model>>,
     launcher: Arc<dyn ProcessLauncher>,
     codex_home: PathBuf,
     thread_index: Arc<index::ThreadIndex>,
@@ -50,6 +50,7 @@ struct ThreadRecord {
     updated_at: i64,
     path: Option<String>,
     model: String,
+    effort: Option<p::ReasoningEffort>,
     approval_policy: p::AskForApproval,
     sandbox: p::SandboxPolicy,
     turns: Vec<Value>,
@@ -158,6 +159,7 @@ impl DroidBridgeBuilder {
             )
         };
         Ok(Arc::new(DroidBridge {
+            model_catalog: Mutex::new(Vec::new()),
             droid_bin: self
                 .agent_bin
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_DROID_BIN)),
@@ -222,47 +224,24 @@ impl Bridge for DroidBridge {
                 ok(p::FeedbackUploadResponse::default())
             }
             "config/read" => {
-                let typed: p::ConfigReadParams = if params.is_null() {
-                    Default::default()
-                } else {
-                    decode(params)?
-                };
-                let config = json!({
-                    "model_provider": MODEL_PROVIDER,
-                    "model": DEFAULT_MODEL,
-                    "cwd": typed.cwd,
-                });
-                ok(p::ConfigReadResponse {
-                    config,
-                    origins: HashMap::new(),
-                    layers: typed.include_layers.then(Vec::new),
-                })
+                let path = alleycat_bridge_core::settings::home_path(".factory/settings.json")
+                    .map_err(|e| internal(e.to_string()))?;
+                ok(alleycat_bridge_core::settings::read_response(&path)
+                    .map_err(|e| internal(e.to_string()))?)
             }
             "config/value/write" => {
-                let _typed: p::ConfigValueWriteParams = decode(params)?;
-                ok(p::ConfigWriteResponse {
-                    status: p::WriteStatus::Ok,
-                    version: "0".to_string(),
-                    file_path: self
-                        .codex_home
-                        .join("config.toml")
-                        .to_string_lossy()
-                        .into_owned(),
-                    overridden_metadata: None,
-                })
+                let typed: p::ConfigValueWriteParams = decode(params)?;
+                let path = alleycat_bridge_core::settings::home_path(".factory/settings.json")
+                    .map_err(|e| internal(e.to_string()))?;
+                ok(alleycat_bridge_core::settings::write_one(&path, typed)
+                    .map_err(|e| internal(e.to_string()))?)
             }
             "config/batchWrite" => {
-                let _typed: p::ConfigBatchWriteParams = decode(params)?;
-                ok(p::ConfigWriteResponse {
-                    status: p::WriteStatus::Ok,
-                    version: "0".to_string(),
-                    file_path: self
-                        .codex_home
-                        .join("config.toml")
-                        .to_string_lossy()
-                        .into_owned(),
-                    overridden_metadata: None,
-                })
+                let typed: p::ConfigBatchWriteParams = decode(params)?;
+                let path = alleycat_bridge_core::settings::home_path(".factory/settings.json")
+                    .map_err(|e| internal(e.to_string()))?;
+                ok(alleycat_bridge_core::settings::write(&path, typed)
+                    .map_err(|e| internal(e.to_string()))?)
             }
             "configRequirements/read" => ok(p::ConfigRequirementsReadResponse::default()),
             "mcpServerStatus/list" => {
@@ -300,7 +279,7 @@ impl Bridge for DroidBridge {
                     decode(params)?
                 };
                 ok(p::ModelListResponse {
-                    data: droid_models(),
+                    data: self.refresh_models().await?,
                     next_cursor: None,
                 })
             }
@@ -453,6 +432,22 @@ impl Bridge for DroidBridge {
 }
 
 impl DroidBridge {
+    async fn refresh_models(&self) -> Result<Vec<p::Model>, JsonRpcError> {
+        let models = crate::models::discover(self.launcher.as_ref(), &self.droid_bin).await.map_err(internal_err)?;
+        *self.model_catalog.lock().await = models.clone();
+        Ok(models)
+    }
+
+    async fn native_effort(&self, model: &str, effort: p::ReasoningEffort) -> Result<String, JsonRpcError> {
+        if !self.model_catalog.lock().await.iter().any(|entry| entry.id == model) {
+            self.refresh_models().await?;
+        }
+        self.model_catalog.lock().await.iter().find(|entry| entry.id == model)
+            .and_then(|entry| entry.supported_reasoning_efforts.iter().find(|item| item.reasoning_effort == effort))
+            .map(|item| item.description.clone())
+            .ok_or_else(|| invalid_params(format!("Requested reasoning effort is not supported by {model}")))
+    }
+
     async fn handle_thread_start(
         &self,
         ctx: &Conn,
@@ -460,14 +455,14 @@ impl DroidBridge {
     ) -> Result<Value, JsonRpcError> {
         let cwd = resolve_cwd(params.cwd.as_deref())?;
         let thread_id = Uuid::now_v7().to_string();
-        let model = normalize_model(params.model.as_deref()).unwrap_or(DEFAULT_MODEL.to_string());
+        let model = normalize_model(params.model.as_deref()).unwrap_or_default();
         let approval_policy = params
             .approval_policy
             .unwrap_or(p::AskForApproval::OnRequest);
         let sandbox = sandbox_value(params.sandbox);
         let now = now_millis();
         let session_path = self.session_path_for(&cwd, &thread_id).await;
-        let record = ThreadRecord {
+        let mut record = ThreadRecord {
             id: thread_id.clone(),
             cwd: cwd.to_string_lossy().into_owned(),
             name: params.service_name.clone(),
@@ -478,18 +473,20 @@ impl DroidBridge {
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
             model: model.clone(),
+            effort: None,
             approval_policy: approval_policy.clone(),
             sandbox,
             turns: Vec::new(),
         };
-        self.spawn_process(
+        let process = self.spawn_process(
             &thread_id,
             &cwd,
-            Some(model.clone()),
+            (!model.is_empty()).then(|| model.clone()),
             &approval_policy,
             SessionOpenMode::Initialize,
         )
         .await?;
+        apply_native_settings(&mut record, &*process.settings.lock().await);
         self.threads
             .lock()
             .await
@@ -508,7 +505,7 @@ impl DroidBridge {
             );
         }
 
-        ok(thread_attach_response(&record, &model))
+        ok(thread_attach_response(&record, &record.model))
     }
 
     async fn handle_thread_resume(
@@ -541,7 +538,7 @@ impl DroidBridge {
             record.turns = self.transcript_turn_values(Path::new(path)).await?;
         }
         let cwd = PathBuf::from(&record.cwd);
-        self.spawn_process(
+        let process = self.spawn_process(
             &record.id,
             &cwd,
             Some(record.model.clone()),
@@ -549,6 +546,11 @@ impl DroidBridge {
             SessionOpenMode::Load,
         )
         .await?;
+        apply_native_settings(&mut record, &*process.settings.lock().await);
+        if let Some(model) = normalize_model(params.model.as_deref()) {
+            process.request("droid.update_session_settings", json!({"modelId":model})).await.map_err(internal_err)?;
+            record.model = model;
+        }
         self.threads
             .lock()
             .await
@@ -789,6 +791,21 @@ impl DroidBridge {
             .ok_or_else(|| {
                 invalid_params(format!("thread `{}` is not loaded", params.thread_id))
             })?;
+        let target_model = normalize_model(params.model.as_deref()).unwrap_or_else(|| record.model.clone());
+        let mut settings = json!({});
+        if target_model != record.model {
+            settings["modelId"] = json!(target_model);
+        }
+        if let Some(effort) = params.effort {
+            settings["reasoningEffort"] = json!(self.native_effort(&target_model, effort).await?);
+        }
+        if !settings.as_object().unwrap().is_empty() {
+            process.request("droid.update_session_settings", settings).await.map_err(internal_err)?;
+            if let Some(stored) = self.threads.lock().await.get_mut(&params.thread_id) {
+                stored.model = target_model;
+                if params.effort.is_some() { stored.effort = params.effort; }
+            }
+        }
         let prompt = input_to_text(&params.input);
         let turn_id = Uuid::now_v7().to_string();
         let started_at = now_secs();
@@ -978,7 +995,7 @@ impl DroidBridge {
             cwd = %process.cwd().display(),
             "spawned droid process"
         );
-        let (method, params) = match open_mode {
+        let (method, mut params) = match open_mode {
             SessionOpenMode::Initialize => (
                 "droid.initialize_session",
                 json!({
@@ -996,6 +1013,9 @@ impl DroidBridge {
                 }),
             ),
         };
+        if params["modelId"].is_null() {
+            params.as_object_mut().unwrap().remove("modelId");
+        }
         process
             .request(method, params)
             .await
@@ -1085,7 +1105,7 @@ impl DroidBridge {
         } else {
             index::session_model(&entry.metadata.droid_session_path)
                 .await
-                .unwrap_or_else(|| DEFAULT_MODEL.to_string())
+                .unwrap_or_default()
         };
         ThreadRecord {
             id: entry.thread_id.clone(),
@@ -1102,6 +1122,7 @@ impl DroidBridge {
                     .into_owned(),
             ),
             model,
+            effort: None,
             approval_policy: params
                 .approval_policy
                 .clone()
@@ -1192,6 +1213,13 @@ fn thread_json(record: &ThreadRecord, include_turns: bool) -> Value {
     })
 }
 
+fn apply_native_settings(record: &mut ThreadRecord, settings: &Value) {
+    if let Some(model) = settings["modelId"].as_str() {
+        record.model = model.to_owned();
+    }
+    record.effort = settings["reasoningEffort"].as_str().and_then(crate::models::effort);
+}
+
 fn thread_attach_response(record: &ThreadRecord, model: &str) -> Value {
     json!({
         "thread": thread_json(record, true),
@@ -1205,7 +1233,7 @@ fn thread_attach_response(record: &ThreadRecord, model: &str) -> Value {
         "sandbox": record.sandbox,
         "permissionProfile": { "type": "disabled" },
         "activePermissionProfile": null,
-        "reasoningEffort": "high",
+        "reasoningEffort": record.effort,
     })
 }
 
@@ -1307,108 +1335,6 @@ fn last_text_preview(items: &[Value]) -> String {
         .chars()
         .take(240)
         .collect()
-}
-
-fn droid_models() -> Vec<p::Model> {
-    vec![
-        model(
-            DEFAULT_MODEL,
-            "Claude Sonnet 4.5",
-            true,
-            p::ReasoningEffort::None,
-        ),
-        model(
-            "claude-opus-4-7",
-            "Claude Opus 4.7",
-            false,
-            p::ReasoningEffort::High,
-        ),
-        model(
-            "claude-sonnet-4-6",
-            "Claude Sonnet 4.6",
-            false,
-            p::ReasoningEffort::High,
-        ),
-        model(
-            "claude-haiku-4-5-20251001",
-            "Claude Haiku 4.5",
-            false,
-            p::ReasoningEffort::None,
-        ),
-        model("gpt-5.5", "GPT-5.5", false, p::ReasoningEffort::Medium),
-        model(
-            "gpt-5.5-fast",
-            "GPT-5.5 Fast Mode",
-            false,
-            p::ReasoningEffort::Medium,
-        ),
-        model("gpt-5.4", "GPT-5.4", false, p::ReasoningEffort::High),
-        model(
-            "gpt-5.4-mini",
-            "GPT-5.4 Mini",
-            false,
-            p::ReasoningEffort::High,
-        ),
-        model(
-            "gpt-5.3-codex",
-            "GPT-5.3 Codex",
-            false,
-            p::ReasoningEffort::High,
-        ),
-        model(
-            "gemini-3.1-pro-preview",
-            "Gemini 3.1 Pro",
-            false,
-            p::ReasoningEffort::High,
-        ),
-        model("glm-5.1", "GLM 5.1", false, p::ReasoningEffort::Medium),
-        model("kimi-k2.6", "Kimi K2.6", false, p::ReasoningEffort::High),
-    ]
-}
-
-fn model(id: &str, display: &str, is_default: bool, effort: p::ReasoningEffort) -> p::Model {
-    p::Model {
-        id: id.to_string(),
-        model: id.to_string(),
-        upgrade: None,
-        upgrade_info: None,
-        availability_nux: None,
-        display_name: display.to_string(),
-        description: "Factory Droid model".to_string(),
-        hidden: false,
-        supported_reasoning_efforts: vec![
-            p::ReasoningEffortOption {
-                reasoning_effort: p::ReasoningEffort::None,
-                description: "No extended reasoning".to_string(),
-            },
-            p::ReasoningEffortOption {
-                reasoning_effort: p::ReasoningEffort::Minimal,
-                description: "Lowest latency".to_string(),
-            },
-            p::ReasoningEffortOption {
-                reasoning_effort: p::ReasoningEffort::Low,
-                description: "Brief reasoning".to_string(),
-            },
-            p::ReasoningEffortOption {
-                reasoning_effort: p::ReasoningEffort::Medium,
-                description: "Default reasoning".to_string(),
-            },
-            p::ReasoningEffortOption {
-                reasoning_effort: p::ReasoningEffort::High,
-                description: "Maximum reasoning".to_string(),
-            },
-        ],
-        default_reasoning_effort: effort,
-        input_modalities: vec![json!("text"), json!("image")],
-        supports_personality: false,
-        additional_speed_tiers: Vec::new(),
-        service_tiers: vec![p::ModelServiceTier {
-            id: "standard".to_string(),
-            name: "Standard".to_string(),
-            description: "Default bridge tier".to_string(),
-        }],
-        is_default,
-    }
 }
 
 fn normalize_model(model: Option<&str>) -> Option<String> {

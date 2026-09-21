@@ -89,11 +89,7 @@ pub fn handle_model_list(
 ) -> p::ModelListResponse {
     let cached = bridge.all_models();
     if !cached.is_empty() {
-        let data: Vec<p::Model> = cached.iter().map(|m| acp_model_to_codex(m)).collect();
-        return p::ModelListResponse {
-            data,
-            next_cursor: None,
-        };
+        return models_response(&cached);
     }
     // Fallback: agent hasn't yet started a session so we have no
     // catalog. Return a single placeholder so the iOS picker has at
@@ -111,13 +107,10 @@ pub fn handle_model_list(
         upgrade_info: None,
         availability_nux: None,
         display_name: display_name.clone(),
-        description: format!("Default model for {display_name}"),
+        description: format!("{display_name} default. This ACP agent publishes selectable models after a session is opened."),
         hidden: false,
-        supported_reasoning_efforts: vec![p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Medium,
-            description: "Default".to_string(),
-        }],
-        default_reasoning_effort: p::ReasoningEffort::Medium,
+        supported_reasoning_efforts: vec![],
+        default_reasoning_effort: p::ReasoningEffort::None,
         input_modalities: vec![json!("text")],
         supports_personality: false,
         additional_speed_tiers: vec![],
@@ -130,6 +123,13 @@ pub fn handle_model_list(
     }];
     p::ModelListResponse {
         data,
+        next_cursor: None,
+    }
+}
+
+pub(crate) fn models_response(models: &[Value]) -> p::ModelListResponse {
+    p::ModelListResponse {
+        data: models.iter().map(acp_model_to_codex).collect(),
         next_cursor: None,
     }
 }
@@ -164,11 +164,8 @@ fn acp_model_to_codex(entry: &Value) -> p::Model {
         display_name,
         description,
         hidden: false,
-        supported_reasoning_efforts: vec![p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Medium,
-            description: "Default".to_string(),
-        }],
-        default_reasoning_effort: p::ReasoningEffort::Medium,
+        supported_reasoning_efforts: vec![],
+        default_reasoning_effort: p::ReasoningEffort::None,
         input_modalities: vec![json!("text")],
         supports_personality: false,
         additional_speed_tiers: vec![],
@@ -177,28 +174,50 @@ fn acp_model_to_codex(entry: &Value) -> p::Model {
             name: "Standard".to_string(),
             description: "Standard service tier".to_string(),
         }],
-        is_default: false,
+        is_default: entry["isDefault"].as_bool().unwrap_or(false),
     }
 }
 
 /// Pull the `options` array out of `session/new`'s `configOptions[id=model]`.
 /// Returns the raw ACP entries so the bridge can dedupe and we keep
 /// translation in one place.
-pub(crate) fn extract_models_from_config_options(session_new: &Value) -> Vec<Value> {
-    let options = session_new
-        .get("configOptions")
-        .and_then(|v| v.as_array())
-        .map(|v| v.iter())
-        .into_iter()
-        .flatten();
-    for opt in options {
-        if opt.get("id").and_then(|v| v.as_str()) == Some("model") {
-            if let Some(arr) = opt.get("options").and_then(|v| v.as_array()) {
-                return arr.clone();
+pub(crate) fn extract_models_from_config_options(session: &Value) -> Vec<Value> {
+    if let Some(options) = session["configOptions"].as_array() {
+        for option in options {
+            if option["category"] != "model" && option["id"] != "model" {
+                continue;
             }
+            let current = option["currentValue"].as_str();
+            let mut models = Vec::new();
+            for entry in option["options"].as_array().into_iter().flatten() {
+                let values: Vec<&Value> = match entry["options"].as_array() {
+                    Some(group) => group.iter().collect(),
+                    None => vec![entry],
+                };
+                for value in values {
+                    if let Some(id) = value["value"].as_str().filter(|id| !id.is_empty()) {
+                        let mut value = value.clone();
+                        value["isDefault"] = json!(Some(id) == current);
+                        models.push(value);
+                    }
+                }
+            }
+            return models;
         }
     }
-    Vec::new()
+    // Older ACP agents expose the model selector directly in session state.
+    session["models"]["availableModels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model["modelId"].as_str().filter(|id| !id.is_empty())?;
+            Some(
+                json!({"value":id, "name":model["name"], "description":model["description"],
+                "isDefault":session["models"]["currentModelId"].as_str() == Some(id)}),
+            )
+        })
+        .collect()
 }
 
 /// Pull `modes.currentModeId` and `modes.availableModes` out of
@@ -363,6 +382,7 @@ pub async fn handle_thread_start(
     // entries in `configOptions[]`. We stash the parsed shapes per
     // session so `model/list` and `collaborationMode/list` can serve
     // real data instead of placeholder rows.
+    bridge.set_native_config_options(&session_id, &acp_response);
     let models = extract_models_from_config_options(&acp_response);
     if !models.is_empty() {
         bridge.set_models(&session_id, models);
@@ -522,7 +542,7 @@ pub async fn handle_thread_resume(
         "mcpServers": [],
     });
 
-    let _acp_response = client
+    let acp_response = client
         .send_request("session/load", acp_request)
         .await
         .map_err(|e| JsonRpcError {
@@ -535,6 +555,11 @@ pub async fn handle_thread_resume(
             data: None,
         })?;
 
+    bridge.set_native_config_options(&typed.thread_id, &acp_response);
+    let models = extract_models_from_config_options(&acp_response);
+    if acp_response.get("configOptions").is_some() || acp_response.get("models").is_some() {
+        bridge.set_models(&typed.thread_id, models);
+    }
     // session/load also streams `available_commands_update` ahead of the
     // response — cache whatever the agent sends so `skills/list` returns
     // a real list even before the first turn is sent.
@@ -1204,6 +1229,10 @@ pub async fn handle_turn_start(
         bridge.set_current_mode(&typed.thread_id, mode);
     }
 
+    if let Some(models) = stream.models.clone() {
+        bridge.set_models(&typed.thread_id, models);
+    }
+
     // If the agent emitted a plan, surface it as turn/plan/updated.
     // We map ACP plan entries → codex TurnPlanStep (status: pending|inProgress|completed),
     // dropping the ACP `priority` field which has no codex equivalent.
@@ -1531,3 +1560,24 @@ pub async fn handle_turn_interrupt(
 
 // Note: ACP `session/update` translation lives in `crate::translator`.
 // `handle_turn_start` and `build_turns_from_replay` are the only callers.
+
+#[cfg(test)]
+mod model_catalog_tests {
+    use super::*;
+    #[test]
+    fn grouped_model_category_keeps_current_value_and_legacy_catalogs() {
+        let models = extract_models_from_config_options(&json!({"configOptions":[{
+            "id":"provider-model", "category":"model", "currentValue":"latest", "options":[
+                {"group":"recommended","name":"Recommended","options":[{"value":"latest","name":"Latest"}]}
+            ]
+        }]}));
+        assert_eq!(models.len(), 1);
+        assert_eq!(acp_model_to_codex(&models[0]).id, "latest");
+        assert!(acp_model_to_codex(&models[0]).is_default);
+        let legacy = extract_models_from_config_options(&json!({"models":{
+            "currentModelId":"custom", "availableModels":[{"modelId":"custom","name":"Custom"}]
+        }}));
+        assert_eq!(legacy[0]["value"], "custom");
+        assert_eq!(legacy[0]["isDefault"], true);
+    }
+}

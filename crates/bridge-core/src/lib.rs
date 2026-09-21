@@ -32,3 +32,5 @@ pub use thread_index::{
     DEFAULT_LIST_LIMIT, Hydrator, IndexEntry, ListFilter, ListPage, ListSort, MAX_LIST_LIMIT,
     ThreadIndex, ThreadIndexHandle, encode_backwards_cursor, resolve_list_limit,
 };
+
+pub mod settings;

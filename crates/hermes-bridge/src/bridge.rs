@@ -26,9 +26,7 @@ use alleycat_codex_proto::common::{
     ApprovalsReviewer, AskForApproval, ReasoningEffort, SandboxMode, SessionSource, ThreadStatus,
     TurnStatus,
 };
-use alleycat_codex_proto::config::{
-    ConfigReadResponse, ConfigRequirementsReadResponse, ConfigWriteResponse, WriteStatus,
-};
+use alleycat_codex_proto::config::ConfigRequirementsReadResponse;
 use alleycat_codex_proto::items::{ThreadItem, UserInput};
 use alleycat_codex_proto::lifecycle::InitializeResponse;
 use alleycat_codex_proto::mcp::{
@@ -54,6 +52,78 @@ use crate::api_client::{CreateRunRequest, DEFAULT_API_KEY_ENV, HermesApiClient};
 use crate::config::HermesBridgeConfig;
 use crate::index::{HermesBinding, ThreadIndex};
 use crate::state::{ActiveTurn, TurnState};
+
+fn gateway_model_ids(catalog: &Value) -> anyhow::Result<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    if let Some(providers) = catalog["providers"].as_array() {
+        for provider in providers {
+            if provider["authenticated"] == false {
+                continue;
+            }
+            let Some(slug) = provider["slug"].as_str().filter(|slug| !slug.is_empty()) else {
+                continue;
+            };
+            for model in provider["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                if model.is_empty() {
+                    continue;
+                }
+                let id = format!("hermes/{slug}/{model}");
+                if seen.insert(id.clone()) {
+                    ids.push(id);
+                }
+            }
+        }
+        if let (Some(provider), Some(model)) =
+            (catalog["provider"].as_str(), catalog["model"].as_str())
+        {
+            let current = format!("hermes/{provider}/{model}");
+            if let Some(index) = ids.iter().position(|id| id == &current) {
+                ids.swap(0, index);
+            }
+        }
+    } else {
+        let rows = catalog["data"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Hermes catalog is missing data"))?;
+        for id in rows
+            .iter()
+            .filter_map(|row| row["id"].as_str())
+            .filter(|id| !id.trim().is_empty())
+        {
+            if seen.insert(id.to_string()) {
+                ids.push(id.to_string());
+            }
+        }
+    }
+    anyhow::ensure!(
+        !ids.is_empty(),
+        "Hermes returned no selectable model routes"
+    );
+    Ok(ids)
+}
+
+/// Our explicit namespace disambiguates provider routing from ordinary model
+/// ids such as anthropic/claude on OpenRouter. Never split unqualified ids.
+pub(crate) fn hermes_model_selection(value: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(value) = value.filter(|value| !value.is_empty() && *value != "hermes-agent") else {
+        return (None, None);
+    };
+    if let Some((provider, model)) = value
+        .strip_prefix("hermes/")
+        .and_then(|value| value.split_once('/'))
+    {
+        if !provider.is_empty() && !model.is_empty() {
+            return (Some(model.into()), Some(provider.into()));
+        }
+    }
+    (Some(value.into()), None)
+}
 
 fn random_hex(len: usize) -> String {
     use rand::RngCore;
@@ -774,29 +844,35 @@ impl HermesBridge {
 
 impl HermesBridge {
     async fn handle_model_list(&self, _ctx: &Conn, _params: Value) -> Result<Value, JsonRpcError> {
+        let ids = match &self.config.mode {
+            crate::config::HermesMode::Cli { .. } => return Err(rpc_error(-32603,
+                "Hermes CLI does not expose a model catalog; connect the Hermes gateway API to discover configured models")),
+            crate::config::HermesMode::Api { .. } | crate::config::HermesMode::Auto { .. } => gateway_model_ids(
+                &self.api_client.models().await.map_err(|error| rpc_error(-32603, error.to_string()))?,
+            ).map_err(|error| rpc_error(-32603, error.to_string()))?,
+        };
         to_value(ModelListResponse {
-            data: vec![alleycat_codex_proto::model::Model {
-                id: "hermes-agent".to_string(),
-                model: "hermes-agent".to_string(),
-                upgrade: None,
-                upgrade_info: None,
-                availability_nux: None,
-                display_name: "Hermes Agent".to_string(),
-                description: "Hermes Agent via Alleycat bridge".to_string(),
-                hidden: false,
-                supported_reasoning_efforts: vec![
-                    alleycat_codex_proto::model::ReasoningEffortOption {
-                        reasoning_effort: ReasoningEffort::Medium,
-                        description: "Default Hermes reasoning effort".to_string(),
-                    },
-                ],
-                default_reasoning_effort: ReasoningEffort::Medium,
-                input_modalities: vec![json!("text")],
-                supports_personality: false,
-                additional_speed_tiers: vec![],
-                service_tiers: vec![],
-                is_default: true,
-            }],
+            data: ids
+                .into_iter()
+                .enumerate()
+                .map(|(index, id)| alleycat_codex_proto::model::Model {
+                    id: id.clone(),
+                    model: id.clone(),
+                    upgrade: None,
+                    upgrade_info: None,
+                    availability_nux: None,
+                    display_name: id.strip_prefix("hermes/").unwrap_or(&id).to_string(),
+                    description: "Configured Hermes model route".to_string(),
+                    hidden: false,
+                    supported_reasoning_efforts: vec![],
+                    default_reasoning_effort: ReasoningEffort::None,
+                    input_modalities: vec![json!("text")],
+                    supports_personality: false,
+                    additional_speed_tiers: vec![],
+                    service_tiers: vec![],
+                    is_default: index == 0,
+                })
+                .collect(),
             next_cursor: None,
         })
     }
@@ -846,50 +922,149 @@ impl HermesBridge {
         to_value(LogoutAccountResponse::default())
     }
 
-    async fn handle_config_read(&self, _ctx: &Conn, _params: Value) -> Result<Value, JsonRpcError> {
-        to_value(ConfigReadResponse {
-            config: json!({"model_provider": "hermes-agent", "model": "hermes-agent"}),
-            origins: Default::default(),
-            layers: None,
-        })
+    async fn active_native_settings_path(
+        &self,
+    ) -> Result<Option<std::path::PathBuf>, JsonRpcError> {
+        let gateway = match &self.config.mode {
+            crate::config::HermesMode::Api { .. } => true,
+            crate::config::HermesMode::Cli { .. } => false,
+            crate::config::HermesMode::Auto { .. } => {
+                tokio::time::timeout(std::time::Duration::from_secs(3), self.api_client.health())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some_and(|h| h.status == "ok")
+            }
+        };
+        if gateway {
+            Ok(None)
+        } else {
+            hermes_settings_path().map(Some).map_err(settings_error)
+        }
     }
-
+    async fn native_settings_catalog(
+        &self,
+    ) -> Result<(Value, bool, std::path::PathBuf), JsonRpcError> {
+        let bin = match &self.config.mode {
+            crate::config::HermesMode::Cli { bin }
+            | crate::config::HermesMode::Auto { bin, .. } => bin.as_deref().unwrap_or("hermes"),
+            _ => "hermes",
+        };
+        let installed = which::which(bin)
+            .and_then(|p| {
+                p.canonicalize()
+                    .map_err(|_| which::Error::CannotCanonicalize)
+            })
+            .map_err(|_| {
+                settings_error(anyhow::anyhow!(
+                    "Cannot resolve installed Hermes interpreter for settings discovery"
+                ))
+            })?;
+        let interpreter = installed
+            .parent()
+            .ok_or_else(|| settings_error(anyhow::anyhow!("Invalid Hermes installation path")))?
+            .join("python");
+        let output=tokio::time::timeout(std::time::Duration::from_secs(10),tokio::process::Command::new(interpreter).args(["-c","import json; from hermes_cli.config import load_config_readonly, get_config_path, is_managed; print(json.dumps({'config':load_config_readonly(),'source':str(get_config_path()),'managed':is_managed()}))"]).stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).kill_on_drop(true).output()).await.map_err(|_|settings_error(anyhow::anyhow!("Hermes settings discovery timed out")))?.map_err(|_|settings_error(anyhow::anyhow!("Hermes settings interpreter could not start")))?;
+        if !output.status.success() {
+            return Err(settings_error(anyhow::anyhow!(
+                "Installed Hermes could not expose its native settings defaults"
+            )));
+        }
+        let response: Value = serde_json::from_slice(&output.stdout)
+            .map_err(|_| settings_error(anyhow::anyhow!("Invalid Hermes settings catalog")))?;
+        let config = response
+            .get("config")
+            .filter(|v| v.is_object())
+            .cloned()
+            .ok_or_else(|| {
+                settings_error(anyhow::anyhow!("Hermes configuration is not an object"))
+            })?;
+        let source = response["source"]
+            .as_str()
+            .ok_or_else(|| settings_error(anyhow::anyhow!("Hermes settings source missing")))?;
+        Ok((
+            config,
+            response["managed"].as_bool().unwrap_or(true),
+            source.into(),
+        ))
+    }
+    async fn handle_config_read(&self, _ctx: &Conn, _params: Value) -> Result<Value, JsonRpcError> {
+        match self.active_native_settings_path().await? {
+            Some(_) => {
+                let (effective, managed, path) = self.native_settings_catalog().await?;
+                let reason =
+                    managed.then_some("Hermes configuration is managed by administrator policy");
+                let mut response = alleycat_bridge_core::settings::response(
+                    alleycat_bridge_core::settings::read(&path).map_err(settings_error)?,
+                    &path.to_string_lossy(),
+                    !managed,
+                    reason,
+                );
+                let defaults = alleycat_bridge_core::settings::response(
+                    effective,
+                    "Installed Hermes defaults and user overrides",
+                    !managed,
+                    reason,
+                );
+                let descriptors = response.config["_litterSettings"].as_array_mut().unwrap();
+                for descriptor in defaults.config["_litterSettings"].as_array().unwrap() {
+                    if !descriptors
+                        .iter()
+                        .any(|row| row["key"] == descriptor["key"])
+                    {
+                        descriptors.push(descriptor.clone());
+                    }
+                }
+                to_value(response)
+            }
+            None => to_value(alleycat_bridge_core::settings::response(
+                json!({}),
+                "Hermes gateway",
+                false,
+                Some(
+                    "The connected Hermes gateway does not expose a settings API; configure settings on its host",
+                ),
+            )),
+        }
+    }
     async fn handle_config_value_write(
         &self,
         _ctx: &Conn,
         params: Value,
     ) -> Result<Value, JsonRpcError> {
-        let file_path = params
-            .get("filePath")
-            .and_then(Value::as_str)
-            .unwrap_or("hermes-bridge")
-            .to_string();
-        to_value(ConfigWriteResponse {
-            status: WriteStatus::Ok,
-            version: epoch_ms().to_string(),
-            file_path,
-            overridden_metadata: None,
-        })
+        let params = serde_json::from_value(params).map_err(|e| settings_error(e.into()))?;
+        let _path = self.active_native_settings_path().await?.ok_or_else(|| {
+            settings_error(anyhow::anyhow!(
+                "Hermes gateway does not expose a settings writer"
+            ))
+        })?;
+        let (_, managed, path) = self.native_settings_catalog().await?;
+        if managed {
+            return Err(settings_error(anyhow::anyhow!(
+                "Hermes configuration is managed by administrator policy"
+            )));
+        }
+        to_value(alleycat_bridge_core::settings::write_one(&path, params).map_err(settings_error)?)
     }
-
     async fn handle_config_batch_write(
         &self,
         _ctx: &Conn,
         params: Value,
     ) -> Result<Value, JsonRpcError> {
-        let file_path = params
-            .get("filePath")
-            .and_then(Value::as_str)
-            .unwrap_or("hermes-bridge")
-            .to_string();
-        to_value(ConfigWriteResponse {
-            status: WriteStatus::Ok,
-            version: epoch_ms().to_string(),
-            file_path,
-            overridden_metadata: None,
-        })
+        let params = serde_json::from_value(params).map_err(|e| settings_error(e.into()))?;
+        let _path = self.active_native_settings_path().await?.ok_or_else(|| {
+            settings_error(anyhow::anyhow!(
+                "Hermes gateway does not expose a settings writer"
+            ))
+        })?;
+        let (_, managed, path) = self.native_settings_catalog().await?;
+        if managed {
+            return Err(settings_error(anyhow::anyhow!(
+                "Hermes configuration is managed by administrator policy"
+            )));
+        }
+        to_value(alleycat_bridge_core::settings::write(&path, params).map_err(settings_error)?)
     }
-
     async fn handle_config_requirements_read(
         &self,
         _ctx: &Conn,
@@ -1092,11 +1267,18 @@ impl HermesBridge {
                     .get_by_thread(thread_id)
                     .and_then(|binding| binding.cwd)
             });
+        let selection = params.model.clone().or_else(|| {
+            self.index
+                .get_by_thread(thread_id)
+                .and_then(|binding| binding.model)
+        });
+        let (model, provider) = hermes_model_selection(selection.as_deref());
         let request = CreateRunRequest {
             input: text,
             session_id: Some(session_id.to_string()),
             cwd,
-            model: params.model.clone(),
+            model,
+            provider,
         };
         let run = match self.api_client.create_run(request).await {
             Ok(run) => run,
@@ -1321,12 +1503,22 @@ impl HermesBridge {
             ),
             crate::config::HermesMode::Api { .. } => ("hermes".to_string(), None),
         };
+        let model = params
+            .model
+            .clone()
+            .or_else(|| binding.as_ref().and_then(|b| b.model.clone()));
         let cwd = params
             .cwd
             .clone()
             .or_else(|| binding.and_then(|b| b.cwd.map(PathBuf::from)));
-        match crate::cli_adapter::run_hermes_cli(&bin, &text, session_id.as_deref(), cwd.as_ref())
-            .await
+        match crate::cli_adapter::run_hermes_cli(
+            &bin,
+            &text,
+            session_id.as_deref(),
+            cwd.as_ref(),
+            model.as_deref(),
+        )
+        .await
         {
             Ok(output) => {
                 self.emit_synthetic_completion(ctx, thread_id, turn_id, &output)
@@ -1502,5 +1694,84 @@ impl HermesBridge {
             .await;
         self.emit_turn_completed(ctx, thread_id, turn_id, Some(text), None)
             .await;
+    }
+}
+
+fn hermes_settings_path() -> anyhow::Result<std::path::PathBuf> {
+    match std::env::var_os("HERMES_HOME") {
+        Some(home) => Ok(std::path::PathBuf::from(home).join("config.yaml")),
+        None => alleycat_bridge_core::settings::home_path(".hermes/config.yaml"),
+    }
+}
+fn settings_error(e: anyhow::Error) -> JsonRpcError {
+    JsonRpcError {
+        code: -32602,
+        message: e.to_string(),
+        data: None,
+    }
+}
+
+#[cfg(test)]
+mod model_catalog_tests {
+    use super::*;
+    #[test]
+    fn provider_inventory_and_dispatch_preserve_nested_model_ids() {
+        let ids = gateway_model_ids(
+            &json!({"provider":"openrouter","model":"anthropic/new-model","providers":[
+                {"slug":"other","authenticated":true,"models":["same-name"]},
+                {"slug":"openrouter","authenticated":true,"models":["anthropic/new-model"]},
+                {"slug":"unauthenticated","authenticated":false,"models":["unavailable"]}
+            ]}),
+        )
+        .unwrap();
+        assert_eq!(ids[0], "hermes/openrouter/anthropic/new-model");
+        assert_eq!(ids.len(), 2);
+        assert_eq!(
+            hermes_model_selection(Some(&ids[0])),
+            (
+                Some("anthropic/new-model".into()),
+                Some("openrouter".into())
+            )
+        );
+        assert_eq!(
+            hermes_model_selection(Some("anthropic/new-model")),
+            (Some("anthropic/new-model".into()), None)
+        );
+        assert_eq!(hermes_model_selection(Some("hermes-agent")), (None, None));
+    }
+    #[tokio::test]
+    async fn unavailable_catalog_is_an_error_instead_of_default_only_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = alleycat_bridge_core::SessionRegistry::new(Default::default());
+        let conn = Conn::from_session(registry.get_or_create("test".into(), "hermes"));
+        // Port allocated then closed to produce a deterministic connection refusal.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        for mode in [
+            crate::config::HermesMode::Auto { api_base: endpoint, bin: None },
+            crate::config::HermesMode::Cli { bin: None },
+        ] {
+            let bridge = HermesBridge::new(HermesBridgeConfig {
+                mode, state_dir: Some(dir.path().to_string_lossy().into_owned()),
+            });
+            assert!(bridge.handle_model_list(&conn, json!({})).await.is_err());
+        }
+    }
+
+    #[test]
+    fn gateway_catalog_tracks_route_changes_without_fabricated_models() {
+        assert_eq!(
+            gateway_model_ids(
+                &json!({"data":[{"id":"hermes-agent"},{"id":"new-route"},{"id":"new-route"}]})
+            )
+            .unwrap(),
+            vec!["hermes-agent", "new-route"]
+        );
+        assert_eq!(
+            gateway_model_ids(&json!({"data":[{"id":"replacement"}]})).unwrap(),
+            vec!["replacement"]
+        );
+        assert!(gateway_model_ids(&json!({"data":[]})).is_err());
     }
 }

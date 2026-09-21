@@ -67,6 +67,7 @@ pub struct TurnStreamEmitter {
     /// Most-recent ACP `current_mode_update` modeId. ACP carries this
     /// as `{sessionUpdate:"current_mode_update", currentModeId: string}`.
     current_mode: Option<String>,
+    models: Option<Vec<Value>>,
 }
 
 struct TextRun {
@@ -92,6 +93,7 @@ pub struct StreamFinish {
     pub plan_entries: Option<Vec<Value>>,
     pub available_commands: Option<Vec<Value>>,
     pub current_mode: Option<String>,
+    pub models: Option<Vec<Value>>,
 }
 
 impl TurnStreamEmitter {
@@ -111,6 +113,7 @@ impl TurnStreamEmitter {
             plan_entries: None,
             available_commands: None,
             current_mode: None,
+            models: None,
         }
     }
 
@@ -157,6 +160,9 @@ impl TurnStreamEmitter {
                     self.available_commands = Some(arr.clone());
                 }
             }
+            "config_option_update" => {
+                self.models = Some(crate::handlers::extract_models_from_config_options(update));
+            }
             "current_mode_update" => {
                 if let Some(id) = update.get("currentModeId").and_then(|v| v.as_str()) {
                     self.current_mode = Some(id.to_string());
@@ -184,6 +190,7 @@ impl TurnStreamEmitter {
             plan_entries: self.plan_entries,
             available_commands: self.available_commands,
             current_mode: self.current_mode,
+            models: self.models,
         }
     }
 
@@ -594,5 +601,20 @@ mod tests {
         assert!(ms.contains(&"item/completed".to_string()));
         assert_eq!(finish.items.len(), 1);
         assert_eq!(finish.items[0]["status"], "completed");
+    }
+}
+
+#[cfg(test)]
+mod model_catalog_update_tests {
+    use super::*;
+    #[test]
+    fn stream_keeps_latest_model_catalog_even_when_it_becomes_empty() {
+        let mut emitter = TurnStreamEmitter::new(|_, _| {}, "thread".into(), "turn".into());
+        for models in [json!([{"value":"fresh","name":"Fresh"}]), json!([])] {
+            emitter.ingest(&json!({"method":"session/update","params":{"sessionId":"thread","update":{
+                "sessionUpdate":"config_option_update", "configOptions":[{"id":"model","options":models}]
+            }}}));
+        }
+        assert_eq!(emitter.finish().models, Some(vec![]));
     }
 }

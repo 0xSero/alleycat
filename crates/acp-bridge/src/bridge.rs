@@ -93,6 +93,7 @@ pub struct ModesSnapshot {
 /// Unified ACP bridge facade.
 pub struct AcpBridge {
     pool: Arc<AcpPool>,
+    model_catalog: Option<crate::catalog::ModelCatalogCommand>,
     /// All completed turns we've observed, keyed by codex thread/session
     /// id. The list is ordered oldest→newest so `thread/read` can emit
     /// turns in chronological order without re-sorting.
@@ -108,6 +109,7 @@ pub struct AcpBridge {
     /// (devin advertises every model the agent can switch to). Keyed by
     /// session id; aggregated across sessions for `model/list`.
     models: DashMap<String, Vec<Value>>,
+    native_config_options: DashMap<String, Vec<Value>>,
     /// Latest mode list + current mode id per session. Captured from
     /// `session/new` (`modes.availableModes`/`modes.currentModeId`) plus
     /// any `current_mode_update` notifications during turns.
@@ -262,6 +264,42 @@ impl AcpBridge {
             }
         }
         out
+    }
+
+    pub fn set_native_config_options(&self, session_id: &str, response: &Value) {
+        if let Some(options) = response.get("configOptions").and_then(Value::as_array) {
+            self.native_config_options
+                .insert(session_id.into(), options.clone());
+        }
+    }
+    pub fn native_settings(&self) -> p::ConfigReadResponse {
+        let mut descriptors = Vec::new();
+        for entry in self.native_config_options.iter() {
+            for option in entry.value() {
+                let Some(id) = option["id"].as_str() else {
+                    continue;
+                };
+                if alleycat_bridge_core::settings::sensitive(id) || option["secret"] == true {
+                    continue;
+                }
+                let value = &option["currentValue"];
+                if alleycat_bridge_core::settings::sanitize(value) != *value {
+                    continue;
+                }
+                let choices: Vec<&str> = option["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v["value"].as_str())
+                    .collect();
+                descriptors.push(json!({"key":format!("{}.{}",entry.key(),id),"label":option["name"].as_str().unwrap_or(id),"valueJson":value.to_string(),"valueKind":"string","choices":choices,"scope":format!("session {}",entry.key()),"source":"ACP session configOptions","writable":false,"readOnlyReason":"ACP settings belong to individual sessions; change them in the native agent session"}));
+            }
+        }
+        p::ConfigReadResponse {
+            config: json!({"_litterSettings":descriptors}),
+            origins: Default::default(),
+            layers: None,
+        }
     }
 
     /// Cache the most-recent model catalog seen for a session.
@@ -442,6 +480,7 @@ pub struct AcpBridgeBuilder {
     retry_backoff: Option<Duration>,
     state_dir: Option<PathBuf>,
     enable_persistence: bool,
+    model_catalog: Option<(Vec<String>, crate::catalog::CatalogParser)>,
 }
 
 impl Default for AcpBridgeBuilder {
@@ -457,11 +496,17 @@ impl Default for AcpBridgeBuilder {
             retry_backoff: None,
             state_dir: None,
             enable_persistence: false,
+            model_catalog: None,
         }
     }
 }
 
 impl AcpBridgeBuilder {
+    pub fn model_catalog_command(mut self, args: Vec<String>, parse: crate::catalog::CatalogParser) -> Self {
+        self.model_catalog = Some((args, parse));
+        self
+    }
+
     pub fn agent_bin(mut self, bin: impl Into<PathBuf>) -> Self {
         self.agent_bin = Some(bin.into());
         self
@@ -611,6 +656,9 @@ impl AcpBridgeBuilder {
                 .unwrap_or(crate::pool::DEFAULT_IDLE_TTL),
         };
 
+        let model_catalog = self.model_catalog.map(|(args, parse)| crate::catalog::ModelCatalogCommand {
+            program: config.agent_bin.clone(), args, parse, launcher: Arc::clone(&launcher),
+        });
         let pool = Arc::new(AcpPool::new(config, launcher, policy));
 
         // Initialize persistence if enabled
@@ -645,10 +693,12 @@ impl AcpBridgeBuilder {
 
         Ok(Arc::new(AcpBridge {
             pool,
+            model_catalog,
             turns: DashMap::new(),
             session_status: DashMap::new(),
             available_commands: DashMap::new(),
             models: DashMap::new(),
+            native_config_options: DashMap::new(),
             modes: DashMap::new(),
             thread_titles: DashMap::new(),
             persistence,
@@ -693,6 +743,13 @@ impl Bridge for AcpBridge {
         params: Value,
     ) -> Result<Value, JsonRpcError> {
         debug!("Dispatching method: {}", method);
+        // Native list commands do not need an ACP process or a persisted session.
+        if method == "model/list" {
+            if let Some(command) = &self.model_catalog {
+                let models = command.discover().await.map_err(|error| JsonRpcError::internal(error.to_string()))?;
+                return to_value(handlers::models_response(&models));
+            }
+        }
 
         let session = ctx.session();
         let session_key = format!("{}:{}", session.agent, session.node_id);
@@ -722,7 +779,8 @@ impl Bridge for AcpBridge {
                 } else {
                     decode(params)?
                 };
-                to_value(handlers::handle_config_read(typed))
+                let _ = typed;
+                to_value(self.native_settings())
             }
             "configRequirements/read" => to_value(handlers::handle_config_requirements_read()),
             "model/list" => {

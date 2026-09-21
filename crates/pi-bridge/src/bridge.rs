@@ -56,6 +56,7 @@ pub struct PiBridge {
     trust_persisted_cwd: bool,
     model_provider_prefixes: Arc<Vec<String>>,
     model_catalog_path: Option<PathBuf>,
+    native_settings_path: Option<PathBuf>,
     session_index_refresh: Option<SessionIndexRefresh>,
 }
 
@@ -103,17 +104,20 @@ impl PiBridge {
         let session = Arc::clone(ctx.session());
         let key = session_key(&session);
         let defaults = self.defaults_for(&key);
-        Arc::new(ConnectionState::new(
-            session,
-            Arc::clone(&self.pool),
-            Arc::clone(&self.thread_index),
-            defaults,
-            Arc::clone(&self.launcher),
-            self.trust_persisted_cwd,
-            Arc::clone(&self.model_provider_prefixes),
-            self.model_catalog_path.clone(),
-            self.session_index_refresh.clone(),
-        ))
+        Arc::new(
+            ConnectionState::new(
+                session,
+                Arc::clone(&self.pool),
+                Arc::clone(&self.thread_index),
+                defaults,
+                Arc::clone(&self.launcher),
+                self.trust_persisted_cwd,
+                Arc::clone(&self.model_provider_prefixes),
+                self.model_catalog_path.clone(),
+                self.session_index_refresh.clone(),
+            )
+            .with_native_settings_path(self.native_settings_path.clone()),
+        )
     }
 }
 
@@ -131,9 +135,15 @@ pub struct PiBridgeBuilder {
     defer_initial_hydration: bool,
     model_provider_prefixes: Vec<String>,
     model_catalog_path: Option<PathBuf>,
+    native_settings_path: Option<PathBuf>,
 }
 
 impl PiBridgeBuilder {
+    pub fn native_settings_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.native_settings_path = Some(path.into());
+        self
+    }
+
     pub fn agent_bin(mut self, bin: impl Into<PathBuf>) -> Self {
         self.agent_bin = Some(bin.into());
         self
@@ -336,6 +346,7 @@ impl PiBridgeBuilder {
             trust_persisted_cwd: self.trust_persisted_cwd,
             model_provider_prefixes: Arc::new(self.model_provider_prefixes),
             model_catalog_path: self.model_catalog_path,
+            native_settings_path: self.native_settings_path,
             session_index_refresh,
         }))
     }
@@ -499,18 +510,21 @@ async fn dispatch(
                 decode(&params)?
             };
             handlers::config::handle_config_read(state, codex_home, typed)
+                .await
                 .map_err(internal_err)
                 .and_then(|v| serde_json::to_value(v).map_err(serde_err))
         }
         "config/value/write" => {
             let typed: p::ConfigValueWriteParams = decode(&params)?;
             handlers::config::handle_config_value_write(state, codex_home, typed)
+                .await
                 .map_err(internal_err)
                 .and_then(|v| serde_json::to_value(v).map_err(serde_err))
         }
         "config/batchWrite" => {
             let typed: p::ConfigBatchWriteParams = decode(&params)?;
             handlers::config::handle_config_batch_write(state, codex_home, typed)
+                .await
                 .map_err(internal_err)
                 .and_then(|v| serde_json::to_value(v).map_err(serde_err))
         }
@@ -549,7 +563,7 @@ async fn dispatch(
             } else {
                 decode(&params)?
             };
-            ok(handlers::model::handle_model_list(state, typed).await)
+            ok(handlers::model::handle_model_list(state, typed).await.map_err(internal_err)?)
         }
         "fuzzyFileSearch" => {
             let typed: p::FuzzyFileSearchParams = decode(&params)?;
