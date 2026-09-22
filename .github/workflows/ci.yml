@@ -21,6 +21,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Test Python helpers
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
       - name: Install system deps
         run: |
           sudo apt-get update
