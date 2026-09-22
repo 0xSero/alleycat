@@ -4,7 +4,8 @@
 Spawns one of `alleycat-pi-bridge` / `alleycat-claude-bridge` /
 `alleycat-opencode-bridge` listening on a temp Unix socket, connects to
 it, performs the JSON-RPC `initialize` handshake, sends one request,
-prints any notifications + the response, then exits.
+prints any notifications + the response, then exits. JSON-RPC errors exit
+with status 1; an initialization error stops before sending the method.
 
 All three bridges support `--socket <path>`; opencode-bridge only
 supports socket mode, so we use it uniformly for all three.
@@ -283,8 +284,10 @@ def main() -> int:
             if frame is None:
                 raise SystemExit("bridge closed before responding to initialize")
             if frame.get("id") == init_id:
-                if not ns.quiet_init:
+                if not ns.quiet_init or "error" in frame:
                     print(json.dumps({"_init_response": frame}, indent=2))
+                if "error" in frame:
+                    return 1
                 break
             if not ns.quiet_init:
                 print(json.dumps(frame, indent=2))
@@ -314,7 +317,7 @@ def main() -> int:
                 break
             if frame.get("id") == request_id:
                 response = frame
-                if ns.watch:
+                if ns.watch and "error" not in response:
                     print(json.dumps(response, indent=2))
                     watch_deadline = time.monotonic() + ns.watch_for
                     while True:
@@ -324,7 +327,7 @@ def main() -> int:
                         print(json.dumps(more, indent=2))
                     return 0
                 print(json.dumps(response, indent=2))
-                return 0
+                return 1 if "error" in response else 0
             print(json.dumps(frame, indent=2))
     finally:
         try:
