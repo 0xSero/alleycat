@@ -105,7 +105,7 @@ pub async fn handle_command_exec(
         role: ProcessRole::ToolCommand,
         program: argv[0].clone().into(),
         args: argv[1..].iter().map(|s| s.clone().into()).collect(),
-        cwd: params.cwd.clone().map(Into::into),
+        cwd: params.cwd.clone(),
         env,
         env_clear: false,
         stdin: StdioMode::Null,

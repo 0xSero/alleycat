@@ -1,6 +1,6 @@
 //! `SessionRegistry` — the daemon-lifetime owner of all live sessions, keyed
 //! by `(node_id, agent)`. Concurrent map operations use a coarse `Mutex`; the
-//! contention is fine for our scale (handful of clients × four agents).
+//! contention is fine for our scale (a handful of clients and configured agents).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};

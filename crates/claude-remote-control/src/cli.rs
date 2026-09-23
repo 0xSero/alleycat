@@ -4,19 +4,14 @@ use std::path::PathBuf;
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum SpawnMode {
+    #[default]
     SameDir,
     Worktree,
     /// Single-session/classic mode. Claude's UI also calls this `session`.
     Session,
-}
-
-impl Default for SpawnMode {
-    fn default() -> Self {
-        Self::SameDir
-    }
 }
 
 impl SpawnMode {

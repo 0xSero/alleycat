@@ -19,7 +19,6 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
-dashmap = "6"
 futures = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

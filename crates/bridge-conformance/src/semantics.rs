@@ -312,15 +312,15 @@ fn check_thread_fork(frame: &Frame, ctx: &SemanticContext, findings: &mut Vec<Fi
             "result.thread.id must be non-empty",
         );
     }
-    if let (Some(got), Some(disposable)) = (got, ctx.disposable_thread_id.as_deref()) {
-        if got == disposable {
-            push(
-                findings,
-                frame,
-                "thread/fork.new_id",
-                "forked thread id must differ from disposable thread id",
-            );
-        }
+    if let (Some(got), Some(disposable)) = (got, ctx.disposable_thread_id.as_deref())
+        && got == disposable
+    {
+        push(
+            findings,
+            frame,
+            "thread/fork.new_id",
+            "forked thread id must differ from disposable thread id",
+        );
     }
 }
 

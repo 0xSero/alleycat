@@ -1,8 +1,8 @@
-//! Shared JSON-RPC client used by all four targets.
+//! Shared JSON-RPC client used by every conformance target.
 //!
 //! Every target produces a pair of (writer, reader) trait objects from its
-//! transport (stdio pipes for pi/claude, Unix socket for opencode, raw TCP
-//! for codex). The harness drives them through this client, which handles
+//! transport (usually stdio pipes, with backend-specific socket transports
+//! where needed). The harness drives them through this client, which handles
 //! id allocation, request/response correlation, and notification capture.
 
 use std::sync::atomic::{AtomicI64, Ordering};

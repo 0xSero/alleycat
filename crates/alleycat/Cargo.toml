@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Iroh-backed daemon that multiplexes local coding agents (Codex, Pi, OpenCode, Claude) onto a single QUIC connection for paired clients."
+description = "Iroh-backed daemon that multiplexes local coding agents onto a single QUIC connection for paired clients."
 # Distribution happens via the `kittylitter` wrapper crate in the litter
 # repo; this crate is consumed only as a git dep.
 publish = false

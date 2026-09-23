@@ -79,15 +79,15 @@ pub fn pi_sessions_dir() -> Option<PathBuf> {
 }
 
 fn expand_tilde(input: &str) -> PathBuf {
-    if input == "~" {
-        if let Some(home) = dirs_home() {
-            return home;
-        }
+    if input == "~"
+        && let Some(home) = dirs_home()
+    {
+        return home;
     }
-    if let Some(rest) = input.strip_prefix("~/") {
-        if let Some(home) = dirs_home() {
-            return home.join(rest);
-        }
+    if let Some(rest) = input.strip_prefix("~/")
+        && let Some(home) = dirs_home()
+    {
+        return home.join(rest);
     }
     PathBuf::from(input)
 }

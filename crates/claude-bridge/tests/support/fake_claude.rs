@@ -60,12 +60,11 @@ fn main() -> ExitCode {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    if let Ok(ms) = env::var("FAKE_CLAUDE_INIT_DELAY_MS") {
-        if let Ok(ms) = ms.parse::<u64>() {
-            if ms > 0 {
-                thread::sleep(Duration::from_millis(ms));
-            }
-        }
+    if let Ok(ms) = env::var("FAKE_CLAUDE_INIT_DELAY_MS")
+        && let Ok(ms) = ms.parse::<u64>()
+        && ms > 0
+    {
+        thread::sleep(Duration::from_millis(ms));
     }
 
     emit(
@@ -118,16 +117,16 @@ fn main() -> ExitCode {
             }
         };
 
-        if let Ok(log_path) = env::var("FAKE_CLAUDE_TURN_LOG") {
-            if !log_path.is_empty() {
-                let user_text = first_user_text(&inbound).unwrap_or_else(|| "<no-text>".into());
-                if let Ok(mut f) = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&log_path)
-                {
-                    let _ = writeln!(f, "{user_text}");
-                }
+        if let Ok(log_path) = env::var("FAKE_CLAUDE_TURN_LOG")
+            && !log_path.is_empty()
+        {
+            let user_text = first_user_text(&inbound).unwrap_or_else(|| "<no-text>".into());
+            if let Ok(mut f) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)
+            {
+                let _ = writeln!(f, "{user_text}");
             }
         }
 
@@ -282,10 +281,10 @@ fn substitute_session(value: &mut Value, session_id: &str) {
 }
 
 fn stamp_turn_on_uuid(value: &mut Value, turn: u64) {
-    if let Some(obj) = value.as_object_mut() {
-        if let Some(Value::String(uuid)) = obj.get_mut("uuid") {
-            uuid.push_str(&format!("-t{turn}"));
-        }
+    if let Some(obj) = value.as_object_mut()
+        && let Some(Value::String(uuid)) = obj.get_mut("uuid")
+    {
+        uuid.push_str(&format!("-t{turn}"));
     }
 }
 

@@ -234,12 +234,12 @@ fn check_pi_oneshot(bin: &PathBuf) -> Result<(), SkipReason> {
 
 fn check_acp() -> Result<Prereq, SkipReason> {
     // Support explicit path via env (e.g. ACP_BRIDGE_AGENT_BIN=/Users/.../grok)
-    if let Some(p) = std::env::var_os("ACP_BRIDGE_AGENT_BIN") {
-        if !p.is_empty() {
-            let path = std::path::PathBuf::from(&p);
-            if path.exists() {
-                return Ok(Prereq::Acp { bin: path });
-            }
+    if let Some(p) = std::env::var_os("ACP_BRIDGE_AGENT_BIN")
+        && !p.is_empty()
+    {
+        let path = std::path::PathBuf::from(&p);
+        if path.exists() {
+            return Ok(Prereq::Acp { bin: path });
         }
     }
 
@@ -253,12 +253,12 @@ fn check_acp() -> Result<Prereq, SkipReason> {
 }
 
 fn which_or_env(env_var: &str, bin_name: &str) -> Option<PathBuf> {
-    if let Some(p) = env::var_os(env_var) {
-        if !p.is_empty() {
-            let path = PathBuf::from(p);
-            if path.is_file() {
-                return Some(path);
-            }
+    if let Some(p) = env::var_os(env_var)
+        && !p.is_empty()
+    {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Some(path);
         }
     }
     which::which(bin_name).ok()

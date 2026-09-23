@@ -56,6 +56,18 @@ const CONTROL_INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// surfaces as an error rather than hanging the turn handler.
 const CONTROL_SET_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn effort_to_thinking_tokens(effort: p::ReasoningEffort) -> u32 {
+    match effort {
+        p::ReasoningEffort::None => 0,
+        p::ReasoningEffort::Minimal => 1024,
+        p::ReasoningEffort::Low => 4096,
+        p::ReasoningEffort::Medium => 16_384,
+        p::ReasoningEffort::High
+        | p::ReasoningEffort::XHigh
+        | p::ReasoningEffort::Max => 32_768,
+    }
+}
+
 /// Per-thread active-turn registry. Claude only allows one active turn per
 /// process. Keyed by codex `thread_id`.
 static ACTIVE_TURNS: LazyLock<SyncMutex<HashMap<String, ActiveTurn>>> =
@@ -120,20 +132,15 @@ pub async fn handle_turn_start(
     // a turn that doesn't change the model/effort is a no-op (zero RTT).
     let normalized_model_override = params.model.as_deref().map(normalize_claude_model_id);
     let model_override = normalized_model_override.as_deref();
-    let thinking_override = match params.effort {
-        Some(p::ReasoningEffort::None) => Some(0),
-        Some(p::ReasoningEffort::Minimal) => Some(1024),
-        _ => None,
-    };
-    if model_override.is_some() || thinking_override.is_some() {
-        if let Err(err) = handle
+    let thinking_override = params.effort.map(effort_to_thinking_tokens);
+    if (model_override.is_some() || thinking_override.is_some())
+        && let Err(err) = handle
             .apply_runtime_overrides(model_override, thinking_override, None, CONTROL_SET_TIMEOUT)
             .await
-        {
-            return Err(TurnError::ClaudeRpc(format!(
-                "applying runtime overrides: {err}"
-            )));
-        }
+    {
+        return Err(TurnError::ClaudeRpc(format!(
+            "applying runtime overrides: {err}"
+        )));
     }
 
     if let Some(effort) = params.effort.filter(|effort| {
@@ -277,13 +284,13 @@ pub async fn handle_turn_interrupt(
         .get(&params.thread_id)
         .await
         .ok_or_else(|| TurnError::ThreadNotLoaded(params.thread_id.clone()))?;
-    if let Some(active) = active_turn(&params.thread_id) {
-        if active.turn_id != params.turn_id {
-            return Err(TurnError::TurnIdMismatch {
-                expected: params.turn_id,
-                actual: active.turn_id,
-            });
-        }
+    if let Some(active) = active_turn(&params.thread_id)
+        && active.turn_id != params.turn_id
+    {
+        return Err(TurnError::TurnIdMismatch {
+            expected: params.turn_id,
+            actual: active.turn_id,
+        });
     }
     interrupt_handle(&handle).await;
     Ok(p::TurnInterruptResponse::default())
@@ -466,17 +473,20 @@ async fn run_event_pump(mut args: EventPumpArgs) {
             _ => {}
         }
         let is_terminal = matches!(payload, ClaudeOutbound::Result(_));
-        if let ClaudeOutbound::Result(ref r) = payload {
-            if r.is_error || r.subtype != "success" {
-                error_message = Some(r.result.clone().filter(|s| !s.is_empty()).unwrap_or_else(
-                    || {
+        if let ClaudeOutbound::Result(ref r) = payload
+            && (r.is_error || r.subtype != "success")
+        {
+            error_message = Some(
+                r.result
+                    .clone()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
                         format!(
                             "claude turn ended with subtype {} (terminal_reason={:?})",
                             r.subtype, r.terminal_reason
                         )
-                    },
-                ));
-            }
+                    }),
+            );
         }
 
         let notifications = translator.translate(payload);

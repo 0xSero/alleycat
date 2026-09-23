@@ -168,6 +168,12 @@ pub(crate) fn render_tool_call_public(state: &ToolCallState) -> Value {
     render_tool_call(state)
 }
 
+impl Default for SessionUpdateTranslator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SessionUpdateTranslator {
     pub fn new() -> Self {
         Self {
@@ -666,17 +672,16 @@ fn map_status(acp_status: &str) -> &'static str {
 fn extract_command_from_content(content: &[Value]) -> Option<String> {
     for block in content {
         if let Some(inner) = block.get("content") {
-            if let Some(text) = inner.get("text").and_then(|v| v.as_str()) {
-                if !text.is_empty() {
-                    return Some(text.to_string());
-                }
+            if let Some(text) = inner.get("text").and_then(|v| v.as_str())
+                && !text.is_empty()
+            {
+                return Some(text.to_string());
             }
-            if let Some(resource) = inner.get("resource") {
-                if let Some(text) = resource.get("text").and_then(|v| v.as_str()) {
-                    if !text.is_empty() {
-                        return Some(text.to_string());
-                    }
-                }
+            if let Some(resource) = inner.get("resource")
+                && let Some(text) = resource.get("text").and_then(|v| v.as_str())
+                && !text.is_empty()
+            {
+                return Some(text.to_string());
             }
         }
     }
@@ -747,15 +752,15 @@ fn aggregate_text_output(content: &[Value]) -> Option<String> {
     let mut buf = String::new();
     for block in content {
         if block.get("type").and_then(|v| v.as_str()) == Some("content") {
-            if let Some(inner) = block.get("content") {
-                if let Some(text) = inner.get("text").and_then(|v| v.as_str()) {
-                    buf.push_str(text);
-                }
+            if let Some(inner) = block.get("content")
+                && let Some(text) = inner.get("text").and_then(|v| v.as_str())
+            {
+                buf.push_str(text);
             }
-        } else if block.get("type").and_then(|v| v.as_str()) == Some("terminal") {
-            if let Some(t) = block.get("terminalId").and_then(|v| v.as_str()) {
-                buf.push_str(&format!("[terminal:{t}]"));
-            }
+        } else if block.get("type").and_then(|v| v.as_str()) == Some("terminal")
+            && let Some(t) = block.get("terminalId").and_then(|v| v.as_str())
+        {
+            buf.push_str(&format!("[terminal:{t}]"));
         }
     }
     if buf.is_empty() { None } else { Some(buf) }

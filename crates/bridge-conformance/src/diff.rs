@@ -1002,17 +1002,16 @@ pub fn compare(reference: &Transcript, target: &Transcript) -> ConformanceReport
             });
         }
         // Error responses for non-allowlisted methods → UnexpectedError.
-        if frame.kind == FrameKind::Response {
-            if let (Some(code), Some(msg)) = (chk.error_code, chk.error_message) {
-                if !div.skips_response(frame) {
-                    report.findings.push(Finding::UnexpectedError {
-                        step: frame.step.clone(),
-                        method: frame.method.clone(),
-                        code,
-                        message: msg,
-                    });
-                }
-            }
+        if frame.kind == FrameKind::Response
+            && let (Some(code), Some(msg)) = (chk.error_code, chk.error_message)
+            && !div.skips_response(frame)
+        {
+            report.findings.push(Finding::UnexpectedError {
+                step: frame.step.clone(),
+                method: frame.method.clone(),
+                code,
+                message: msg,
+            });
         }
     }
 
@@ -1182,17 +1181,16 @@ pub fn schema_only(transcript: &Transcript) -> Vec<Finding> {
                 message: err,
             });
         }
-        if frame.kind == FrameKind::Response {
-            if let (Some(code), Some(msg)) = (chk.error_code, chk.error_message.clone()) {
-                if !div.skips_response(frame) {
-                    findings.push(Finding::UnexpectedError {
-                        step: frame.step.clone(),
-                        method: frame.method.clone(),
-                        code,
-                        message: msg,
-                    });
-                }
-            }
+        if frame.kind == FrameKind::Response
+            && let (Some(code), Some(msg)) = (chk.error_code, chk.error_message.clone())
+            && !div.skips_response(frame)
+        {
+            findings.push(Finding::UnexpectedError {
+                step: frame.step.clone(),
+                method: frame.method.clone(),
+                code,
+                message: msg,
+            });
         }
     }
     findings

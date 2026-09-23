@@ -140,7 +140,7 @@ async fn outstanding_server_request_redelivered_on_reattach() {
     // with the original id and the handler that was awaiting `rx` resumes.
     assert!(session.resolve_pending(&req_id, Ok(json!({"decision": "decline"}))));
     let resolved = rx.try_recv().expect("resolved");
-    assert!(matches!(resolved, Ok(_)));
+    assert!(resolved.is_ok());
 }
 
 #[tokio::test]

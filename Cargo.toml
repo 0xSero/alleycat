@@ -24,8 +24,8 @@ edition = "2024"
 license = "GPL-3.0-only"
 version = "0.1.0"
 authors = ["The Alleycat Authors"]
-repository = "https://github.com/dnakov/alleycat"
-homepage = "https://github.com/dnakov/alleycat"
+repository = "https://github.com/0xSero/alleycat"
+homepage = "https://github.com/0xSero/alleycat"
 readme = "README.md"
 
 [workspace.dependencies]
@@ -34,7 +34,6 @@ alleycat-bridge-core = { path = "crates/bridge-core", version = "0.1" }
 alleycat-amp-bridge = { path = "crates/amp-bridge", version = "0.1" }
 alleycat-codex-proto = { path = "crates/codex-proto", version = "0.1" }
 alleycat-claude-bridge = { path = "crates/claude-bridge", version = "0.1" }
-alleycat-claude-remote-control = { path = "crates/claude-remote-control", version = "0.1" }
 alleycat-devin-bridge = { path = "crates/devin-bridge", version = "0.1" }
 alleycat-grok-bridge = { path = "crates/grok-bridge", version = "0.1" }
 alleycat-droid-bridge = { path = "crates/droid-bridge", version = "0.1" }
@@ -52,14 +51,9 @@ fd-lock = "4"
 futures = "0.3"
 hex = "0.4"
 hostname = "0.4"
-iroh = "0.98.1"
+iroh = "1.0.3"
 libc = "0.2"
-pin-project-lite = "0.2"
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.8"
-rcgen = "0.13"
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -72,7 +66,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 which = "6"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
-tokio-util = { version = "0.7", features = ["codec", "io"] }
 uuid = { version = "1", features = ["serde", "v7"] }
 pretty_assertions = "1"
 tempfile = "3"

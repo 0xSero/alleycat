@@ -148,9 +148,7 @@ pub fn min_params_for_with(method: &str, ctx: &ProbeContext) -> Value {
 
 pub fn assert_method_response(frame: &Frame, target: TargetId) -> Option<Finding> {
     let div = KnownDivergence::for_target(target);
-    let Some(error) = frame.raw.get("error") else {
-        return None;
-    };
+    let error = frame.raw.get("error")?;
     let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
     let message = error
         .get("message")

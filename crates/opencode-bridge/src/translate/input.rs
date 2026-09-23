@@ -31,10 +31,10 @@ pub fn codex_input_to_parts(input: &[Value]) -> Vec<Value> {
                 let name = item.get("name").and_then(Value::as_str).unwrap_or("");
                 let path = item.get("path").and_then(Value::as_str);
                 parts.push(json!({"type":"text","text":format!("@{name}")}));
-                if let Some(path) = path {
-                    if let Some(file_part) = mention_file_part(path) {
-                        parts.push(file_part);
-                    }
+                if let Some(path) = path
+                    && let Some(file_part) = mention_file_part(path)
+                {
+                    parts.push(file_part);
                 }
             }
             _ => {

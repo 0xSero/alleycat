@@ -75,17 +75,16 @@ impl ThreadIndex {
                 .get(&session_id)
                 .cloned()
         };
-        if let Some(thread_id) = existing_thread_id {
-            if let Some(binding) = self
+        if let Some(thread_id) = existing_thread_id
+            && let Some(binding) = self
                 .inner
                 .lock()
                 .unwrap()
                 .by_thread
                 .get(&thread_id)
                 .cloned()
-            {
-                return Ok(binding);
-            }
+        {
+            return Ok(binding);
         }
         let now = now_secs();
         let binding = OpencodeBinding {

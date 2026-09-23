@@ -22,7 +22,6 @@ path = "src/lib.rs"
 
 [dependencies]
 alleycat-bridge-core = { workspace = true }
-alleycat-claude-bridge = { workspace = true }
 alleycat-codex-proto = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }

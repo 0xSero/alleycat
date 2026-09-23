@@ -43,15 +43,12 @@ pub async fn run() -> anyhow::Result<()> {
 /// systemd) will respawn the daemon within seconds of `stop`. Surface that
 /// so users aren't surprised by uptime=2s on the next `status`.
 fn warn_if_autostart_installed() {
-    match service::is_installed() {
-        Ok(true) => {
-            let name = crate::binary_name();
-            eprintln!(
-                "note: autostart is installed; the daemon will be restarted by the OS. \
-                 run `{name} uninstall` to disable autostart."
-            );
-        }
-        Ok(false) | Err(_) => {}
+    if let Ok(true) = service::is_installed() {
+        let name = crate::binary_name();
+        eprintln!(
+            "note: autostart is installed; the daemon will be restarted by the OS. \
+             run `{name} uninstall` to disable autostart."
+        );
     }
 }
 

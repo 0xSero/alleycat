@@ -586,10 +586,7 @@ pub async fn handle_thread_resume(
         rebuilt
     };
 
-    let turns_json: Vec<Value> = stored_turns
-        .iter()
-        .map(|t| stored_turn_to_json(t))
-        .collect();
+    let turns_json: Vec<Value> = stored_turns.iter().map(stored_turn_to_json).collect();
 
     let (created_at_ms, updated_at_ms) = thread_timestamps(&stored_turns);
 
@@ -743,12 +740,12 @@ fn user_input_to_acp_prompt(input: &[p::UserInput]) -> Vec<Value> {
 fn user_input_text_summary(input: &[p::UserInput]) -> String {
     input
         .iter()
-        .filter_map(|item| match item {
-            p::UserInput::Text { text, .. } => Some(text.clone()),
-            p::UserInput::Skill { name, .. } => Some(format!("/{name}")),
-            p::UserInput::Mention { name, .. } => Some(format!("@{name}")),
-            p::UserInput::Image { url } => Some(format!("[image: {url}]")),
-            p::UserInput::LocalImage { path } => Some(format!("[image: {}]", path.display())),
+        .map(|item| match item {
+            p::UserInput::Text { text, .. } => text.clone(),
+            p::UserInput::Skill { name, .. } => format!("/{name}"),
+            p::UserInput::Mention { name, .. } => format!("@{name}"),
+            p::UserInput::Image { url } => format!("[image: {url}]"),
+            p::UserInput::LocalImage { path } => format!("[image: {}]", path.display()),
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -1465,36 +1462,20 @@ pub fn handle_review_start(_params: p::ReviewStartParams) -> Result<Value, JsonR
 
 /// Handle command/exec/terminate request.
 pub async fn handle_command_exec_terminate(
-    client: &Arc<AcpClient>,
-    params: p::CommandExecTerminateParams,
+    _client: &Arc<AcpClient>,
+    _params: p::CommandExecTerminateParams,
 ) -> Result<p::CommandExecTerminateResponse, JsonRpcError> {
-    // The process_id in Codex maps to terminal_id in ACP
-    let session_id = "default".to_string(); // Would need to track session mapping
-    let terminal_id = params.process_id;
-
-    // Try to kill the terminal
-    let kill_request = json!({
-        "sessionId": session_id,
-        "terminalId": terminal_id,
-    });
-
-    match client.send_request("terminal/kill", kill_request).await {
-        Ok(_) => {
-            // Release the terminal after killing
-            let release_request = json!({
-                "sessionId": session_id,
-                "terminalId": terminal_id,
-            });
-            let _ = client
-                .send_request("terminal/release", release_request)
-                .await;
-            Ok(p::CommandExecTerminateResponse {})
-        }
-        Err(_) => {
-            // Terminal doesn't exist or already terminated, that's fine
-            Ok(p::CommandExecTerminateResponse {})
-        }
-    }
+    // CommandExecTerminateParams has a process id but no thread/session id.
+    // ACP terminal/kill requires both. The old implementation sent every kill
+    // to a fabricated "default" session and reported success even when the
+    // agent rejected it, leaving the real process running.
+    Err(JsonRpcError {
+        code: error_codes::METHOD_NOT_FOUND,
+        message:
+            "command/exec/terminate is not supported by ACP bridges (no session id in request)"
+                .to_string(),
+        data: None,
+    })
 }
 
 /// Handle command/exec/write request.

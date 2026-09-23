@@ -118,10 +118,10 @@ fn file_part_to_item(part: &Value, id: &str, role: &str) -> Option<Value> {
     // Assistant-side: only `file://` URLs translate to `ImageView` (which
     // requires an absolute path). For data: URLs we fall back to a text
     // breadcrumb on `agentMessage` so the client at least sees something.
-    if let Some(path) = url.strip_prefix("file://") {
-        if mime.starts_with("image/") {
-            return Some(json!({"type":"imageView","id":id,"path":path}));
-        }
+    if let Some(path) = url.strip_prefix("file://")
+        && mime.starts_with("image/")
+    {
+        return Some(json!({"type":"imageView","id":id,"path":path}));
     }
     let filename = part
         .get("filename")

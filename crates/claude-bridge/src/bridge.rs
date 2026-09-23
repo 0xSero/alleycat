@@ -1,9 +1,9 @@
 //! `ClaudeBridge` — the unified `Bridge` impl.
 //!
 //! Owns the [`ClaudePool`], the disk-backed thread index, the launcher seam,
-//! and per-connection state keyed by session id. Replaces the legacy
-//! [`crate::server::run_connection_with_session`] free function (which is kept
-//! as a thin compat shim during the migration).
+//! and per-connection state keyed by session id. Production traffic uses the
+//! shared bridge-core server; [`crate::server::run_connection`] remains only as
+//! an in-process test helper.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -113,7 +113,7 @@ impl ClaudeBridge {
     }
 
     /// Internal: assemble a bridge from already-built parts. Used by the
-    /// legacy `run_connection_with_session` compat shim (see `server.rs`).
+    /// in-process `server::run_connection` test helper.
     #[doc(hidden)]
     pub fn __assemble(
         pool: Arc<ClaudePool>,
@@ -212,15 +212,15 @@ impl ClaudeBridgeBuilder {
     /// Builder-set values stay; env vars only fill in fields the caller
     /// hasn't already set explicitly.
     pub fn from_env(mut self) -> Self {
-        if self.agent_bin.is_none() {
-            if let Some(bin) = std::env::var_os("CLAUDE_BRIDGE_CLAUDE_BIN") {
-                self.agent_bin = Some(PathBuf::from(bin));
-            }
+        if self.agent_bin.is_none()
+            && let Some(bin) = std::env::var_os("CLAUDE_BRIDGE_CLAUDE_BIN")
+        {
+            self.agent_bin = Some(PathBuf::from(bin));
         }
-        if self.codex_home.is_none() {
-            if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
-                self.codex_home = Some(PathBuf::from(home));
-            }
+        if self.codex_home.is_none()
+            && let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty())
+        {
+            self.codex_home = Some(PathBuf::from(home));
         }
         if let Ok(value) = std::env::var("CLAUDE_BRIDGE_BYPASS_PERMISSIONS") {
             self.bypass_permissions = matches!(

@@ -306,16 +306,16 @@ fn normalize_dynamic_tool_call_output(value: &Value) -> Vec<Value> {
             .collect(),
         Value::Object(obj) => {
             // Anthropic-style text block: `{type: "text", text: "..."}`.
-            if obj.get("type").and_then(Value::as_str) == Some("text") {
-                if let Some(text) = obj.get("text").and_then(Value::as_str) {
-                    return vec![serde_json::json!({"type": "inputText", "text": text})];
-                }
+            if obj.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(text) = obj.get("text").and_then(Value::as_str)
+            {
+                return vec![serde_json::json!({"type": "inputText", "text": text})];
             }
             // Anthropic-style image block: `{type: "image", source: {...}}`.
-            if obj.get("type").and_then(Value::as_str) == Some("image") {
-                if let Some(url) = obj.get("source").and_then(image_source_to_data_url) {
-                    return vec![serde_json::json!({"type": "inputImage", "imageUrl": url})];
-                }
+            if obj.get("type").and_then(Value::as_str) == Some("image")
+                && let Some(url) = obj.get("source").and_then(image_source_to_data_url)
+            {
+                return vec![serde_json::json!({"type": "inputImage", "imageUrl": url})];
             }
             // Already-codex-shaped: pass through unchanged.
             if matches!(
@@ -422,14 +422,14 @@ fn complete_tool_item(
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             let mut combined = stdout.unwrap_or(inline);
-            if let Some(stderr) = stderr {
-                if !stderr.is_empty() {
-                    if !combined.is_empty() && !combined.ends_with('\n') {
-                        combined.push('\n');
-                    }
-                    combined.push_str("[stderr] ");
-                    combined.push_str(&stderr);
+            if let Some(stderr) = stderr
+                && !stderr.is_empty()
+            {
+                if !combined.is_empty() && !combined.ends_with('\n') {
+                    combined.push('\n');
                 }
+                combined.push_str("[stderr] ");
+                combined.push_str(&stderr);
             }
             *aggregated_output = Some(cap_aggregated_output_disk(combined));
             *status = if is_error || interrupted {

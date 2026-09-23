@@ -69,7 +69,7 @@ impl DaemonConfig {
 
     pub fn remove_by_name_or_dir(&mut self, name_or_dir: &str) -> Option<RemoteControlDaemonEntry> {
         let idx = self.remote_control.iter().position(|entry| {
-            entry.dir == PathBuf::from(name_or_dir) || entry.name.as_deref() == Some(name_or_dir)
+            entry.dir == Path::new(name_or_dir) || entry.name.as_deref() == Some(name_or_dir)
         })?;
         Some(self.remote_control.remove(idx))
     }
