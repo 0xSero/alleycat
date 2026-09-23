@@ -455,6 +455,7 @@ impl HermesBridge {
         let binding = HermesBinding {
             thread_id: thread_id.clone(),
             hermes_session_id: session_id,
+            cli_session_id: None,
             model: p.model.clone(),
             created_at: now,
             updated_at: now,
@@ -533,6 +534,7 @@ impl HermesBridge {
         let binding = HermesBinding {
             thread_id: thread_id.clone(),
             hermes_session_id: parent.hermes_session_id.clone(),
+            cli_session_id: parent.cli_session_id.clone(),
             model: p.model.clone().or(parent.model.clone()),
             created_at: now,
             updated_at: now,
@@ -1508,7 +1510,7 @@ impl HermesBridge {
             crate::config::HermesMode::Cli { bin }
             | crate::config::HermesMode::Auto { bin, .. } => (
                 bin.clone().unwrap_or_else(|| "hermes".to_string()),
-                binding.as_ref().map(|b| b.hermes_session_id.clone()),
+                binding.as_ref().and_then(|b| b.cli_session_id.clone()),
             ),
             crate::config::HermesMode::Api { .. } => ("hermes".to_string(), None),
         };
@@ -1530,8 +1532,18 @@ impl HermesBridge {
         .await
         {
             Ok(output) => {
-                self.emit_synthetic_completion(ctx, thread_id, turn_id, &output)
-                    .await;
+                if let Some(mut binding) = self.index.get_by_thread(thread_id) {
+                    binding.cli_session_id = output.session_id;
+                    self.index.upsert(binding);
+                    self.persist_index()?;
+                }
+                self.emit_synthetic_completion(
+                    ctx,
+                    thread_id,
+                    turn_id,
+                    output.stdout.trim_end_matches('\n'),
+                )
+                .await;
                 to_value(TurnStartResponse {
                     turn: completed_turn(turn_id),
                 })
@@ -1782,5 +1794,43 @@ mod model_catalog_tests {
             vec!["replacement"]
         );
         assert!(gateway_model_ids(&json!({"data":[]})).is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn cli_first_turn_and_restart_use_native_session_identity() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("hermes-fake");
+        let args = dir.path().join("args.log");
+        std::fs::write(&bin, format!(r#"#!/bin/sh
+printf '%s\n' "$@" > '{}'
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = --usage-file ]; then
+        shift
+        printf '%s' '{{"session_id":"native-session"}}' > "$1"
+    fi
+    shift
+done
+printf 'OK\n'
+"#, args.display())).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = HermesBridgeConfig {
+            mode: crate::config::HermesMode::Cli { bin: Some(bin.to_string_lossy().into()) },
+            state_dir: Some(dir.path().to_string_lossy().into()),
+        };
+        let registry = alleycat_bridge_core::SessionRegistry::new(Default::default());
+        let conn = Conn::from_session(registry.get_or_create("test".into(), "hermes"));
+        let bridge = HermesBridge::new(config.clone());
+        let start = bridge.handle_thread_start(&conn, json!({"cwd":dir.path()})).await.unwrap();
+        let id = start["thread"]["id"].as_str().unwrap();
+        let turn = json!({"threadId":id,"input":[{"type":"text","text":"hello"}]});
+        bridge.handle_turn_start(&conn, turn.clone()).await.unwrap();
+        assert!(!std::fs::read_to_string(&args).unwrap().contains("--resume"));
+        drop(bridge);
+        let bridge = HermesBridge::new(config);
+        assert_eq!(bridge.index.get_by_thread(id).unwrap().cli_session_id.as_deref(), Some("native-session"));
+        bridge.handle_turn_start(&conn, turn).await.unwrap();
+        assert!(std::fs::read_to_string(args).unwrap().contains("--resume\nnative-session"));
     }
 }

@@ -36,7 +36,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::codex_proto as p;
-use crate::codex_proto::{SessionSource, SortDirection, ThreadSourceKind};
+use crate::codex_proto::{SortDirection, ThreadSourceKind};
 use crate::index::IndexEntry;
 use crate::index::{ListFilter, ListSort};
 use crate::pool::pi_protocol as pi;
@@ -740,28 +740,23 @@ pub async fn handle_thread_list(
         .into_iter()
         .filter(|id| !id.starts_with("utility_"))
         .collect();
-    let data = page
-        .data
-        .into_iter()
-        .map(|entry| {
-            // For list responses we use the index's `to_thread`-equivalent
-            // free function, which leaves status at `NotLoaded` so the
-            // pool-membership check below can flip only the loaded ones to
-            // `Idle`. The handler-local `thread_from_entry` is for handlers
-            // (start/resume/read) that always return loaded threads.
-            let mut t = crate::index::thread_from_entry(&entry);
-            if loaded.contains(&t.id) {
-                t.status = if super::turn::active_turn_id(&t.id).is_some() {
-                    p::ThreadStatus::Active {
-                        active_flags: Vec::new(),
-                    }
-                } else {
-                    p::ThreadStatus::Idle
-                };
-            }
-            t
-        })
-        .collect();
+    let mut data = alleycat_bridge_core::map_entries_with_git_info(
+        page.data,
+        crate::index::thread_from_entry_with_git_info,
+    )
+    .await
+    .map_err(ThreadError::from)?;
+    for thread in &mut data {
+        if loaded.contains(&thread.id) {
+            thread.status = if super::turn::active_turn_id(&thread.id).is_some() {
+                p::ThreadStatus::Active {
+                    active_flags: Vec::new(),
+                }
+            } else {
+                p::ThreadStatus::Idle
+            };
+        }
+    }
 
     Ok(p::ThreadListResponse {
         data,
@@ -995,33 +990,9 @@ fn now_unix_millis() -> i64 {
 }
 
 fn thread_from_entry(entry: &IndexEntry) -> p::Thread {
-    p::Thread {
-        id: entry.thread_id.clone(),
-        session_id: entry.metadata.pi_session_id.clone(),
-        forked_from_id: entry.forked_from_id.clone(),
-        preview: entry.preview.clone(),
-        ephemeral: false,
-        model_provider: entry.model_provider.clone(),
-        created_at: entry.created_at,
-        updated_at: entry.updated_at,
-        status: p::ThreadStatus::Idle,
-        path: Some(
-            entry
-                .metadata
-                .pi_session_path
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        cwd: entry.cwd.clone(),
-        cli_version: format!("alleycat-pi-bridge/{}", env!("CARGO_PKG_VERSION")),
-        source: source_kind_to_session_source(entry.source),
-        thread_source: None,
-        agent_nickname: None,
-        agent_role: None,
-        git_info: alleycat_bridge_core::git_info_for_cwd(&entry.cwd),
-        name: entry.name.clone(),
-        turns: Vec::new(),
-    }
+    let mut thread = crate::index::thread_from_entry(entry);
+    thread.status = p::ThreadStatus::Idle;
+    thread
 }
 
 fn apply_live_turn_state(thread: &mut p::Thread, active_turn_id: Option<&str>) {
@@ -1057,16 +1028,6 @@ fn apply_live_turn_to_turns(turns: &mut Vec<p::Turn>, active_turn_id: Option<&st
     turn.error = None;
     turn.completed_at = None;
     turn.duration_ms = None;
-}
-
-fn source_kind_to_session_source(kind: ThreadSourceKind) -> SessionSource {
-    match kind {
-        ThreadSourceKind::Cli => SessionSource::Cli,
-        ThreadSourceKind::VsCode => SessionSource::VsCode,
-        ThreadSourceKind::Exec => SessionSource::Exec,
-        ThreadSourceKind::AppServer => SessionSource::AppServer,
-        _ => SessionSource::AppServer,
-    }
 }
 
 fn sandbox_value(mode: Option<p::SandboxMode>) -> p::SandboxPolicy {

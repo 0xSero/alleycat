@@ -723,17 +723,17 @@ impl DroidBridge {
             .keys()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
-        let data = page
-            .data
-            .into_iter()
-            .map(|entry| {
-                let mut thread = index::thread_from_entry(&entry);
-                if loaded.contains(&thread.id) {
-                    thread.status = p::ThreadStatus::Idle;
-                }
-                thread
-            })
-            .collect();
+        let mut data = alleycat_bridge_core::map_entries_with_git_info(
+            page.data,
+            index::thread_from_entry_with_git_info,
+        )
+        .await
+        .map_err(internal_err)?;
+        for thread in &mut data {
+            if loaded.contains(&thread.id) {
+                thread.status = p::ThreadStatus::Idle;
+            }
+        }
         ok(p::ThreadListResponse {
             data,
             next_cursor: page.next_cursor,

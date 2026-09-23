@@ -757,7 +757,12 @@ impl AmpBridge {
             .first()
             .map(|entry| encode_backwards_cursor(entry, sort));
         ok(p::ThreadListResponse {
-            data: page.data.iter().map(entry_to_thread).collect(),
+            data: alleycat_bridge_core::map_entries_with_git_info(
+                page.data,
+                index::entry_to_thread_with_git_info,
+            )
+            .await
+            .map_err(|err| internal(err.to_string()))?,
             next_cursor: page.next_cursor,
             backwards_cursor,
         })

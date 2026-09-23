@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::codex_proto::{SessionSource, Thread, ThreadSourceKind, ThreadStatus};
+use crate::codex_proto::{Thread, ThreadSourceKind};
 
 pub use pi_session_scan::{
     PiSessionInfo, list_all, list_sessions_from_dir, list_sessions_modified_since, pi_sessions_dir,
@@ -337,39 +337,25 @@ pub fn entry_from_pi(info: &PiSessionInfo) -> IndexEntry {
 /// Fold an `IndexEntry` into a codex `Thread` with no turns populated.
 /// `thread/read` fills `turns` separately when `include_turns` is set.
 pub fn thread_from_entry(entry: &IndexEntry) -> Thread {
-    Thread {
-        id: entry.thread_id.clone(),
-        session_id: entry.metadata.pi_session_id.clone(),
-        forked_from_id: entry.forked_from_id.clone(),
-        preview: entry.preview.clone(),
-        ephemeral: false,
-        model_provider: entry.model_provider.clone(),
-        created_at: entry.created_at,
-        updated_at: entry.updated_at,
-        status: ThreadStatus::NotLoaded,
-        path: Some(
+    thread_from_entry_with_git_info(entry, alleycat_bridge_core::git_info_for_cwd(&entry.cwd))
+}
+
+pub fn thread_from_entry_with_git_info(
+    entry: &IndexEntry,
+    git_info: Option<alleycat_codex_proto::GitInfo>,
+) -> Thread {
+    entry.to_thread(
+        entry.metadata.pi_session_id.clone(),
+        Some(
             entry
                 .metadata
                 .pi_session_path
                 .to_string_lossy()
                 .into_owned(),
         ),
-        cwd: entry.cwd.clone(),
-        cli_version: CLI_VERSION.to_string(),
-        source: match entry.source {
-            ThreadSourceKind::Cli => SessionSource::Cli,
-            ThreadSourceKind::VsCode => SessionSource::VsCode,
-            ThreadSourceKind::Exec => SessionSource::Exec,
-            ThreadSourceKind::AppServer => SessionSource::AppServer,
-            _ => SessionSource::AppServer,
-        },
-        thread_source: None,
-        agent_nickname: None,
-        agent_role: None,
-        git_info: alleycat_bridge_core::git_info_for_cwd(&entry.cwd),
-        name: entry.name.clone(),
-        turns: Vec::new(),
-    }
+        CLI_VERSION,
+        git_info,
+    )
 }
 
 /// Pi-specific hydrator: walks `~/.pi/agent/sessions/` (or its env-var

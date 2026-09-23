@@ -617,17 +617,18 @@ pub async fn handle_thread_list(
         .into_iter()
         .filter(|id| !id.starts_with("utility_"))
         .collect();
-    let data = page
-        .data
-        .into_iter()
-        .map(|entry| {
-            let mut t = thread_from_entry(&entry);
-            if loaded.contains(&t.id) {
-                t.status = p::ThreadStatus::Idle;
-            }
-            t
-        })
-        .collect();
+    let mut data = alleycat_bridge_core::map_entries_with_git_info(
+        page.data,
+        crate::index::entry_to_thread_with_git_info,
+    )
+    .await
+    .map_err(ThreadError::from)?;
+    for thread in &mut data {
+        if loaded.contains(&thread.id) {
+            thread.status = p::ThreadStatus::Idle;
+        }
+    }
+
     Ok(p::ThreadListResponse {
         data,
         next_cursor: page.next_cursor,

@@ -24,7 +24,7 @@ use alleycat_bridge_core::Hydrator;
 pub use alleycat_bridge_core::{
     IndexEntry as CoreIndexEntry, ListFilter, ListPage, ListSort, ThreadIndex as CoreThreadIndex,
 };
-use alleycat_codex_proto::{SessionSource, Thread, ThreadSourceKind, ThreadStatus};
+use alleycat_codex_proto::{Thread, ThreadSourceKind};
 
 /// Bridge CLI version string baked into `Thread.cli_version`.
 pub const CLI_VERSION: &str = concat!("alleycat-claude-bridge/", env!("CARGO_PKG_VERSION"));
@@ -68,43 +68,25 @@ pub fn entry_from_claude(info: &ClaudeSessionInfo) -> IndexEntry {
 
 /// Render an index row as a wire `Thread`.
 pub fn entry_to_thread(entry: &IndexEntry) -> Thread {
-    Thread {
-        id: entry.thread_id.clone(),
-        session_id: entry.metadata.claude_session_id.clone(),
-        forked_from_id: entry.forked_from_id.clone(),
-        preview: entry.preview.clone(),
-        ephemeral: false,
-        model_provider: entry.model_provider.clone(),
-        created_at: entry.created_at,
-        updated_at: entry.updated_at,
-        status: ThreadStatus::NotLoaded,
-        path: Some(
+    entry_to_thread_with_git_info(entry, alleycat_bridge_core::git_info_for_cwd(&entry.cwd))
+}
+
+pub fn entry_to_thread_with_git_info(
+    entry: &IndexEntry,
+    git_info: Option<alleycat_codex_proto::GitInfo>,
+) -> Thread {
+    entry.to_thread(
+        entry.metadata.claude_session_id.clone(),
+        Some(
             entry
                 .metadata
                 .claude_session_path
                 .to_string_lossy()
                 .into_owned(),
         ),
-        cwd: entry.cwd.clone(),
-        cli_version: CLI_VERSION.to_string(),
-        source: source_kind_to_session_source(entry.source),
-        thread_source: None,
-        agent_nickname: None,
-        agent_role: None,
-        git_info: alleycat_bridge_core::git_info_for_cwd(&entry.cwd),
-        name: entry.name.clone(),
-        turns: Vec::new(),
-    }
-}
-
-fn source_kind_to_session_source(kind: ThreadSourceKind) -> SessionSource {
-    match kind {
-        ThreadSourceKind::Cli => SessionSource::Cli,
-        ThreadSourceKind::VsCode => SessionSource::VsCode,
-        ThreadSourceKind::Exec => SessionSource::Exec,
-        ThreadSourceKind::AppServer => SessionSource::AppServer,
-        _ => SessionSource::AppServer,
-    }
+        CLI_VERSION,
+        git_info,
+    )
 }
 
 /// Hydrator that walks `~/.claude/projects/<encoded-cwd>/<session_id>.jsonl`

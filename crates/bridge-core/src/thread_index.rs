@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use alleycat_codex_proto::{SortDirection, ThreadSortKey, ThreadSourceKind};
+use alleycat_codex_proto::{
+    GitInfo, SessionSource, SortDirection, Thread, ThreadSortKey, ThreadSourceKind, ThreadStatus,
+};
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -61,6 +63,44 @@ pub struct IndexEntry<M> {
     /// compatible with the pre-refactor shape.
     #[serde(flatten)]
     pub metadata: M,
+}
+
+impl<M> IndexEntry<M> {
+    /// Shared wire projection; adapters supply only native session metadata.
+    pub fn to_thread(
+        &self,
+        session_id: String,
+        path: Option<String>,
+        cli_version: &str,
+        git_info: Option<GitInfo>,
+    ) -> Thread {
+        Thread {
+            id: self.thread_id.clone(),
+            session_id,
+            forked_from_id: self.forked_from_id.clone(),
+            preview: self.preview.clone(),
+            ephemeral: false,
+            model_provider: self.model_provider.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            status: ThreadStatus::NotLoaded,
+            path,
+            cwd: self.cwd.clone(),
+            cli_version: cli_version.to_string(),
+            source: match self.source {
+                ThreadSourceKind::Cli => SessionSource::Cli,
+                ThreadSourceKind::VsCode => SessionSource::VsCode,
+                ThreadSourceKind::Exec => SessionSource::Exec,
+                _ => SessionSource::AppServer,
+            },
+            thread_source: None,
+            agent_nickname: None,
+            agent_role: None,
+            git_info,
+            name: self.name.clone(),
+            turns: Vec::new(),
+        }
+    }
 }
 
 /// Filter knobs accepted by `ThreadIndex::list`. Mirrors the codex

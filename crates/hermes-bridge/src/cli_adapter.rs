@@ -23,6 +23,7 @@ pub struct CliConfig {
 pub struct HermesCliProcess {
     /// The `hermes` child process.
     child: tokio::process::Child,
+    usage_file: tempfile::NamedTempFile,
 }
 
 impl HermesCliProcess {
@@ -38,9 +39,12 @@ impl HermesCliProcess {
         model: Option<&str>,
     ) -> Result<Self> {
         let bin = resolve_bin(&config.bin)?;
+        let usage_file = tempfile::NamedTempFile::new()?;
         let mut cmd = Command::new(&bin);
         cmd.arg("-z")
             .arg(prompt)
+            .arg("--usage-file")
+            .arg(usage_file.path())
             .kill_on_drop(true)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -68,7 +72,7 @@ impl HermesCliProcess {
             .spawn()
             .with_context(|| format!("spawning `hermes -z` via {}", bin.display()))?;
 
-        Ok(Self { child })
+        Ok(Self { child, usage_file })
     }
 
     /// Send a signal to interrupt the running turn.
@@ -87,6 +91,13 @@ impl HermesCliProcess {
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let usage: serde_json::Value =
+            serde_json::from_reader(self.usage_file.as_file()).unwrap_or(serde_json::Value::Null);
+        let session_id = usage
+            .get("session_id")
+            .and_then(|id| id.as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
 
         if !output.status.success() {
             warn!(
@@ -100,6 +111,7 @@ impl HermesCliProcess {
             stdout,
             stderr,
             exit_code: output.status.code(),
+            session_id,
         })
     }
 }
@@ -110,6 +122,7 @@ pub struct CliOutput {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: Option<i32>,
+    pub session_id: Option<String>,
 }
 
 /// Resolve a binary name to an absolute path. Returns the configured value
@@ -136,7 +149,7 @@ pub async fn run_hermes_cli(
     session_id: Option<&str>,
     cwd: Option<&PathBuf>,
     model: Option<&str>,
-) -> Result<String> {
+) -> Result<CliOutput> {
     let config = CliConfig {
         bin: bin.to_string(),
         cwd: cwd.cloned(),
@@ -150,7 +163,11 @@ pub async fn run_hermes_cli(
             output.stderr
         );
     }
-    Ok(output.stdout)
+    anyhow::ensure!(
+        output.session_id.is_some(),
+        "Hermes did not report a resumable session ID"
+    );
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -167,6 +184,7 @@ mod tests {
         let mut file = std::fs::File::create(&bin).unwrap();
         writeln!(file, "#!/usr/bin/env sh").unwrap();
         writeln!(file, "printf '%s\\n' \"$@\" > {:?}", log).unwrap();
+        writeln!(file, "while [ \"$#\" -gt 0 ]; do if [ \"$1\" = --usage-file ]; then shift; printf '%s' '{{\"session_id\":\"native-session\"}}' > \"$1\"; fi; shift; done").unwrap();
         writeln!(file, "printf 'ok'").unwrap();
         drop(file);
         use std::os::unix::fs::PermissionsExt;
@@ -183,13 +201,18 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(output, "ok");
-        let args = std::fs::read_to_string(log).unwrap();
+        assert_eq!(output.stdout, "ok");
+        assert_eq!(output.session_id.as_deref(), Some("native-session"));
+        let args = std::fs::read_to_string(&log).unwrap();
         assert!(args.contains("-z\nhello"));
         assert!(args.contains("--resume\nsession-1"));
         assert!(args.contains("--model\nvendor/new-model"));
         assert!(args.contains("--provider\nopenrouter"));
         assert!(!args.contains("run"));
         assert!(!args.contains("--prompt"));
+        run_hermes_cli(bin.to_str().unwrap(), "first turn", None, None, None)
+            .await
+            .unwrap();
+        assert!(!std::fs::read_to_string(log).unwrap().contains("--resume"));
     }
 }

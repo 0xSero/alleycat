@@ -282,7 +282,7 @@ mod tests {
         let session = reg.get_or_create("node-abc".into(), "pi");
         // Attach + immediately detach so detached_at is set.
         let _h = session.install_attachment(None);
-        session.drop_attachment();
+        session.drop_attachment(_h.generation);
         // Use zero grace/ttl so the session expires immediately.
         reg.tick(Duration::from_millis(0), Duration::from_millis(0));
         assert!(reg.get("node-abc", "pi").is_none());
@@ -310,7 +310,7 @@ mod tests {
             tx,
         );
         let _h = session.install_attachment(None);
-        session.drop_attachment();
+        session.drop_attachment(_h.generation);
         // Past pending_grace but well under idle_ttl: cancel pending, keep
         // the session itself for potential reuse on reattach.
         reg.tick(Duration::from_millis(0), Duration::from_secs(3600));

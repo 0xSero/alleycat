@@ -57,6 +57,8 @@ pub enum AttachOutcome {
 /// responsible for spawning the drainer task that flushes `backlog` and then
 /// `live_rx` to the iroh sink.
 pub struct AttachHandle {
+    /// Identifies this attachment when its stream finishes or is cancelled.
+    pub generation: u64,
     pub outcome: AttachOutcome,
     pub current_seq: u64,
     pub floor_seq: u64,
@@ -74,8 +76,7 @@ pub struct AttachHandle {
 struct Attachment {
     live_tx: mpsc::UnboundedSender<Sequenced>,
     /// Monotonic counter incremented on every fresh `install_attachment`.
-    /// Surfaced via `Session::attachment_generation()` for log correlation.
-    #[allow(dead_code)]
+    /// Prevents an old stream's teardown from detaching its replacement.
     generation: u64,
 }
 
@@ -308,12 +309,11 @@ impl Session {
             live_tx,
             generation,
         });
-        drop(attachment_slot);
-
         // Clear detach bookkeeping while attached.
         self.detach.lock().unwrap().detached_at = None;
 
         AttachHandle {
+            generation,
             outcome,
             current_seq,
             floor_seq,
@@ -327,10 +327,15 @@ impl Session {
     /// ring; only the live forwarding stops. If `pending_grace` is configured
     /// and elapses without a reattach, the session reaper will drain pending
     /// requests with `ConnectionClosed` (see [`SessionRegistry`]).
-    pub fn drop_attachment(&self) {
+    pub fn drop_attachment(&self, generation: u64) {
         let mut slot = self.attachment.lock().unwrap();
+        if !slot
+            .as_ref()
+            .is_some_and(|attachment| attachment.generation == generation)
+        {
+            return;
+        }
         *slot = None;
-        drop(slot);
         self.detach.lock().unwrap().detached_at = Some(Instant::now());
     }
 
@@ -544,7 +549,7 @@ mod tests {
         assert!(!session.detached_for(Duration::from_millis(0)));
         let _h = session.install_attachment(None);
         assert!(!session.detached_for(Duration::from_millis(0)));
-        session.drop_attachment();
+        session.drop_attachment(_h.generation);
         assert!(session.detached_for(Duration::from_millis(0)));
     }
 }

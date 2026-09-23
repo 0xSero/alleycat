@@ -15,7 +15,7 @@ pub use envelope::{
     InboundMessage, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
     JsonRpcResponse, JsonRpcVersion, RequestId, error_codes,
 };
-pub use git_info::git_info_for_cwd;
+pub use git_info::{git_info_for_cwd, map_entries_with_git_info};
 pub use launch_environment::{
     LaunchEnvironment, LaunchEnvironmentPolicy, LaunchEnvironmentResolver, UserEnvironmentLauncher,
 };

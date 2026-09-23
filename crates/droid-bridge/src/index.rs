@@ -311,33 +311,25 @@ pub fn entry_from_droid(info: &DroidSessionInfo) -> IndexEntry {
 }
 
 pub fn thread_from_entry(entry: &IndexEntry) -> p::Thread {
-    p::Thread {
-        id: entry.thread_id.clone(),
-        session_id: entry.metadata.droid_session_id.clone(),
-        forked_from_id: entry.forked_from_id.clone(),
-        preview: entry.preview.clone(),
-        ephemeral: false,
-        model_provider: entry.model_provider.clone(),
-        created_at: entry.created_at,
-        updated_at: entry.updated_at,
-        status: p::ThreadStatus::NotLoaded,
-        path: Some(
+    thread_from_entry_with_git_info(entry, alleycat_bridge_core::git_info_for_cwd(&entry.cwd))
+}
+
+pub fn thread_from_entry_with_git_info(
+    entry: &IndexEntry,
+    git_info: Option<alleycat_codex_proto::GitInfo>,
+) -> p::Thread {
+    entry.to_thread(
+        entry.metadata.droid_session_id.clone(),
+        Some(
             entry
                 .metadata
                 .droid_session_path
                 .to_string_lossy()
                 .into_owned(),
         ),
-        cwd: entry.cwd.clone(),
-        cli_version: CLI_VERSION.to_string(),
-        source: source_kind_to_session_source(entry.source),
-        thread_source: None,
-        agent_nickname: None,
-        agent_role: None,
-        git_info: alleycat_bridge_core::git_info_for_cwd(&entry.cwd),
-        name: entry.name.clone(),
-        turns: Vec::new(),
-    }
+        CLI_VERSION,
+        git_info,
+    )
 }
 
 pub async fn transcript_turns(path: &Path) -> Result<Vec<p::Turn>> {
@@ -1365,16 +1357,6 @@ fn system_time_to_datetime(time: std::time::SystemTime) -> Option<DateTime<Utc>>
     time.duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|duration| DateTime::<Utc>::from_timestamp_millis(duration.as_millis() as i64))
-}
-
-fn source_kind_to_session_source(kind: p::ThreadSourceKind) -> p::SessionSource {
-    match kind {
-        p::ThreadSourceKind::Cli => p::SessionSource::Cli,
-        p::ThreadSourceKind::VsCode => p::SessionSource::VsCode,
-        p::ThreadSourceKind::Exec => p::SessionSource::Exec,
-        p::ThreadSourceKind::AppServer => p::SessionSource::AppServer,
-        _ => p::SessionSource::AppServer,
-    }
 }
 
 fn expand_tilde(input: &str) -> PathBuf {
