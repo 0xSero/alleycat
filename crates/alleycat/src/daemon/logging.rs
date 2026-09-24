@@ -1,6 +1,6 @@
 //! Daemon logging setup. Writes to a daily-rotated file under
-//! [`crate::paths::log_dir`] and, when stderr is a TTY, additionally mirrors
-//! to stderr so `alleycat serve` is debuggable from a terminal.
+//! [`crate::paths::log_dir`], retaining seven daily files. When stderr is a TTY,
+//! it also mirrors there so `alleycat serve` is debuggable from a terminal.
 //!
 //! The returned [`tracing_appender::non_blocking::WorkerGuard`] must be kept
 //! alive for the daemon's lifetime — dropping it stops the background writer
@@ -24,7 +24,7 @@ pub fn init(level: &str, log_dir: &Path) -> anyhow::Result<WorkerGuard> {
     std::fs::create_dir_all(log_dir)
         .with_context(|| format!("creating log dir {}", log_dir.display()))?;
 
-    let appender = tracing_appender::rolling::daily(log_dir, "daemon.log");
+    let appender = retained_appender(log_dir)?;
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
     let env_filter = EnvFilter::try_from_default_env()
@@ -50,4 +50,49 @@ pub fn init(level: &str, log_dir: &Path) -> anyhow::Result<WorkerGuard> {
     }
 
     Ok(guard)
+}
+
+fn retained_appender(
+    log_dir: &Path,
+) -> anyhow::Result<tracing_appender::rolling::RollingFileAppender> {
+    tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("daemon.log")
+        .max_log_files(7)
+        .build(log_dir)
+        .context("initializing retained daemon logs")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_prunes_old_daemon_logs_and_preserves_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for day in 1..=10 {
+            std::fs::write(
+                dir.path().join(format!("daemon.log.2020-01-{day:02}")),
+                "old",
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.path().join("other.log"), "keep").unwrap();
+        let _appender = retained_appender(dir.path()).unwrap();
+        let logs = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("daemon.log.")
+            })
+            .count();
+        assert_eq!(logs, 7);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("other.log")).unwrap(),
+            "keep"
+        );
+    }
 }
