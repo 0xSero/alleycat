@@ -1146,6 +1146,36 @@ mod tests {
         }]))
         .unwrap();
 
+        let pi::AgentMessage::Assistant(assistant) = &messages[0] else {
+            panic!("assistant fixture");
+        };
+        for (reason, assistant_message_event) in [
+            (
+                pi::StopReason::Length,
+                pi::AssistantMessageEvent::Done {
+                    reason: pi::StopReason::Length,
+                    message: assistant.clone(),
+                },
+            ),
+            (
+                pi::StopReason::Aborted,
+                pi::AssistantMessageEvent::Error {
+                    reason: pi::StopReason::Aborted,
+                    error: assistant.clone(),
+                },
+            ),
+        ] {
+            // The streaming terminal reason wins over the snapshot's older
+            // stopReason, and terminal errors keep their normalized message.
+            assert_eq!(
+                event_terminal_state(&pi::PiEvent::MessageUpdate {
+                    message: messages[0].clone(),
+                    assistant_message_event: Box::new(assistant_message_event),
+                }),
+                Some((reason, Some("model is not running".to_string())))
+            );
+        }
+
         assert_eq!(
             event_terminal_state(&pi::PiEvent::AgentEnd { messages }),
             Some((

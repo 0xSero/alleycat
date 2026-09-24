@@ -120,6 +120,15 @@ impl SessionRegistry {
         agent: AgentId,
         last_seen: Option<u64>,
     ) -> ResolvedAttach {
+        // ponytail: the shell agent's ring holds shell/output+shell/exit
+        // notifications from a killed pty. Replaying them to a reattaching
+        // client makes the client treat a stale exit as its own and drop
+        // the terminal (see litter remote_alleycat read_output_loop). Shell
+        // has no meaningful cross-connection state, so drop any prior
+        // session on reattach and always start Fresh.
+        if agent == "shell" {
+            self.inner.lock().unwrap().remove(&(node_id.clone(), agent));
+        }
         let (session, was_existing) = {
             let mut inner = self.inner.lock().unwrap();
             let key = (node_id.clone(), agent);
@@ -274,6 +283,25 @@ mod tests {
         let c = reg.get_or_create("node-xyz".into(), "pi");
         assert!(!Arc::ptr_eq(&a, &b));
         assert!(!Arc::ptr_eq(&a, &c));
+    }
+
+    #[test]
+    fn shell_reattach_starts_fresh_while_agent_reattach_keeps_replay() {
+        let registry = SessionRegistry::new(SessionRegistryConfig::default());
+        for agent in ["shell", "pi"] {
+            let first = registry.resolve_attach("node".into(), agent, None);
+            first.session.enqueue(notif("previous-connection"));
+            let second = registry.resolve_attach("node".into(), agent, Some(0));
+            if agent == "shell" {
+                assert_eq!(second.kind, AttachKind::Fresh);
+                assert!(!Arc::ptr_eq(&first.session, &second.session));
+                assert_eq!(second.current_seq, 0);
+            } else {
+                assert_eq!(second.kind, AttachKind::Resumed);
+                assert!(Arc::ptr_eq(&first.session, &second.session));
+                assert_eq!(second.current_seq, first.session.peek_seq().0);
+            }
+        }
     }
 
     #[test]

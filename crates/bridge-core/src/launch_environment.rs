@@ -488,7 +488,10 @@ fn find_provider_on_path(program: &str, env: &EnvMap, fallback_paths: &[&str]) -
 }
 
 fn find_on_path(program: &str, env: &EnvMap) -> Option<PathBuf> {
-    let path = env.get(OsStr::new("PATH"))?;
+    // Windows stores the variable as `Path`, so an exact `PATH` lookup misses it.
+    let path = ["PATH", "Path"]
+        .iter()
+        .find_map(|k| env.get(OsStr::new(k)))?;
     for dir in std::env::split_paths(path) {
         let candidate = dir.join(program);
         if is_executable_file(&candidate) {
@@ -539,15 +542,25 @@ mod tests {
         if let Some(marker) = std::env::var_os(CHILD) {
             let runtime = tokio::runtime::Runtime::new().unwrap();
             runtime.block_on(LaunchEnvironmentResolver::default().resolve(None));
-            assert!(!Path::new(&marker).exists(), "background launch executed the login shell");
+            assert!(
+                !Path::new(&marker).exists(),
+                "background launch executed the login shell"
+            );
             return;
         }
         let temp = tempfile::tempdir().unwrap();
         let shell = temp.path().join("bash");
-        std::fs::write(&shell, "#!/bin/sh\nprintf launched > \"$ALLEYCAT_HEADLESS_ENV_TEST\"\n").unwrap();
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\nprintf launched > \"$ALLEYCAT_HEADLESS_ENV_TEST\"\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
         let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "launch_environment::tests::default_resolver_does_not_launch_user_shell"])
+            .args([
+                "--exact",
+                "launch_environment::tests::default_resolver_does_not_launch_user_shell",
+            ])
             .env_clear()
             .env("HOME", temp.path())
             .env("PATH", "/usr/bin:/bin")
@@ -555,7 +568,11 @@ mod tests {
             .env(CHILD, temp.path().join("unwanted-terminal"))
             .output()
             .unwrap();
-        assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stdout));
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
     }
 
     #[test]
@@ -639,6 +656,35 @@ mod tests {
         let path = std::env::join_paths([first.as_path(), second.as_path()]).expect("join path");
         let mut env = EnvMap::new();
         env.insert(OsString::from("PATH"), path);
+
+        assert_eq!(
+            find_on_path("agent", &env).as_deref(),
+            Some(executable.as_path())
+        );
+    }
+
+    #[test]
+    fn find_on_path_accepts_windows_path_key_casing() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let executable = temp
+            .path()
+            .join(if cfg!(windows) { "agent.exe" } else { "agent" });
+        std::fs::write(&executable, "#!/bin/sh\n").expect("write executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&executable)
+                .expect("executable metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&executable, perms).expect("chmod executable");
+        }
+
+        let mut env = EnvMap::new();
+        env.insert(
+            OsString::from("Path"),
+            temp.path().as_os_str().to_os_string(),
+        );
 
         assert_eq!(
             find_on_path("agent", &env).as_deref(),

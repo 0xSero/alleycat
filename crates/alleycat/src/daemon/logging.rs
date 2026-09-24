@@ -69,6 +69,7 @@ mod tests {
 
     #[test]
     fn retention_prunes_old_daemon_logs_and_preserves_other_files() {
+        let _guard = crate::test_support::lock_env();
         let dir = tempfile::tempdir().unwrap();
         for day in 1..=10 {
             std::fs::write(

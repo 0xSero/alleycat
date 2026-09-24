@@ -125,8 +125,8 @@ async fn two_concurrent_connections_share_one_daemon() -> Result<()> {
 }
 
 fn spawn_daemon(
-    socket_path: &PathBuf,
-    script_path: &PathBuf,
+    socket_path: &Path,
+    script_path: &Path,
     codex_home: &std::path::Path,
 ) -> Result<Child> {
     let bin = env!("CARGO_BIN_EXE_alleycat-pi-bridge");

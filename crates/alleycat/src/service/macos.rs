@@ -248,6 +248,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn tempdir() -> PathBuf {
+        // Other tests temporarily point TMPDIR inside a disposable TempHome.
+        let _guard = crate::test_support::lock_env();
         let mut path = std::env::temp_dir();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

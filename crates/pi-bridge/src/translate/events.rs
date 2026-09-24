@@ -22,7 +22,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::codex_proto::common::TurnError;
+use crate::codex_proto::common::{ThreadTokenUsage, TokenUsageBreakdown, TurnError};
 use crate::codex_proto::items::{
     CommandExecutionStatus, DynamicToolCallStatus, FileUpdateChange, McpToolCallError,
     McpToolCallResult, McpToolCallStatus, PatchApplyStatus, PatchChangeKind, ThreadItem,
@@ -31,7 +31,7 @@ use crate::codex_proto::notifications::{
     AgentMessageDeltaNotification, CommandExecutionOutputDeltaNotification,
     ContextCompactedNotification, ErrorNotification, ItemCompletedNotification,
     ItemStartedNotification, McpToolCallProgressNotification, ReasoningTextDeltaNotification,
-    ServerNotification,
+    ServerNotification, ThreadTokenUsageUpdatedNotification,
 };
 use crate::pool::pi_protocol::{
     AgentMessage, AssistantContentBlock, AssistantMessage, AssistantMessageEvent, PiEvent,
@@ -64,6 +64,7 @@ pub struct EventTranslatorState {
     open_reasoning_item: Option<OpenItem>,
     open_tool_calls: HashMap<String, OpenToolCall>,
     open_compaction_item_id: Option<String>,
+    cumulative_token_usage: TokenUsageBreakdown,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +113,7 @@ impl EventTranslatorState {
             open_reasoning_item: None,
             open_tool_calls: HashMap::new(),
             open_compaction_item_id: None,
+            cumulative_token_usage: TokenUsageBreakdown::default(),
         }
     }
 
@@ -145,7 +147,7 @@ impl EventTranslatorState {
             PiEvent::TurnStart => Vec::new(),
             PiEvent::AgentEnd { messages } => self.translate_agent_end(&messages),
             PiEvent::AgentSettled => Vec::new(),
-            PiEvent::TurnEnd { .. } => Vec::new(),
+            PiEvent::TurnEnd { message, .. } => self.translate_turn_end(message),
             PiEvent::ThinkingLevelChanged { .. } => Vec::new(),
 
             PiEvent::MessageStart { message } => match message {
@@ -721,6 +723,34 @@ impl EventTranslatorState {
             out.push(self.item_completed(item));
         }
         out
+    }
+
+    fn translate_turn_end(&mut self, message: AgentMessage) -> Vec<ServerNotification> {
+        let AgentMessage::Assistant(a) = &message else {
+            return Vec::new();
+        };
+        if a.usage.total_tokens == 0 && a.usage.input == 0 && a.usage.output == 0 {
+            return Vec::new();
+        }
+        let breakdown = TokenUsageBreakdown {
+            total_tokens: a.usage.total_tokens as i64,
+            input_tokens: a.usage.input as i64,
+            cached_input_tokens: a.usage.cache_read as i64,
+            output_tokens: a.usage.output as i64,
+            reasoning_output_tokens: 0,
+        };
+        self.cumulative_token_usage = sum_breakdown(&self.cumulative_token_usage, &breakdown);
+        vec![ServerNotification::ThreadTokenUsageUpdated(
+            ThreadTokenUsageUpdatedNotification {
+                thread_id: self.thread_id.clone(),
+                turn_id: self.turn_id.clone(),
+                token_usage: ThreadTokenUsage {
+                    total: self.cumulative_token_usage.clone(),
+                    last: breakdown,
+                    model_context_window: None,
+                },
+            },
+        )]
     }
 
     fn reconcile_authoritative_tool(
@@ -1340,6 +1370,75 @@ mod tests {
             stop_reason: StopReason::Stop,
             error_message: None,
             timestamp: 0,
+        }
+    }
+
+    fn assistant_msg_with_usage(input: u64, output: u64, cache_read: u64) -> AgentMessage {
+        AgentMessage::Assistant(AssistantMessage {
+            usage: Usage {
+                input,
+                output,
+                cache_read,
+                cache_write: 0,
+                total_tokens: input + output + cache_read,
+                cost: UsageCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    total: 0.0,
+                },
+            },
+            ..assistant_message("")
+        })
+    }
+
+    #[test]
+    fn turn_end_with_usage_emits_thread_token_usage_updated() {
+        let mut s = state();
+        let out = s.translate(PiEvent::TurnEnd {
+            message: assistant_msg_with_usage(300, 200, 100),
+            tool_results: Vec::new(),
+        });
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            ServerNotification::ThreadTokenUsageUpdated(n) => {
+                assert_eq!(n.thread_id, "th_1");
+                assert_eq!(n.turn_id, "tu_1");
+                assert_eq!(n.token_usage.last.total_tokens, 600);
+                assert_eq!(n.token_usage.total.total_tokens, 600);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_end_zero_usage_is_silent() {
+        let mut s = state();
+        let out = s.translate(PiEvent::TurnEnd {
+            message: assistant_msg_with_usage(0, 0, 0),
+            tool_results: Vec::new(),
+        });
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn turn_end_usage_accumulates_across_turns() {
+        let mut s = state();
+        s.translate(PiEvent::TurnEnd {
+            message: assistant_msg_with_usage(300, 200, 100),
+            tool_results: Vec::new(),
+        });
+        let out = s.translate(PiEvent::TurnEnd {
+            message: assistant_msg_with_usage(100, 100, 0),
+            tool_results: Vec::new(),
+        });
+        match &out[0] {
+            ServerNotification::ThreadTokenUsageUpdated(n) => {
+                assert_eq!(n.token_usage.last.total_tokens, 200);
+                assert_eq!(n.token_usage.total.total_tokens, 800);
+            }
+            other => panic!("unexpected {other:?}"),
         }
     }
 
@@ -2653,5 +2752,15 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+}
+
+fn sum_breakdown(a: &TokenUsageBreakdown, b: &TokenUsageBreakdown) -> TokenUsageBreakdown {
+    TokenUsageBreakdown {
+        total_tokens: a.total_tokens + b.total_tokens,
+        input_tokens: a.input_tokens + b.input_tokens,
+        cached_input_tokens: a.cached_input_tokens + b.cached_input_tokens,
+        output_tokens: a.output_tokens + b.output_tokens,
+        reasoning_output_tokens: a.reasoning_output_tokens + b.reasoning_output_tokens,
     }
 }

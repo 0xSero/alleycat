@@ -410,7 +410,9 @@ impl AgentManager {
 
         let devin_builder = AcpBridge::builder()
             .model_catalog_command(
-                ["models", "list", "--format", "json"].map(str::to_owned).to_vec(),
+                ["models", "list", "--format", "json"]
+                    .map(str::to_owned)
+                    .to_vec(),
                 alleycat_devin_bridge::parse_model_catalog,
             )
             .agent_bin(PathBuf::from(&snapshot.agents.devin.bin))
@@ -1315,11 +1317,10 @@ impl ProcessLauncher for LocalStudioLauncher {
             // Settings discovery must inspect the same bundled Pi package even
             // when the executable is Node and the CLI is a prefix argument.
             if let Some(cli) = command.prefix_args.first() {
-                spec.env.retain(|(key, _)| key != "ALLEYCAT_PI_SETTINGS_CLI");
-                spec.env.push((
-                    OsString::from("ALLEYCAT_PI_SETTINGS_CLI"),
-                    cli.clone(),
-                ));
+                spec.env
+                    .retain(|(key, _)| key != "ALLEYCAT_PI_SETTINGS_CLI");
+                spec.env
+                    .push((OsString::from("ALLEYCAT_PI_SETTINGS_CLI"), cli.clone()));
             }
             if spec.role == alleycat_bridge_core::ProcessRole::Agent {
                 let mut args = command.prefix_args;
@@ -1587,6 +1588,10 @@ async fn codex_app_server_proxy_supported(bin: &Path, env: &LaunchEnvironment) -
 }
 
 async fn codex_app_server_daemon_supported(bin: &Path, env: &LaunchEnvironment) -> bool {
+    if !codex_managed_standalone_available(env) {
+        return false;
+    }
+
     let mut command = codex_command(bin);
     apply_launch_env_to_command(&mut command, env);
     command
@@ -1599,6 +1604,27 @@ async fn codex_app_server_daemon_supported(bin: &Path, env: &LaunchEnvironment) 
         tokio::time::timeout(Duration::from_secs(5), command.status()).await,
         Ok(Ok(status)) if status.success()
     )
+}
+
+fn codex_managed_standalone_available(env: &LaunchEnvironment) -> bool {
+    #[cfg(windows)]
+    let names: &[&str] = &["codex.exe", "codex.cmd", "codex.bat", "codex.com"];
+    #[cfg(not(windows))]
+    let names: &[&str] = &["codex"];
+
+    names
+        .iter()
+        .map(|name| codex_managed_standalone_path(env).join(name))
+        .any(|path| is_executable_file(&path))
+}
+
+fn codex_managed_standalone_path(env: &LaunchEnvironment) -> PathBuf {
+    env_path(env, "CODEX_HOME")
+        .or_else(|| env_path(env, "HOME").map(|home| home.join(".codex")))
+        .unwrap_or_else(|| PathBuf::from(".codex"))
+        .join("packages")
+        .join("standalone")
+        .join("current")
 }
 
 #[derive(Debug, Deserialize)]
@@ -2299,6 +2325,42 @@ mod tests {
 
         assert!(program_available(&env, "agent"));
         assert_eq!(resolve_pi_bin("pi", &env), None);
+    }
+
+    #[test]
+    fn codex_daemon_requires_managed_standalone_install() {
+        let mut home = crate::test_support::TempHome::new();
+        home.override_env(&[("CODEX_HOME", "")]);
+        let env = LaunchEnvironment::current();
+
+        assert!(!codex_managed_standalone_available(&env));
+    }
+
+    #[test]
+    fn codex_daemon_accepts_codex_home_standalone_install() {
+        let mut home = crate::test_support::TempHome::new();
+        let codex_home = home.path().join("custom-codex-home");
+        let standalone_dir = codex_home.join("packages/standalone/current");
+        std::fs::create_dir_all(&standalone_dir).unwrap();
+        #[cfg(windows)]
+        let codex = standalone_dir.join("codex.exe");
+        #[cfg(not(windows))]
+        let codex = standalone_dir.join("codex");
+        std::fs::write(&codex, b"#!/bin/sh\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&codex).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&codex, perms).unwrap();
+        }
+
+        home.override_env(&[("CODEX_HOME", codex_home.to_str().unwrap())]);
+        let env = LaunchEnvironment::current();
+
+        assert_eq!(codex_managed_standalone_path(&env), standalone_dir);
+        assert!(codex_managed_standalone_available(&env));
     }
 
     #[test]
