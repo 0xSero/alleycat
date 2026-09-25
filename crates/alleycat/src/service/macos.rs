@@ -13,17 +13,12 @@ use crate::service::{DAEMON_SUBCOMMAND, service_label};
 pub(super) fn install() -> anyhow::Result<()> {
     let plist_path = paths::launchd_plist_path()?;
     let exe = std::env::current_exe().context("resolving current executable for launchd plist")?;
-    // Raw bootstrap/panic output is separate from the dated tracing files.
-    // In particular, retention must never unlink a live launchd descriptor.
-    // This fallback sink is not covered by the tracing byte cap.
-    let log_path = paths::log_dir()?.join("service-startup.log");
     let inherit_path = std::env::var("PATH").ok();
     let inherit_shell = std::env::var("SHELL").ok();
 
     write_plist(
         &plist_path,
         &exe,
-        &log_path,
         inherit_path.as_deref(),
         inherit_shell.as_deref(),
     )?;
@@ -128,15 +123,10 @@ pub(super) fn uninstall() -> anyhow::Result<()> {
 pub(super) fn write_plist(
     plist_path: &Path,
     exe: &Path,
-    log_path: &Path,
     inherit_path: Option<&str>,
     inherit_shell: Option<&str>,
 ) -> anyhow::Result<()> {
     if let Some(parent) = plist_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    if let Some(parent) = log_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating {}", parent.display()))?;
     }
@@ -150,7 +140,7 @@ pub(super) fn write_plist(
     if let Some(shell) = inherit_shell {
         environment.insert("SHELL".to_owned(), shell.to_owned());
     }
-    let body = render_plist(exe, log_path, &environment);
+    let body = render_plist(exe, &environment);
     let tmp = plist_path.with_extension("plist.tmp");
     std::fs::write(&tmp, body.as_bytes()).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, plist_path)
@@ -185,10 +175,11 @@ fn read_plist_environment(plist_path: &Path) -> anyhow::Result<BTreeMap<String, 
     }
 }
 
-fn render_plist(exe: &Path, log_path: &Path, environment: &BTreeMap<String, String>) -> String {
+fn render_plist(exe: &Path, environment: &BTreeMap<String, String>) -> String {
     let label = service_label();
     let exe = xml_escape(&exe.to_string_lossy());
-    let log = xml_escape(&log_path.to_string_lossy());
+    // Normal daemon tracing has its own capped writer. Raw bootstrap/panic
+    // output must not accumulate across launchd crash-loop restarts.
     // launchd sanitizes PATH to /usr/bin:/bin:/usr/sbin:/sbin by default,
     // which makes `which::which` fail for tools installed under ~/.bun/bin,
     // ~/.opencode/bin, /opt/homebrew/bin, etc. Inheriting the install-time
@@ -226,9 +217,9 @@ fn render_plist(exe: &Path, log_path: &Path, environment: &BTreeMap<String, Stri
     <key>KeepAlive</key>
     <true/>
 {env_block}    <key>StandardOutPath</key>
-    <string>{log}</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>{log}</string>
+    <string>/dev/null</string>
 </dict>
 </plist>
 "#
@@ -268,8 +259,7 @@ mod tests {
         let tmp = tempdir();
         let plist = tmp.join("dev.alleycat.alleycat.plist");
         let exe = PathBuf::from("/usr/local/bin/alleycat");
-        let log = tmp.join("daemon.log");
-        write_plist(&plist, &exe, &log, None, None).expect("write_plist");
+        write_plist(&plist, &exe, None, None).expect("write_plist");
         let body = std::fs::read_to_string(&plist).expect("read plist");
         assert!(body.contains("<string>dev.alleycat.alleycat</string>"));
         assert!(body.contains("<string>/usr/local/bin/alleycat</string>"));
@@ -280,8 +270,9 @@ mod tests {
             !body.contains("<key>EnvironmentVariables</key>"),
             "no inherit_path → no env block"
         );
-        let log_str = log.to_string_lossy().to_string();
-        assert!(body.contains(&log_str));
+        assert!(body.contains("<key>StandardOutPath</key>\n    <string>/dev/null</string>"));
+        assert!(body.contains("<key>StandardErrorPath</key>\n    <string>/dev/null</string>"));
+        assert!(!body.contains("service-startup.log"));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -290,11 +281,9 @@ mod tests {
         let tmp = tempdir();
         let plist = tmp.join("dev.alleycat.alleycat.plist");
         let exe = PathBuf::from("/usr/local/bin/alleycat");
-        let log = tmp.join("daemon.log");
         write_plist(
             &plist,
             &exe,
-            &log,
             Some("/Users/me/.bun/bin:/opt/homebrew/bin:/usr/bin:/bin"),
             Some("/opt/homebrew/bin/fish"),
         )
@@ -312,7 +301,6 @@ mod tests {
     fn reinstall_preserves_explicit_environment_and_updates_executable() {
         let tmp = tempdir();
         let plist = tmp.join("service.plist");
-        let log = tmp.join("daemon.log");
         let environment = BTreeMap::from([
             ("PATH".to_owned(), "/old/bin".to_owned()),
             ("SHELL".to_owned(), "/bin/zsh".to_owned()),
@@ -324,9 +312,14 @@ mod tests {
         ]);
         std::fs::write(
             &plist,
-            render_plist(Path::new("/old/kittylitter"), &log, &environment),
+            render_plist(Path::new("/old/kittylitter"), &environment).replace(
+                "/dev/null",
+                &tmp.join("service-startup.log").to_string_lossy(),
+            ),
         )
         .unwrap();
+        let old_log = tmp.join("service-startup.log");
+        std::fs::write(&old_log, "previous startup diagnostics").unwrap();
         // Native binary plists are supported as well as our generated XML.
         assert!(
             Command::new("/usr/bin/plutil")
@@ -339,7 +332,6 @@ mod tests {
         write_plist(
             &plist,
             Path::new("/new/kittylitter"),
-            &log,
             Some("/new/bin"),
             None,
         )
@@ -347,6 +339,12 @@ mod tests {
         let mut expected = environment;
         expected.insert("PATH".to_owned(), "/new/bin".to_owned());
         assert_eq!(read_plist_environment(&plist).unwrap(), expected);
+        let body = std::fs::read_to_string(&plist).unwrap();
+        assert_eq!(body.matches("<string>/dev/null</string>").count(), 2);
+        assert_eq!(
+            std::fs::read_to_string(old_log).unwrap(),
+            "previous startup diagnostics"
+        );
         assert!(
             std::fs::read_to_string(&plist)
                 .unwrap()
@@ -365,14 +363,7 @@ mod tests {
         ] {
             std::fs::write(&plist, contents).unwrap();
             assert!(
-                write_plist(
-                    &plist,
-                    Path::new("/new/kittylitter"),
-                    &tmp.join("daemon.log"),
-                    Some("/bin"),
-                    None
-                )
-                .is_err()
+                write_plist(&plist, Path::new("/new/kittylitter"), Some("/bin"), None).is_err()
             );
             assert_eq!(std::fs::read_to_string(&plist).unwrap(), contents);
         }
