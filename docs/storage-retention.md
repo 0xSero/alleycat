@@ -32,11 +32,20 @@ It does **not** impose a byte limit on raw service output. Older installations
 may also leave a bare `daemon.log`; it is not silently deleted. Normal daemon
 tracing is not mirrored to this sink because service stderr is not a TTY.
 
-At the audited shipping revision, OpenCode's child server inherits stderr and
-can write here throughout its lifetime; this is a concrete residual growth
-path, not evidence that all diagnostic storage is bounded. Other inspected
-agent pools use piped or null stderr. Linux service stderr follows the user's
-systemd journal policy, not this app's file cap.
+OpenCode's child server previously inherited stderr and could write here
+throughout its lifetime. It now uses an owned reader with fixed 4 KiB chunks,
+emitted at warning level through tracing. There is no line accumulation or
+additional queue; a newline-free stream cannot expand a read buffer. The
+reader is cancelled when its runtime is dropped, including failed/cancelled
+startup. Chunk boundaries can replace split UTF-8 sequences in diagnostics;
+the stream is not a byte-exact transcript. Other inspected agent pools use
+piped or null stderr.
+
+The raw sink still receives process-level bootstrap/termination errors, default
+panic output, and tracing worker flush-failure diagnostics. Repeated failures
+can therefore grow it, even after the ordinary OpenCode stream is routed away.
+No claim is made that all diagnostic storage is bounded. Linux service stderr
+follows the user's systemd journal policy, not this app's file cap.
 
 ## Durable session state is not a disposable log cache
 
