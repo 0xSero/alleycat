@@ -13,6 +13,7 @@ publish = false
 [dependencies]
 alleycat-acp-bridge = { workspace = true }
 alleycat-bridge-core = { workspace = true }
+alleycat-codex-proto = { workspace = true }
 anyhow.workspace = true
 async-trait.workspace = true
 rusqlite = { version = "0.31", features = ["bundled"] }

@@ -1,0 +1,71 @@
+✓ plugins/glm-52-mode.ts active
+  agent: glm-5.2
+  agent mode: glm-5.2
+✓ plugins/custom-models.ts active
+  agent: sonnet
+  agent: gemini
+  agent: grok
+  agent mode: sonnet
+  agent mode: gemini
+  agent mode: grok
+✓ plugins/fable-mode.ts active
+  agent: claude-fable-5
+  agent: claude-fable-5-low
+  agent: claude-fable-5-medium
+  agent: claude-fable-5-xhigh
+  agent: claude-fable-5-max
+  agent mode: claude-fable-5
+  agent mode: claude-fable-low
+  agent mode: claude-fable-med
+  agent mode: claude-fable-xhi
+  agent mode: claude-fable-max
+✓ official-modes (Workspace Plugins) active
+  agent: gpt-6-astra-low
+  agent: gpt-6-astra-medium
+  agent: gpt-6-astra-high
+  agent: gpt-6-astra-xhigh
+  agent: gpt-6-astra-max
+  agent: gpt-6-astra
+  agent: claude-fable-5-1
+  agent: claude-opus-5
+  agent: claude-sonnet-5
+  agent: deepseek-v4.1-flash
+  agent: gemini-3.8-flash
+  agent: glm-5.2
+  agent: glm-5.3
+  agent: glm-5.3-flash
+  agent: gpt-5.6-luna
+  agent: gpt-5.6-sol
+  agent: gpt-5.6-sol-pro
+  agent: gpt-5.6-terra
+  agent: grok-4-5
+  agent: grok-4-6
+  agent: kimi-k3
+  agent: muse-spark
+  agent: minimax-m3
+  agent: qwen3.8-max
+  agent mode: gpt-6-astra-low
+  agent mode: gpt-6-astra-medium
+  agent mode: gpt-6-astra-high
+  agent mode: gpt-6-astra-xhigh
+  agent mode: gpt-6-astra-max
+  agent mode: astra
+  agent mode: claude-fable-5-1
+  agent mode: claude-opus-5
+  agent mode: claude-sonnet-5
+  agent mode: daybreak-blue
+  agent mode: deepseek-v4.1-flash
+  agent mode: gemini-3.8-flash
+  agent mode: glm-5.2
+  agent mode: glm-5.3
+  agent mode: glm-5.3-flash
+  agent mode: gpt56l
+  agent mode: gpt56s
+  agent mode: gpt56s-pro
+  agent mode: gpt56t
+  agent mode: grok45
+  agent mode: grok46
+  agent mode: kimi-k3
+  agent mode: muse-spark
+  agent mode: minimax-m3
+  agent mode: qwen3.8-max

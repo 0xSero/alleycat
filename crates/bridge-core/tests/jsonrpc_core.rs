@@ -11,6 +11,81 @@ use serde_json::{Value, json};
 use tokio::io::BufReader;
 
 #[tokio::test]
+async fn closing_preempted_stream_preserves_new_attachment() {
+    struct Echo;
+    #[async_trait]
+    impl Bridge for Echo {
+        async fn initialize(&self, _: &Conn, _: Value) -> Result<Value, JsonRpcError> {
+            Ok(json!({}))
+        }
+        async fn dispatch(&self, _: &Conn, _: &str, params: Value) -> Result<Value, JsonRpcError> {
+            Ok(params)
+        }
+    }
+    let session = Arc::new(alleycat_bridge_core::Session::new(
+        "pi",
+        "reattach-test".into(),
+        64,
+        1 << 20,
+    ));
+    let mut clients = Vec::new();
+    let mut servers = Vec::new();
+    for id in 1..=2 {
+        let (client, stream) = tokio::io::duplex(8192);
+        servers.push(tokio::spawn(server::serve_stream_with_session(
+            Arc::new(Echo),
+            stream,
+            session.clone(),
+            None,
+        )));
+        let mut client = BufReader::new(client);
+        write_json_line(
+            client.get_mut(),
+            &json!({"id":id,"method":"initialize","params":{}}),
+        )
+        .await
+        .unwrap();
+        let reply: Value = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_json_line(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply["id"], id);
+        clients.push(client);
+    }
+    drop(clients.remove(0));
+    tokio::time::timeout(std::time::Duration::from_secs(2), servers.remove(0))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        session.is_attached(),
+        "old stream cleanup detached the replacement"
+    );
+    session.enqueue(json!({"method":"still-live","params":{}}));
+    let message: Value = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_json_line(&mut clients[0]),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+    .unwrap();
+    assert_eq!(message["method"], "still-live");
+    drop(clients);
+    tokio::time::timeout(std::time::Duration::from_secs(2), servers.remove(0))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(!session.is_attached());
+}
+
+#[tokio::test]
 async fn framing_round_trips_jsonrpc_message() {
     let mut bytes = Vec::new();
     write_json_line(

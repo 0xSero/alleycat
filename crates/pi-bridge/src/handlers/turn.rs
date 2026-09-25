@@ -723,18 +723,22 @@ async fn run_event_pump(mut args: EventPumpArgs) {
 }
 
 fn event_terminal_state(event: &pi::PiEvent) -> Option<(pi::StopReason, Option<String>)> {
-    let assistant = match event {
-        pi::PiEvent::MessageUpdate { assistant_message_event, .. } => {
-            match &**assistant_message_event {
-                pi::AssistantMessageEvent::Done { reason, message } => {
-                    return Some((*reason, normalized_error(message.error_message.as_deref())))
-                }
-                pi::AssistantMessageEvent::Error { reason, error } => {
-                    return Some((*reason, normalized_error(error.error_message.as_deref())))
-                }
-                _ => return None,
+    if let pi::PiEvent::MessageUpdate {
+        assistant_message_event,
+        ..
+    } = event
+    {
+        return match assistant_message_event.as_ref() {
+            pi::AssistantMessageEvent::Done { reason, message } => {
+                Some((*reason, normalized_error(message.error_message.as_deref())))
             }
-        }
+            pi::AssistantMessageEvent::Error { reason, error } => {
+                Some((*reason, normalized_error(error.error_message.as_deref())))
+            }
+            _ => None,
+        };
+    }
+    let assistant = match event {
         pi::PiEvent::MessageEnd {
             message: pi::AgentMessage::Assistant(message),
         }
@@ -1141,6 +1145,36 @@ mod tests {
             "timestamp": 1
         }]))
         .unwrap();
+
+        let pi::AgentMessage::Assistant(assistant) = &messages[0] else {
+            panic!("assistant fixture");
+        };
+        for (reason, assistant_message_event) in [
+            (
+                pi::StopReason::Length,
+                pi::AssistantMessageEvent::Done {
+                    reason: pi::StopReason::Length,
+                    message: assistant.clone(),
+                },
+            ),
+            (
+                pi::StopReason::Aborted,
+                pi::AssistantMessageEvent::Error {
+                    reason: pi::StopReason::Aborted,
+                    error: assistant.clone(),
+                },
+            ),
+        ] {
+            // The streaming terminal reason wins over the snapshot's older
+            // stopReason, and terminal errors keep their normalized message.
+            assert_eq!(
+                event_terminal_state(&pi::PiEvent::MessageUpdate {
+                    message: messages[0].clone(),
+                    assistant_message_event: Box::new(assistant_message_event),
+                }),
+                Some((reason, Some("model is not running".to_string())))
+            );
+        }
 
         assert_eq!(
             event_terminal_state(&pi::PiEvent::AgentEnd { messages }),

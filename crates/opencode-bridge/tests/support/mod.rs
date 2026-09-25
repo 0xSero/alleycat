@@ -411,6 +411,10 @@ fn handle_conn(mut stream: TcpStream, state: FakeState, injector: SseInjector) {
         Some(Value::String(ref s)) if s == "__no_content__" => {
             "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".to_string()
         }
+        Some(Value::String(ref s)) if s == "__server_error__" => {
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string()
+        }
         Some(body) => {
             let body = serde_json::to_string(&body).unwrap();
             format!(
