@@ -13,7 +13,10 @@ use crate::service::{DAEMON_SUBCOMMAND, service_label};
 pub(super) fn install() -> anyhow::Result<()> {
     let plist_path = paths::launchd_plist_path()?;
     let exe = std::env::current_exe().context("resolving current executable for launchd plist")?;
-    let log_path = paths::log_dir()?.join("daemon.log");
+    // Raw bootstrap/panic output is separate from the dated tracing files.
+    // In particular, retention must never unlink a live launchd descriptor.
+    // This fallback sink is not covered by the tracing byte cap.
+    let log_path = paths::log_dir()?.join("service-startup.log");
     let inherit_path = std::env::var("PATH").ok();
     let inherit_shell = std::env::var("SHELL").ok();
 

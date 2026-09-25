@@ -30,14 +30,10 @@ use crate::state;
 
 use self::control::{Request, Response, RotateResult, StatusInfo, token_fingerprint};
 
-/// Entry point for `alleycat serve`. Initializes file logging, acquires the
-/// single-instance lock, binds the iroh endpoint + control IPC, and runs
+/// Entry point for `alleycat serve`. Acquires the single-instance lock,
+/// initializes file logging, binds the iroh endpoint + control IPC, and runs
 /// until SIGTERM / SIGINT / control `Stop`.
 pub async fn run() -> anyhow::Result<()> {
-    let log_dir = paths::log_dir().context("locating log directory")?;
-    let _log_guard: WorkerGuard =
-        logging::init("info", &log_dir).context("initializing logging")?;
-
     let mut lock = state::acquire_lock().await.context("acquiring lock file")?;
     let _lock_guard = lock.try_write().map_err(|_| {
         let pid_hint = state::read_pid_file().unwrap_or(None);
@@ -51,6 +47,12 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
     })?;
+
+    // A failed duplicate start must not create a second size-accounting writer
+    // against the running daemon's file.
+    let log_dir = paths::log_dir().context("locating log directory")?;
+    let _log_guard: WorkerGuard =
+        logging::init("info", &log_dir).context("initializing logging")?;
 
     let pid_path = state::write_pid_file().context("writing pid file")?;
     let _pid_cleanup = RemoveOnDrop(pid_path);
