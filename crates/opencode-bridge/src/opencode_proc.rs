@@ -145,7 +145,10 @@ async fn drain_stderr(
     }
 }
 
-const READINESS_TIMEOUT: Duration = Duration::from_secs(10);
+// `opencode serve` is a JS runtime; on a heavily loaded host (load avg in the
+// hundreds) cold start routinely exceeds 10s, which failed the daemon's lazy
+// bridge init and surfaced to clients as a dropped `initialize`.
+const READINESS_TIMEOUT: Duration = Duration::from_secs(45);
 const READINESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 

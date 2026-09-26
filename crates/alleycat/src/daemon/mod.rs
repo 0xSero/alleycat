@@ -83,6 +83,7 @@ async fn run_inner() -> anyhow::Result<()> {
     let agents = AgentManager::new(Arc::clone(&config))
         .await
         .context("initializing agent manager")?;
+    let _catalog_warmup = agents.spawn_model_catalog_warmup();
 
     let started_at = Instant::now();
     let shutdown = Arc::new(Notify::new());

@@ -4,6 +4,7 @@ pub mod framing;
 pub mod git_info;
 pub mod launch_environment;
 pub mod launcher;
+pub mod model_catalog;
 pub mod notify;
 pub mod pool;
 pub mod server;
@@ -23,6 +24,7 @@ pub use launcher::{
     ChildProcess, ChildStderr, ChildStdin, ChildStdout, LocalLauncher, ProcessLauncher,
     ProcessRole, ProcessSpec, StdioMode,
 };
+pub use model_catalog::{CachedCatalogBridge, ModelCatalogCache};
 pub use notify::NotificationSender;
 pub use server::{Bridge, Conn, serve_stdio, serve_stream, serve_stream_with_session};
 #[cfg(unix)]

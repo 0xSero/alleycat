@@ -9,6 +9,7 @@ use alleycat_acp_bridge::AcpBridge;
 use alleycat_amp_bridge::AmpBridge;
 use alleycat_bridge_core::codex_resolver::{newest_codex_candidates_first, program_candidates};
 use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryConfig};
+use alleycat_bridge_core::{CachedCatalogBridge, ModelCatalogCache};
 use alleycat_bridge_core::{
     Bridge, LaunchEnvironment, LaunchEnvironmentResolver, LocalLauncher, ProcessLauncher,
     UserEnvironmentLauncher,
@@ -253,10 +254,17 @@ pub struct AgentManager {
     /// daemon startup if no client ever asks for opencode.
     opencode_bridge: Arc<OnceCell<Arc<OpencodeBridge>>>,
     opencode_state_dir: PathBuf,
+    /// Last-known-good opencode `model/list` catalog (the bridge itself is lazy).
+    opencode_catalog: Arc<ModelCatalogCache>,
     /// One daemon-owned `codex app-server` child for modes that keep a shared
     /// app-server alive (`UnixProxy` or legacy `Websocket`). Not populated when
     /// Alleycat is proxying to an externally-started Codex app-server.
     codex_child: Arc<Mutex<Option<Child>>>,
+    /// Last endpoint verified by `ensure_codex_daemon_running`. While its
+    /// socket still accepts connections we skip re-running `codex app-server
+    /// daemon start` + a probe proxy on every stream: three codex process
+    /// launches per connection pushed `model/list` past 45s under heavy load.
+    codex_daemon_endpoint: Arc<Mutex<Option<CodexUnixEndpoint>>>,
     /// Detected once at startup. Determines whether `serve_codex` runs the
     /// upstream daemon proxy, legacy Unix proxy, legacy websocket byte-pump, or
     /// per-stream stdio bridging.
@@ -475,6 +483,22 @@ impl AgentManager {
             Arc::new(HermesBridge::new(hermes_bridge_cfg)) as Arc<dyn Bridge>,
         );
 
+        // Serve the last-known-good `model/list` catalog when native discovery
+        // times out on a loaded host. Shell has no model catalog.
+        let catalog_dir = bridge_state.base.join("model-catalogs");
+        let bridges: HashMap<AgentKind, Arc<dyn Bridge>> = bridges
+            .into_iter()
+            .map(|(kind, bridge)| {
+                if kind == AgentKind::Shell {
+                    return (kind, bridge);
+                }
+                let cache =
+                    ModelCatalogCache::new(agent_kind_str(kind), Some(catalog_dir.clone()));
+                (kind, Arc::new(CachedCatalogBridge::new(bridge, cache)) as Arc<dyn Bridge>)
+            })
+            .collect();
+        let opencode_catalog = ModelCatalogCache::new("opencode", Some(catalog_dir));
+
         let session_cfg = &snapshot.session;
         let registry_config = SessionRegistryConfig {
             ring_max_msgs: session_cfg.replay_max_msgs,
@@ -510,13 +534,56 @@ impl AgentManager {
             local_studio_bridge,
             opencode_bridge: Arc::new(OnceCell::new()),
             opencode_state_dir: bridge_state.opencode,
+            opencode_catalog,
             codex_child: Arc::new(Mutex::new(None)),
+            codex_daemon_endpoint: Arc::new(Mutex::new(None)),
             codex_mode: codex_detection.mode,
             codex_bin: codex_detection.bin,
             codex_available: codex_detection.available,
             launch_env,
             session_registry,
             _reaper_handle: reaper_handle,
+        })
+    }
+
+    /// Refresh every enabled agent's `model/list` catalog in the background
+    /// (two at a time) so the first client request after launch is served
+    /// from a warm cache. Opencode is skipped: its bridge spawns a server and
+    /// is deliberately built lazily.
+    pub fn spawn_model_catalog_warmup(&self) -> tokio::task::JoinHandle<()> {
+        use futures::StreamExt;
+        let enabled: Vec<(AgentKind, Arc<dyn Bridge>)> = {
+            let cfg = self.config.load();
+            self.bridges
+                .iter()
+                .filter(|(kind, _)| **kind != AgentKind::Shell && cfg.agents.is_enabled(**kind))
+                .map(|(kind, bridge)| (*kind, Arc::clone(bridge)))
+                .collect()
+        };
+        tokio::spawn(async move {
+            futures::stream::iter(enabled)
+                .for_each_concurrent(2, |(kind, bridge)| async move {
+                    let name = agent_kind_str(kind);
+                    let session = Arc::new(Session::new(
+                        name,
+                        "model-catalog-warmup".into(),
+                        16,
+                        64 * 1024,
+                    ));
+                    let conn = alleycat_bridge_core::Conn::from_session(session);
+                    let started = Instant::now();
+                    match tokio::time::timeout(
+                        Duration::from_secs(120),
+                        bridge.dispatch(&conn, "model/list", serde_json::json!({})),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => info!(agent = name, elapsed_ms = started.elapsed().as_millis() as u64, "model catalog warmed"),
+                        Ok(Err(error)) => warn!(agent = name, "model catalog warmup failed: {}", error.message),
+                        Err(_) => warn!(agent = name, "model catalog warmup timed out"),
+                    }
+                })
+                .await;
         })
     }
 
@@ -683,7 +750,10 @@ impl AgentManager {
             match kind {
                 AgentKind::Opencode => {
                     let oc = self.opencode_bridge_arc().await?;
-                    oc as Arc<dyn Bridge>
+                    Arc::new(CachedCatalogBridge::new(
+                        oc as Arc<dyn Bridge>,
+                        Arc::clone(&self.opencode_catalog),
+                    )) as Arc<dyn Bridge>
                 }
                 other => self.bridges.get(&other).cloned().ok_or_else(|| {
                     anyhow!("agent `{}` is not configured", agent_kind_str(other))
@@ -864,6 +934,12 @@ impl AgentManager {
         };
 
         let env = self.daemon_launch_env().await;
+        if let Some(endpoint) = self.codex_daemon_endpoint.lock().await.clone()
+            && endpoint.bin == bin
+            && codex_endpoint_socket_accepts(&endpoint, &env).await
+        {
+            return Ok(endpoint);
+        }
         let output = run_codex_app_server_daemon(&bin, "start", &env).await?;
         let endpoint = match output.socket_path {
             Some(socket_path) => CodexUnixEndpoint::custom_socket(bin, socket_path),
@@ -879,6 +955,7 @@ impl AgentManager {
                     .unwrap_or_else(|| "default".to_string());
                 format!("codex app-server proxy could not reach daemon socket {socket}")
             })?;
+        *self.codex_daemon_endpoint.lock().await = Some(endpoint.clone());
         Ok(endpoint)
     }
 
@@ -1725,7 +1802,7 @@ async fn probe_codex_app_server_proxy(
 
     let child_io = tokio::io::join(stdout, stdin);
     let result = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(15),
         tokio_tungstenite::client_async("ws://codex-app-server-proxy.localhost/rpc", child_io),
     )
     .await;
@@ -1739,6 +1816,32 @@ async fn probe_codex_app_server_proxy(
     };
     terminate_codex_child(&mut child, "app-server proxy probe").await;
     result
+}
+
+#[cfg(unix)]
+async fn codex_endpoint_socket_accepts(
+    endpoint: &CodexUnixEndpoint,
+    env: &LaunchEnvironment,
+) -> bool {
+    let Some(path) = endpoint
+        .socket_path
+        .clone()
+        .or_else(|| default_codex_control_socket_path(env))
+    else {
+        return false;
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(&path)).await,
+        Ok(Ok(_))
+    )
+}
+
+#[cfg(not(unix))]
+async fn codex_endpoint_socket_accepts(
+    _endpoint: &CodexUnixEndpoint,
+    _env: &LaunchEnvironment,
+) -> bool {
+    false
 }
 
 #[cfg(unix)]
