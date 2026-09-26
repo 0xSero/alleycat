@@ -9,7 +9,7 @@ use alleycat_acp_bridge::AcpBridge;
 use alleycat_amp_bridge::AmpBridge;
 use alleycat_bridge_core::codex_resolver::{newest_codex_candidates_first, program_candidates};
 use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryConfig};
-use alleycat_bridge_core::{CachedCatalogBridge, ModelCatalogCache};
+use alleycat_bridge_core::{CachedCatalogBridge, InterruptCompletionBridge, ModelCatalogCache};
 use alleycat_bridge_core::{
     Bridge, LaunchEnvironment, LaunchEnvironmentResolver, LocalLauncher, ProcessLauncher,
     UserEnvironmentLauncher,
@@ -489,6 +489,9 @@ impl AgentManager {
         let bridges: HashMap<AgentKind, Arc<dyn Bridge>> = bridges
             .into_iter()
             .map(|(kind, bridge)| {
+                // Every bridge gets a guaranteed `turn/completed{interrupted}`
+                // after a successful `turn/interrupt`.
+                let bridge = Arc::new(InterruptCompletionBridge::new(bridge)) as Arc<dyn Bridge>;
                 if kind == AgentKind::Shell {
                     return (kind, bridge);
                 }
@@ -718,6 +721,8 @@ impl AgentManager {
                     .local_studio_bridge
                     .clone()
                     .ok_or_else(|| anyhow!("Local Studio runtime is unavailable"))?;
+                let bridge: Arc<dyn Bridge> =
+                    Arc::new(InterruptCompletionBridge::new(bridge as Arc<dyn Bridge>));
                 alleycat_bridge_core::serve_stream_with_session(bridge, stream, session, last_seen)
                     .await
                     .context("serving `local-studio` bridge stream")
@@ -751,7 +756,8 @@ impl AgentManager {
                 AgentKind::Opencode => {
                     let oc = self.opencode_bridge_arc().await?;
                     Arc::new(CachedCatalogBridge::new(
-                        oc as Arc<dyn Bridge>,
+                        Arc::new(InterruptCompletionBridge::new(oc as Arc<dyn Bridge>))
+                            as Arc<dyn Bridge>,
                         Arc::clone(&self.opencode_catalog),
                     )) as Arc<dyn Bridge>
                 }

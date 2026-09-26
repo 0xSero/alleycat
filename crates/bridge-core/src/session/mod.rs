@@ -115,6 +115,26 @@ pub struct Session {
     /// so the most recent uncertain frame is re-sent — duplicates over
     /// missing data.
     last_attempted_seq: AtomicU64,
+    /// Recently emitted `turn/completed` keys (`thread\0turn`). A turn is
+    /// completed at most once per session: the synthetic completion sent
+    /// after a successful `turn/interrupt` and the bridge's own turn-end path
+    /// must not both reach the client.
+    completed_turns: Mutex<std::collections::VecDeque<String>>,
+}
+
+const COMPLETED_TURNS_MAX: usize = 512;
+
+fn turn_completed_key(payload: &Value) -> Option<String> {
+    if payload.get("method")?.as_str()? != "turn/completed" {
+        return None;
+    }
+    let params = payload.get("params")?;
+    let thread = params.get("threadId")?.as_str()?;
+    let turn = params.get("turn")?.get("id")?.as_str()?;
+    if turn.is_empty() {
+        return None;
+    }
+    Some(format!("{thread}\0{turn}"))
 }
 
 impl std::fmt::Debug for Session {
@@ -148,6 +168,7 @@ impl Session {
             attachment_generation: AtomicU64::new(0),
             detach: Mutex::new(DetachState { detached_at: None }),
             last_attempted_seq: AtomicU64::new(0),
+            completed_turns: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -174,6 +195,17 @@ impl Session {
     /// `deny_unknown_fields`, so existing litter-side parsers ignore it.
     /// Non-object payloads are passed through unstamped.
     pub fn enqueue(&self, mut payload: Value) -> u64 {
+        if let Some(key) = turn_completed_key(&payload) {
+            let mut completed = self.completed_turns.lock().unwrap();
+            if completed.contains(&key) {
+                tracing::debug!(turn = %key, "dropping duplicate turn/completed");
+                return self.ring.lock().unwrap().next_seq_peek().saturating_sub(1);
+            }
+            if completed.len() >= COMPLETED_TURNS_MAX {
+                completed.pop_front();
+            }
+            completed.push_back(key);
+        }
         let seq = {
             let mut ring = self.ring.lock().unwrap();
             let next = ring.next_seq_peek();
