@@ -286,12 +286,31 @@ mod tests {
     }
 
     #[test]
+    fn shell_reattach_starts_fresh_while_agent_reattach_keeps_replay() {
+        let registry = SessionRegistry::new(SessionRegistryConfig::default());
+        for agent in ["shell", "pi"] {
+            let first = registry.resolve_attach("node".into(), agent, None);
+            first.session.enqueue(notif("previous-connection"));
+            let second = registry.resolve_attach("node".into(), agent, Some(0));
+            if agent == "shell" {
+                assert_eq!(second.kind, AttachKind::Fresh);
+                assert!(!Arc::ptr_eq(&first.session, &second.session));
+                assert_eq!(second.current_seq, 0);
+            } else {
+                assert_eq!(second.kind, AttachKind::Resumed);
+                assert!(Arc::ptr_eq(&first.session, &second.session));
+                assert_eq!(second.current_seq, first.session.peek_seq().0);
+            }
+        }
+    }
+
+    #[test]
     fn tick_drops_idle_unattached_sessions() {
         let reg = SessionRegistry::new(SessionRegistryConfig::default());
         let session = reg.get_or_create("node-abc".into(), "pi");
         // Attach + immediately detach so detached_at is set.
         let _h = session.install_attachment(None);
-        session.drop_attachment();
+        session.drop_attachment(_h.generation);
         // Use zero grace/ttl so the session expires immediately.
         reg.tick(Duration::from_millis(0), Duration::from_millis(0));
         assert!(reg.get("node-abc", "pi").is_none());
@@ -319,7 +338,7 @@ mod tests {
             tx,
         );
         let _h = session.install_attachment(None);
-        session.drop_attachment();
+        session.drop_attachment(_h.generation);
         // Past pending_grace but well under idle_ttl: cancel pending, keep
         // the session itself for potential reuse on reattach.
         reg.tick(Duration::from_millis(0), Duration::from_secs(3600));

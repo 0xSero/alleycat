@@ -147,6 +147,7 @@ impl EventTranslatorState {
             PiEvent::TurnStart => Vec::new(),
             PiEvent::AgentEnd { messages } => self.translate_agent_end(&messages),
             PiEvent::AgentSettled => Vec::new(),
+            PiEvent::PromptResult { .. } | PiEvent::SessionSettled => Vec::new(),
             PiEvent::TurnEnd { message, .. } => self.translate_turn_end(message),
             PiEvent::ThinkingLevelChanged { .. } => Vec::new(),
 
@@ -696,7 +697,6 @@ impl EventTranslatorState {
                 }
                 AgentMessage::ToolResult(_) | AgentMessage::Other(_) => {}
             }
-
         }
         if (self.open_message_item.is_some() || self.open_reasoning_item.is_some())
             && !self

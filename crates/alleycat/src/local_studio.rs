@@ -296,8 +296,8 @@ pub(crate) fn pi_agent_dir() -> Option<PathBuf> {
 }
 
 /// Resolve the Pi CLI shipped with Local Studio. The desktop bundle runs the
-/// package through Electron's Node mode; Linux controller installs run the
-/// same package through the node process that owns the agent-runtime sidecar.
+/// package through a headless Node executable; launching the desktop Electron
+/// executable in Node mode still registers foreground Dock apps on macOS.
 /// An explicit override is useful for non-standard/package-manager layouts.
 pub(crate) fn bundled_pi_runtime() -> Option<PiRuntimeCommand> {
     if let (Some(program), Some(cli)) = (
@@ -413,11 +413,25 @@ fn runtime_command(
         return None;
     }
     let cli = cli.canonicalize().ok()?;
-    Some(PiRuntimeCommand {
+    headless_pi_runtime(PiRuntimeCommand {
         program,
         prefix_args: vec![cli.into_os_string()],
         env,
     })
+}
+
+fn headless_pi_runtime(mut runtime: PiRuntimeCommand) -> Option<PiRuntimeCommand> {
+    if runtime
+        .env
+        .iter()
+        .any(|(key, value)| key == "ELECTRON_RUN_AS_NODE" && value == "1")
+    {
+        // Electron's main .app executable acquires a foreground LaunchServices
+        // identity even in Node mode. Never use it for background bridge work.
+        runtime.program = which::which("node").ok()?;
+        runtime.env.retain(|(key, _)| key != "ELECTRON_RUN_AS_NODE");
+    }
+    Some(runtime)
 }
 
 fn absolute_env_path(name: &str) -> Option<PathBuf> {
@@ -578,7 +592,7 @@ fn runtime_from_descriptor(descriptor: PiRuntimeDescriptor) -> Option<PiRuntimeC
     if !program.is_absolute() || !executable_file(&program) {
         return None;
     }
-    Some(PiRuntimeCommand {
+    headless_pi_runtime(PiRuntimeCommand {
         program,
         prefix_args: descriptor.args.into_iter().map(OsString::from).collect(),
         env: descriptor
@@ -1354,8 +1368,11 @@ mod tests {
     }
 
     #[test]
-    fn app_bundle_runtime_uses_electron_node_mode_and_bundled_cli() {
-        let temp = tempfile::tempdir().unwrap();
+    fn app_bundle_runtime_uses_headless_node_and_bundled_cli() {
+        let mut temp = TempHome::new();
+        let node = temp.path().join("bin/node");
+        executable(&node);
+        temp.override_env(&[("PATH", node.parent().unwrap().to_str().unwrap())]);
         let app = temp.path().join("Local Studio.app");
         executable(&app.join("Contents/MacOS/Local Studio"));
         let cli = app
@@ -1365,20 +1382,20 @@ mod tests {
         std::fs::write(&cli, "export {};\n").unwrap();
 
         let runtime = runtime_from_app_bundle(&app).unwrap();
-        assert_eq!(runtime.program, app.join("Contents/MacOS/Local Studio"));
+        assert_eq!(runtime.program, node);
         assert_eq!(
             runtime.prefix_args,
             vec![cli.canonicalize().unwrap().into_os_string()]
         );
-        assert_eq!(
-            runtime.env,
-            vec![(OsString::from("ELECTRON_RUN_AS_NODE"), OsString::from("1"))]
-        );
+        assert!(runtime.env.is_empty());
     }
 
     #[test]
-    fn development_app_bundle_uses_its_matching_executable() {
-        let temp = tempfile::tempdir().unwrap();
+    fn development_app_bundle_uses_headless_node() {
+        let mut temp = TempHome::new();
+        let node = temp.path().join("bin/node");
+        executable(&node);
+        temp.override_env(&[("PATH", node.parent().unwrap().to_str().unwrap())]);
         let app = temp.path().join("Local Studio Dev.app");
         executable(&app.join("Contents/MacOS/Local Studio Dev"));
         let cli = app
@@ -1388,7 +1405,7 @@ mod tests {
         std::fs::write(&cli, "export {};\n").unwrap();
 
         let runtime = runtime_from_app_bundle(&app).unwrap();
-        assert_eq!(runtime.program, app.join("Contents/MacOS/Local Studio Dev"));
+        assert_eq!(runtime.program, node);
     }
 
     #[test]
@@ -1421,7 +1438,7 @@ mod tests {
                 "piRuntime": {
                     "program": program.to_str().unwrap(),
                     "args": ["/opt/pi/dist/cli.js"],
-                    "env": { "ELECTRON_RUN_AS_NODE": "1" }
+                    "env": {}
                 }
             }))
             .unwrap(),
@@ -1435,13 +1452,37 @@ mod tests {
             runtime.prefix_args,
             vec![OsString::from("/opt/pi/dist/cli.js")]
         );
-        assert_eq!(
-            runtime.env,
-            vec![(OsString::from("ELECTRON_RUN_AS_NODE"), OsString::from("1"))]
-        );
+        assert!(runtime.env.is_empty());
 
         // The published agent dir is authoritative too.
         assert_eq!(pi_agent_dir(), Some(agent_dir));
+    }
+
+    #[test]
+    fn electron_descriptor_uses_node_and_fails_closed_without_it() {
+        let mut home = TempHome::new();
+        let program = home
+            .path()
+            .join("Local Studio.app/Contents/MacOS/Local Studio");
+        executable(&program);
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        home.override_env(&[("PATH", bin.to_str().unwrap())]);
+        let descriptor = || PiRuntimeDescriptor {
+            program: program.to_string_lossy().into_owned(),
+            args: vec!["/bundled/pi/cli.js".into()],
+            env: [("ELECTRON_RUN_AS_NODE".into(), "1".into())].into(),
+        };
+        assert!(runtime_from_descriptor(descriptor()).is_none());
+        let node = bin.join("node");
+        executable(&node);
+        let runtime = runtime_from_descriptor(descriptor()).unwrap();
+        assert_eq!(runtime.program, node);
+        assert_eq!(
+            runtime.prefix_args,
+            vec![OsString::from("/bundled/pi/cli.js")]
+        );
+        assert!(runtime.env.is_empty());
     }
 
     #[test]

@@ -57,6 +57,8 @@ pub enum AttachOutcome {
 /// responsible for spawning the drainer task that flushes `backlog` and then
 /// `live_rx` to the iroh sink.
 pub struct AttachHandle {
+    /// Identifies this attachment when its stream finishes or is cancelled.
+    pub generation: u64,
     pub outcome: AttachOutcome,
     pub current_seq: u64,
     pub floor_seq: u64,
@@ -74,8 +76,7 @@ pub struct AttachHandle {
 struct Attachment {
     live_tx: mpsc::UnboundedSender<Sequenced>,
     /// Monotonic counter incremented on every fresh `install_attachment`.
-    /// Surfaced via `Session::attachment_generation()` for log correlation.
-    #[allow(dead_code)]
+    /// Prevents an old stream's teardown from detaching its replacement.
     generation: u64,
 }
 
@@ -114,6 +115,26 @@ pub struct Session {
     /// so the most recent uncertain frame is re-sent — duplicates over
     /// missing data.
     last_attempted_seq: AtomicU64,
+    /// Recently emitted `turn/completed` keys (`thread\0turn`). A turn is
+    /// completed at most once per session: the synthetic completion sent
+    /// after a successful `turn/interrupt` and the bridge's own turn-end path
+    /// must not both reach the client.
+    completed_turns: Mutex<std::collections::VecDeque<String>>,
+}
+
+const COMPLETED_TURNS_MAX: usize = 512;
+
+fn turn_completed_key(payload: &Value) -> Option<String> {
+    if payload.get("method")?.as_str()? != "turn/completed" {
+        return None;
+    }
+    let params = payload.get("params")?;
+    let thread = params.get("threadId")?.as_str()?;
+    let turn = params.get("turn")?.get("id")?.as_str()?;
+    if turn.is_empty() {
+        return None;
+    }
+    Some(format!("{thread}\0{turn}"))
 }
 
 impl std::fmt::Debug for Session {
@@ -147,6 +168,7 @@ impl Session {
             attachment_generation: AtomicU64::new(0),
             detach: Mutex::new(DetachState { detached_at: None }),
             last_attempted_seq: AtomicU64::new(0),
+            completed_turns: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -173,6 +195,17 @@ impl Session {
     /// `deny_unknown_fields`, so existing litter-side parsers ignore it.
     /// Non-object payloads are passed through unstamped.
     pub fn enqueue(&self, mut payload: Value) -> u64 {
+        if let Some(key) = turn_completed_key(&payload) {
+            let mut completed = self.completed_turns.lock().unwrap();
+            if completed.contains(&key) {
+                tracing::debug!(turn = %key, "dropping duplicate turn/completed");
+                return self.ring.lock().unwrap().next_seq_peek().saturating_sub(1);
+            }
+            if completed.len() >= COMPLETED_TURNS_MAX {
+                completed.pop_front();
+            }
+            completed.push_back(key);
+        }
         let seq = {
             let mut ring = self.ring.lock().unwrap();
             let next = ring.next_seq_peek();
@@ -308,12 +341,11 @@ impl Session {
             live_tx,
             generation,
         });
-        drop(attachment_slot);
-
         // Clear detach bookkeeping while attached.
         self.detach.lock().unwrap().detached_at = None;
 
         AttachHandle {
+            generation,
             outcome,
             current_seq,
             floor_seq,
@@ -327,10 +359,15 @@ impl Session {
     /// ring; only the live forwarding stops. If `pending_grace` is configured
     /// and elapses without a reattach, the session reaper will drain pending
     /// requests with `ConnectionClosed` (see [`SessionRegistry`]).
-    pub fn drop_attachment(&self) {
+    pub fn drop_attachment(&self, generation: u64) {
         let mut slot = self.attachment.lock().unwrap();
+        if !slot
+            .as_ref()
+            .is_some_and(|attachment| attachment.generation == generation)
+        {
+            return;
+        }
         *slot = None;
-        drop(slot);
         self.detach.lock().unwrap().detached_at = Some(Instant::now());
     }
 
@@ -544,7 +581,7 @@ mod tests {
         assert!(!session.detached_for(Duration::from_millis(0)));
         let _h = session.install_attachment(None);
         assert!(!session.detached_for(Duration::from_millis(0)));
-        session.drop_attachment();
+        session.drop_attachment(_h.generation);
         assert!(session.detached_for(Duration::from_millis(0)));
     }
 }

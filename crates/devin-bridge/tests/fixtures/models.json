@@ -1,0 +1,56 @@
+{
+  "families": [
+    {
+      "family_label": "Claude Opus 5",
+      "family_uid": "claude-opus-5",
+      "slug": "claude-opus-5",
+      "aliases": [
+        "opus"
+      ],
+      "variants": [
+        {
+          "model_uid": "claude-opus-5-medium",
+          "label": "Claude Opus 5 Medium",
+          "max_output_tokens": 128000,
+          "cost_summary": "$5 / 1M Input \u00b7 $0.5 / 1M Cached input \u00b7 $25 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "claude-opus-5-max",
+          "label": "Claude Opus 5 Max",
+          "max_output_tokens": 128000,
+          "cost_summary": "$5 / 1M Input \u00b7 $0.5 / 1M Cached input \u00b7 $25 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        }
+      ]
+    },
+    {
+      "family_label": "GPT-6 Astra",
+      "family_uid": "gpt-6-astra",
+      "slug": "gpt-6-astra",
+      "aliases": [
+        "gpt"
+      ],
+      "variants": [
+        {
+          "model_uid": "gpt-6-astra-medium",
+          "label": "GPT-6 Astra Medium Thinking",
+          "max_output_tokens": 128000,
+          "cost_summary": "$10 / 1M Input \u00b7 $1 / 1M Cached input \u00b7 $50 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        },
+        {
+          "model_uid": "gpt-6-astra-max-priority",
+          "label": "GPT-6 Astra Max Thinking Fast",
+          "max_output_tokens": 128000,
+          "cost_summary": "$20 / 1M Input \u00b7 $2 / 1M Cached input \u00b7 $100 / 1M Output",
+          "is_new": false,
+          "is_beta": false
+        }
+      ]
+    }
+  ]
+}

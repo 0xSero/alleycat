@@ -30,14 +30,10 @@ use crate::state;
 
 use self::control::{Request, Response, RotateResult, StatusInfo, token_fingerprint};
 
-/// Entry point for `alleycat serve`. Initializes file logging, acquires the
-/// single-instance lock, binds the iroh endpoint + control IPC, and runs
+/// Entry point for `alleycat serve`. Acquires the single-instance lock,
+/// initializes file logging, binds the iroh endpoint + control IPC, and runs
 /// until SIGTERM / SIGINT / control `Stop`.
 pub async fn run() -> anyhow::Result<()> {
-    let log_dir = paths::log_dir().context("locating log directory")?;
-    let _log_guard: WorkerGuard =
-        logging::init("info", &log_dir).context("initializing logging")?;
-
     let mut lock = state::acquire_lock().await.context("acquiring lock file")?;
     let _lock_guard = lock.try_write().map_err(|_| {
         let pid_hint = state::read_pid_file().unwrap_or(None);
@@ -52,6 +48,22 @@ pub async fn run() -> anyhow::Result<()> {
         }
     })?;
 
+    // A failed duplicate start must not create a second size-accounting writer
+    // against the running daemon's file.
+    let log_dir = paths::log_dir().context("locating log directory")?;
+    let _log_guard: WorkerGuard =
+        logging::init("info", &log_dir).context("initializing logging")?;
+
+    // Report failures before the writer guard flushes and the instance lock is
+    // released. Service stdout/stderr may deliberately discard raw output.
+    let result = run_inner().await;
+    if let Err(error) = &result {
+        error!("daemon failed: {error:#}");
+    }
+    result
+}
+
+async fn run_inner() -> anyhow::Result<()> {
     let pid_path = state::write_pid_file().context("writing pid file")?;
     let _pid_cleanup = RemoveOnDrop(pid_path);
 
@@ -71,6 +83,7 @@ pub async fn run() -> anyhow::Result<()> {
     let agents = AgentManager::new(Arc::clone(&config))
         .await
         .context("initializing agent manager")?;
+    let _catalog_warmup = agents.spawn_model_catalog_warmup();
 
     let started_at = Instant::now();
     let shutdown = Arc::new(Notify::new());
@@ -403,6 +416,53 @@ mod tests {
 
     use super::*;
     use crate::test_support::TempHome;
+
+    #[test]
+    fn startup_failure_is_flushed_to_bounded_log_before_returning() {
+        // A fresh process gives logging::init its own global subscriber without
+        // changing the subscriber used by other tests in this binary.
+        const CHILD: &str = "ALLEYCAT_TEST_STARTUP_FAILURE_LOG";
+        if std::env::var_os(CHILD).is_none() {
+            let _guard = crate::test_support::lock_env();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "daemon::tests::startup_failure_is_flushed_to_bounded_log_before_returning",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        let mut home = TempHome::new();
+        home.override_env(&[("RUST_LOG", "info")]);
+        let config = paths::host_config_file().unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, "invalid = [").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), run()).await
+            })
+            .expect("invalid config must fail before any server starts")
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("loading host config"));
+        let log = paths::log_dir().unwrap().join(format!(
+            "daemon.log.{}",
+            chrono::Utc::now().format("%Y-%m-%d")
+        ));
+        let contents = std::fs::read_to_string(log).unwrap();
+        assert!(contents.contains("daemon failed: loading host config: parsing"));
+        assert!(contents.len() <= 8 * 1024 * 1024);
+        assert!(!paths::daemon_pid_file().unwrap().exists());
+        let mut lock = runtime.block_on(state::acquire_lock()).unwrap();
+        assert!(lock.try_write().is_ok(), "failed daemon releases its lock");
+    }
 
     #[test]
     fn host_ipc_grant_and_revoke_are_persisted_and_default_deny() {

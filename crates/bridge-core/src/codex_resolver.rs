@@ -419,7 +419,13 @@ mod tests {
                 "{{SHARED_LINES}}",
                 "_litter_consider_path_candidates codex codex",
             );
-        let path_value = format!("{}:{}:/usr/bin:/bin", old_dir.display(), new_dir.display());
+        let original_path = "/usr/bin:/bin";
+        let path_value = format!(
+            "{}:{}:{}",
+            old_dir.display(),
+            new_dir.display(),
+            original_path
+        );
         let output = StdCommand::new("/bin/sh")
             .arg("-c")
             .arg(script)

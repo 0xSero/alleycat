@@ -32,6 +32,9 @@ pub struct LaunchEnvironmentPolicy {
     /// Capture the configured user shell (`$SHELL`) before agent launch. The
     /// shell is invoked as login+interactive where the shell supports it so
     /// zsh/bash/fish users get their normal rc-file-managed variables.
+    /// Disabled by default: background connections must not run interactive
+    /// startup hooks, which can open desktop windows or wait for input.
+    /// Explicit opt-in is available to callers that need those side effects.
     pub load_user_shell: bool,
     /// Overlay `mise env --json -C <cwd>` when `mise` is available on PATH.
     pub load_mise: bool,
@@ -46,7 +49,7 @@ pub struct LaunchEnvironmentPolicy {
 impl Default for LaunchEnvironmentPolicy {
     fn default() -> Self {
         Self {
-            load_user_shell: true,
+            load_user_shell: false,
             load_mise: true,
             load_direnv: true,
             provider_timeout: DEFAULT_PROVIDER_TIMEOUT,
@@ -529,6 +532,48 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn default_resolver_does_not_launch_user_shell() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD: &str = "ALLEYCAT_HEADLESS_ENV_TEST";
+        if let Some(marker) = std::env::var_os(CHILD) {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(LaunchEnvironmentResolver::default().resolve(None));
+            assert!(
+                !Path::new(&marker).exists(),
+                "background launch executed the login shell"
+            );
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let shell = temp.path().join("bash");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\nprintf launched > \"$ALLEYCAT_HEADLESS_ENV_TEST\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launch_environment::tests::default_resolver_does_not_launch_user_shell",
+            ])
+            .env_clear()
+            .env("HOME", temp.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", shell)
+            .env(CHILD, temp.path().join("unwanted-terminal"))
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+    }
 
     #[test]
     fn shell_args_cover_common_shells() {

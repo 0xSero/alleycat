@@ -39,6 +39,8 @@ pub struct CreateRunRequest {
     /// Optional model override.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// Response from `POST /v1/runs`.
@@ -96,6 +98,31 @@ pub struct HermesApiClient {
 }
 
 impl HermesApiClient {
+    /// Discover the gateway's selectable route aliases without reading keys
+    /// into the mobile catalog or guessing provider-specific model ids.
+    pub async fn models(&self) -> Result<Value> {
+        let mut request = self
+            .client
+            .get(format!("{}/api/model/options", self.base_url))
+            .timeout(Duration::from_secs(8));
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await.map_err(reqwest::Error::without_url)?;
+        if response.status() != reqwest::StatusCode::NOT_FOUND {
+            return Ok(response.error_for_status().map_err(reqwest::Error::without_url)?.json().await.map_err(reqwest::Error::without_url)?);
+        }
+        // Older gateways expose only their configured route aliases.
+        let mut request = self
+            .client
+            .get(format!("{}/v1/models", self.base_url))
+            .timeout(Duration::from_secs(5));
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+        Ok(request.send().await.map_err(reqwest::Error::without_url)?.error_for_status().map_err(reqwest::Error::without_url)?.json().await.map_err(reqwest::Error::without_url)?)
+    }
+
     pub fn new(base_url: &str, api_key: Option<String>) -> Self {
         let client = Client::builder()
             .timeout(Duration::from_secs(300))
@@ -214,6 +241,37 @@ impl HermesApiClient {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn model_discovery_refreshes_authenticated_gateway_routes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for model in ["old-route", "new-route"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buffer = [0; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..count]);
+                assert!(request.starts_with("GET /api/model/options "));
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("authorization: bearer test-key")
+                );
+                let body = serde_json::json!({"data":[{"id":model}]}).to_string();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let client = HermesApiClient::new(&format!("http://{addr}"), Some("test-key".into()));
+        assert_eq!(client.models().await.unwrap()["data"][0]["id"], "old-route");
+        assert_eq!(client.models().await.unwrap()["data"][0]["id"], "new-route");
+        server.await.unwrap();
+    }
+
     #[test]
     fn create_run_request_uses_stock_input_field() {
         let req = CreateRunRequest {
@@ -221,6 +279,7 @@ mod tests {
             session_id: Some("thread-1".to_string()),
             cwd: Some("/tmp".to_string()),
             model: None,
+            provider: None,
         };
         let value = serde_json::to_value(req).unwrap();
         assert_eq!(
@@ -289,6 +348,7 @@ mod tests {
                 session_id: Some("session-1".to_string()),
                 cwd: None,
                 model: None,
+                provider: None,
             })
             .await
             .unwrap();

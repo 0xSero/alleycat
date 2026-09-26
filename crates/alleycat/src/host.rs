@@ -24,10 +24,7 @@ use crate::stream::IrohStream;
 /// (`RelayMode::Custom`) instead of the default number0 relays. This lets an
 /// operator point the daemon at a closer / self-hosted relay via the `relay`
 /// field in `host.toml`.
-pub async fn bind_endpoint(
-    secret_key: SecretKey,
-    relay: Option<&str>,
-) -> anyhow::Result<Endpoint> {
+pub async fn bind_endpoint(secret_key: SecretKey, relay: Option<&str>) -> anyhow::Result<Endpoint> {
     // iroh defaults already PING every 5s (HEARTBEAT_INTERVAL) which would
     // normally keep the connection alive — but the connection-wide
     // `max_idle_timeout` is still 30s by default, and once the holepunched
@@ -59,10 +56,7 @@ pub async fn bind_endpoint(
         info!(relay = %relay_url, "using custom relay from host.toml");
     }
 
-    let endpoint = builder
-        .bind()
-        .await
-        .context("binding iroh endpoint")?;
+    let endpoint = builder.bind().await.context("binding iroh endpoint")?;
 
     info!(node_id = %endpoint.id(), "alleycat endpoint bound");
     let endpoint_for_online = endpoint.clone();

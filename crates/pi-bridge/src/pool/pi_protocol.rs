@@ -338,7 +338,7 @@ pub struct SessionState {
     pub auto_compaction_enabled: bool,
     #[serde(rename = "messageCount")]
     pub message_count: u64,
-    #[serde(rename = "pendingMessageCount")]
+    #[serde(rename = "pendingMessageCount", alias = "queuedMessageCount")]
     pub pending_message_count: u64,
 }
 
@@ -565,6 +565,23 @@ pub enum PiEvent {
         messages: Vec<AgentMessage>,
     },
     AgentSettled,
+    /// omp >= 0.9x: reported once per prompt. `agentInvoked: false` means
+    /// the prompt never started an agent run (provider error, rejected
+    /// prompt), so no `agent_end` will follow.
+    PromptResult {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "agentInvoked")]
+        agent_invoked: bool,
+        #[serde(default)]
+        status: Option<Value>,
+        #[serde(default, rename = "sessionSettled")]
+        session_settled: bool,
+        #[serde(default)]
+        error: Option<Value>,
+    },
+    /// omp >= 0.9x: the session has no running agent and nothing queued.
+    SessionSettled,
 
     // Turn lifecycle (one assistant response + tool calls/results)
     TurnStart,
@@ -1172,6 +1189,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_omp_prompt_lifecycle_frames() {
+        let result: PiOutboundMessage = serde_json::from_value(json!({
+            "type": "prompt_result", "id": "c1", "agentInvoked": false,
+            "status": "error", "sessionSettled": true,
+            "error": {"message": "provider unavailable"}
+        }))
+        .expect("prompt_result");
+        assert!(matches!(
+            result,
+            PiOutboundMessage::Event(PiEvent::PromptResult { agent_invoked: false, session_settled: true, .. })
+        ));
+        let settled: PiOutboundMessage =
+            serde_json::from_value(json!({"type": "session_settled"})).expect("session_settled");
+        assert!(matches!(settled, PiOutboundMessage::Event(PiEvent::SessionSettled)));
+    }
+
+    #[test]
     fn prompt_command_serializes_with_streaming_behavior() {
         let cmd = RpcCommand::Prompt(PromptCmd {
             id: Some("c1".into()),
@@ -1685,5 +1719,19 @@ mod tests {
         let event: PiEvent = serde_json::from_value(body.clone()).unwrap();
         assert_eq!(event, PiEvent::AgentSettled);
         assert_eq!(serde_json::to_value(&event).unwrap(), body);
+    }
+
+    #[test]
+    fn session_state_preserves_pi_and_omp_queue_counts() {
+        for field in ["pendingMessageCount", "queuedMessageCount"] {
+            let mut body = json!({
+                "thinkingLevel":"off", "isStreaming":false, "isCompacting":false,
+                "steeringMode":"all", "followUpMode":"all", "sessionId":"test",
+                "autoCompactionEnabled":true, "messageCount":0
+            });
+            body[field] = json!(2);
+            let state: SessionState = serde_json::from_value(body).unwrap();
+            assert_eq!(state.pending_message_count, 2);
+        }
     }
 }

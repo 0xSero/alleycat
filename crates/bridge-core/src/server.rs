@@ -253,10 +253,11 @@ where
     let conn = Conn::from_session(Arc::clone(&session));
 
     let attach = session.install_attachment(last_seen);
+    let generation = attach.generation;
     let writer_task = tokio::spawn(drain_attachment(writer, attach, Arc::clone(&session)));
 
     let result = run_reader(bridge, &conn, &mut reader).await;
-    session.drop_attachment();
+    session.drop_attachment(generation);
     let _ = writer_task.await;
     result
 }

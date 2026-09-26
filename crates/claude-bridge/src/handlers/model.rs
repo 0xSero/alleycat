@@ -1,24 +1,12 @@
-//! `model/list`.
-//!
-//! Claude has no introspection API for available models, so the bridge ships
-//! a hand-curated list. Three concrete model ids (the latest opus/sonnet/haiku)
-//! plus the three short aliases (`opus`/`sonnet`/`haiku`) the `claude` CLI
-//! itself accepts via `--model`.
-//!
-//! Default is sonnet — matches the CLI default and is the most common pick.
-
+//! Model choices come from the installed CLI's account/provider-aware catalog.
+use crate::state::ConnectionState;
+use alleycat_codex_proto as p;
+use anyhow::Context;
+use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use alleycat_codex_proto as p;
-use serde_json::json;
-
-use crate::state::ConnectionState;
-
 pub const MODEL_PROVIDER: &str = "anthropic";
-
-pub const OPUS_MODEL: &str = "claude-opus-4-7";
-pub const SONNET_MODEL: &str = "claude-sonnet-4-6";
-pub const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 
 pub fn normalize_claude_model_id(model: &str) -> String {
     let model = model.trim();
@@ -33,214 +21,120 @@ pub fn normalize_claude_model(model: Option<String>) -> Option<String> {
 }
 
 pub async fn handle_model_list(
-    _state: &Arc<ConnectionState>,
+    state: &Arc<ConnectionState>,
     _params: p::ModelListParams,
-) -> p::ModelListResponse {
-    let data = vec![
-        // Concrete model ids first.
-        build_model(
-            OPUS_MODEL,
-            "Claude Opus 4.7",
-            "Anthropic's most capable model. Best for hard reasoning, deep refactors, multi-step planning.",
-            false,
-            p::ReasoningEffort::High,
-        ),
-        build_model(
-            SONNET_MODEL,
-            "Claude Sonnet 4.6",
-            "Balanced model for everyday coding work — fast, capable, lower cost than Opus.",
-            true,
-            p::ReasoningEffort::Medium,
-        ),
-        build_model(
-            HAIKU_MODEL,
-            "Claude Haiku 4.5",
-            "Lightest, fastest model. Best for quick edits, small tasks, low-latency interactions.",
-            false,
-            p::ReasoningEffort::Minimal,
-        ),
-        // Short aliases the `claude` CLI accepts directly.
-        build_model(
-            "opus",
-            "Claude Opus (alias)",
-            "Alias resolved by the claude CLI to the latest Opus revision.",
-            false,
-            p::ReasoningEffort::High,
-        ),
-        build_model(
-            "sonnet",
-            "Claude Sonnet (alias)",
-            "Alias resolved by the claude CLI to the latest Sonnet revision.",
-            false,
-            p::ReasoningEffort::Medium,
-        ),
-        build_model(
-            "haiku",
-            "Claude Haiku (alias)",
-            "Alias resolved by the claude CLI to the latest Haiku revision.",
-            false,
-            p::ReasoningEffort::Minimal,
-        ),
-    ];
-    p::ModelListResponse {
+) -> anyhow::Result<p::ModelListResponse> {
+    models_from_catalog(&state.claude_pool().catalog().await?)
+}
+
+fn models_from_catalog(catalog: &Value) -> anyhow::Result<p::ModelListResponse> {
+    let entries = catalog["models"]
+        .as_array()
+        .context("Claude catalog is missing models")?;
+    let mut seen = HashSet::new();
+    let mut data: Vec<p::Model> = entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry["value"].as_str().filter(|id| !id.trim().is_empty())?;
+            if !seen.insert(id) {
+                return None;
+            }
+            let efforts: Vec<p::ReasoningEffortOption> = entry["supportedEffortLevels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|value| {
+                    let effort: p::ReasoningEffort = serde_json::from_value(value.clone()).ok()?;
+                    Some(p::ReasoningEffortOption {
+                        reasoning_effort: effort,
+                        description: value.as_str().unwrap_or_default().to_string(),
+                    })
+                })
+                .collect();
+            let default_effort = efforts
+                .iter()
+                .find(|option| option.reasoning_effort == p::ReasoningEffort::Medium)
+                .or_else(|| efforts.first())
+                .map(|option| option.reasoning_effort)
+                .unwrap_or(p::ReasoningEffort::None);
+            Some(p::Model {
+                // Keep CLI selection values (including aliases and context suffixes),
+                // rather than replacing them with a provider-specific resolved id.
+                id: id.into(),
+                model: id.into(),
+                upgrade: None,
+                upgrade_info: None,
+                availability_nux: None,
+                display_name: entry["displayName"].as_str().unwrap_or(id).into(),
+                description: entry["description"].as_str().unwrap_or_default().into(),
+                hidden: false,
+                supported_reasoning_efforts: efforts,
+                default_reasoning_effort: default_effort,
+                input_modalities: vec![json!("text"), json!("image")],
+                supports_personality: false,
+                additional_speed_tiers: Vec::new(),
+                service_tiers: Vec::new(),
+                is_default: id == "default",
+            })
+        })
+        .collect();
+    anyhow::ensure!(!data.is_empty(), "Claude returned no selectable models");
+    if !data.iter().any(|model| model.is_default) {
+        data[0].is_default = true;
+    }
+    Ok(p::ModelListResponse {
         data,
         next_cursor: None,
-    }
-}
-
-fn build_model(
-    model_id: &str,
-    display_name: &str,
-    description: &str,
-    is_default: bool,
-    default_effort: p::ReasoningEffort,
-) -> p::Model {
-    p::Model {
-        id: model_id.to_string(),
-        model: model_id.to_string(),
-        upgrade: None,
-        upgrade_info: None,
-        availability_nux: None,
-        display_name: display_name.to_string(),
-        description: description.to_string(),
-        hidden: false,
-        supported_reasoning_efforts: reasoning_options(),
-        default_reasoning_effort: default_effort,
-        input_modalities: vec![json!("text"), json!("image")],
-        supports_personality: false,
-        additional_speed_tiers: Vec::new(),
-        service_tiers: standard_service_tiers(),
-        is_default,
-    }
-}
-
-fn standard_service_tiers() -> Vec<p::ModelServiceTier> {
-    vec![p::ModelServiceTier {
-        id: "standard".to_string(),
-        name: "Standard".to_string(),
-        description: "Default bridge service tier".to_string(),
-    }]
-}
-
-fn reasoning_options() -> Vec<p::ReasoningEffortOption> {
-    vec![
-        p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Minimal,
-            description: "Lowest latency, no extended thinking".to_string(),
-        },
-        p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Low,
-            description: "Brief reasoning".to_string(),
-        },
-        p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Medium,
-            description: "Default depth of reasoning".to_string(),
-        },
-        p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::High,
-            description: "Maximum reasoning effort".to_string(),
-        },
-    ]
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::ClaudeSessionRef;
-    use crate::pool::ClaudePool;
-    use crate::state::{ConnectionState, ThreadDefaults};
-    use std::path::PathBuf;
 
-    struct NoopIndex;
-
-    #[async_trait::async_trait]
-    impl alleycat_bridge_core::ThreadIndexHandle<ClaudeSessionRef> for NoopIndex {
-        async fn lookup(&self, _: &str) -> Option<crate::state::IndexEntry> {
-            None
-        }
-        async fn insert(&self, _: crate::state::IndexEntry) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn set_archived(&self, _: &str, _: bool) -> anyhow::Result<bool> {
-            Ok(false)
-        }
-        async fn set_name(&self, _: &str, _: Option<String>) -> anyhow::Result<bool> {
-            Ok(false)
-        }
-        async fn update_preview_and_updated_at(
-            &self,
-            _: &str,
-            _: String,
-            _: chrono::DateTime<chrono::Utc>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        async fn list(
-            &self,
-            _: &crate::state::ListFilter,
-            _: crate::state::ListSort,
-            _: Option<&str>,
-            _: Option<u32>,
-        ) -> anyhow::Result<crate::state::ListPage<ClaudeSessionRef>> {
-            Ok(crate::state::ListPage::<ClaudeSessionRef> {
-                data: Vec::new(),
-                next_cursor: None,
-            })
-        }
-        async fn loaded_thread_ids(&self) -> Vec<String> {
-            Vec::new()
-        }
-    }
-
-    fn dummy_state() -> Arc<ConnectionState> {
-        let (state, _rx) = ConnectionState::for_test(
-            Arc::new(ClaudePool::new(PathBuf::from("/usr/bin/false"))),
-            Arc::new(NoopIndex),
-            ThreadDefaults::default(),
+    #[test]
+    fn current_sdk_catalog_preserves_account_choices_and_capabilities() {
+        let response = models_from_catalog(&json!({"models": [
+            {"value":"default","resolvedModel":"claude-opus-5[1m]","displayName":"Default (recommended)","supportedEffortLevels":["low","medium","high","xhigh","max"]},
+            {"value":"claude-fable-5-1[1m]","resolvedModel":"claude-fable-5-1","displayName":"Fable","supportedEffortLevels":["high","max"]},
+            {"value":"haiku","displayName":"Haiku"},
+            {"value":"custom-deployment","displayName":"Private deployment"}
+        ]})).unwrap();
+        assert_eq!(response.data.len(), 4);
+        assert_eq!(response.data[0].model, "default");
+        assert_eq!(response.data[0].supported_reasoning_efforts.len(), 5);
+        assert_eq!(response.data[1].id, "claude-fable-5-1[1m]");
+        assert_eq!(
+            response.data[1].default_reasoning_effort,
+            p::ReasoningEffort::High
         );
-        state
+        assert!(response.data[2].supported_reasoning_efforts.is_empty());
+        assert_eq!(
+            response.data[2].default_reasoning_effort,
+            p::ReasoningEffort::None
+        );
+        assert_eq!(response.data[3].model, "custom-deployment");
+        assert_eq!(
+            response
+                .data
+                .iter()
+                .filter(|model| model.is_default)
+                .count(),
+            1
+        );
     }
 
-    #[tokio::test]
-    async fn lists_three_concrete_models_plus_aliases_with_sonnet_default() {
-        let state = dummy_state();
-        let resp = handle_model_list(&state, p::ModelListParams::default()).await;
-        assert_eq!(resp.data.len(), 6);
-
-        let by_id: std::collections::HashMap<_, _> =
-            resp.data.iter().map(|m| (m.model.as_str(), m)).collect();
-
-        assert!(by_id.contains_key(OPUS_MODEL));
-        assert!(by_id.contains_key(SONNET_MODEL));
-        assert!(by_id.contains_key(HAIKU_MODEL));
-        assert!(by_id.contains_key("opus"));
-        assert!(by_id.contains_key("sonnet"));
-        assert!(by_id.contains_key("haiku"));
-
-        let sonnet = by_id[SONNET_MODEL];
-        assert!(sonnet.is_default);
-        assert_eq!(sonnet.id, SONNET_MODEL);
-        assert!(matches!(
-            sonnet.default_reasoning_effort,
-            p::ReasoningEffort::Medium
-        ));
-        assert_eq!(sonnet.supported_reasoning_efforts.len(), 4);
-
-        // Only one default across the entire list.
-        let defaults: Vec<_> = resp.data.iter().filter(|m| m.is_default).collect();
-        assert_eq!(defaults.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn ids_are_plain_claude_cli_model_values() {
-        let state = dummy_state();
-        let resp = handle_model_list(&state, p::ModelListParams::default()).await;
-        for m in &resp.data {
-            assert!(
-                !m.id.contains('/'),
-                "id {} should be a plain claude CLI model value, not provider-prefixed",
-                m.id
-            );
-        }
+    #[test]
+    fn refresh_replaces_retired_models_without_inventing_choices() {
+        let before = models_from_catalog(&json!({"models":[{"value":"old"}]})).unwrap();
+        let after =
+            models_from_catalog(&json!({"models":[{"value":"new"},{"value":"new"},{"value":""}]}))
+                .unwrap();
+        assert_eq!(before.data[0].id, "old");
+        assert_eq!(after.data.len(), 1);
+        assert_eq!(after.data[0].id, "new");
+        assert!(after.data[0].is_default);
+        assert!(models_from_catalog(&json!({"models":[]})).is_err());
+        assert!(models_from_catalog(&json!({})).is_err());
     }
 }

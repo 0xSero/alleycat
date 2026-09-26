@@ -14,6 +14,18 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  windows-diagnostics:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Exercise diagnostic byte caps on Windows files
+        run: cargo test --locked -p alleycat --lib daemon::logging::tests
+      - name: Exercise owned OpenCode diagnostic drain on Windows
+        run: cargo test --locked -p alleycat-opencode-bridge --lib opencode_proc::tests
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45

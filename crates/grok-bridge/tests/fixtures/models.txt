@@ -1,0 +1,8 @@
+Model 'kimi-k2.6' is using its own API key.
+
+Default model: grok-4.5
+
+Available models:
+  - grok-4.6
+  * grok-4.5 (default)
+  - kimi-k2.6
