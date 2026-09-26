@@ -565,6 +565,23 @@ pub enum PiEvent {
         messages: Vec<AgentMessage>,
     },
     AgentSettled,
+    /// omp >= 0.9x: reported once per prompt. `agentInvoked: false` means
+    /// the prompt never started an agent run (provider error, rejected
+    /// prompt), so no `agent_end` will follow.
+    PromptResult {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(rename = "agentInvoked")]
+        agent_invoked: bool,
+        #[serde(default)]
+        status: Option<Value>,
+        #[serde(default, rename = "sessionSettled")]
+        session_settled: bool,
+        #[serde(default)]
+        error: Option<Value>,
+    },
+    /// omp >= 0.9x: the session has no running agent and nothing queued.
+    SessionSettled,
 
     // Turn lifecycle (one assistant response + tool calls/results)
     TurnStart,
@@ -1169,6 +1186,23 @@ mod tests {
         assert_eq!(serialized, expected_json, "serialized form mismatch");
         let parsed: T = serde_json::from_value(expected_json).expect("deserialize");
         assert_eq!(&parsed, value, "round-trip identity mismatch");
+    }
+
+    #[test]
+    fn parses_omp_prompt_lifecycle_frames() {
+        let result: PiOutboundMessage = serde_json::from_value(json!({
+            "type": "prompt_result", "id": "c1", "agentInvoked": false,
+            "status": "error", "sessionSettled": true,
+            "error": {"message": "provider unavailable"}
+        }))
+        .expect("prompt_result");
+        assert!(matches!(
+            result,
+            PiOutboundMessage::Event(PiEvent::PromptResult { agent_invoked: false, session_settled: true, .. })
+        ));
+        let settled: PiOutboundMessage =
+            serde_json::from_value(json!({"type": "session_settled"})).expect("session_settled");
+        assert!(matches!(settled, PiOutboundMessage::Event(PiEvent::SessionSettled)));
     }
 
     #[test]
