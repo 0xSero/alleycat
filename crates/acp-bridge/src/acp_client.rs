@@ -32,15 +32,16 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use alleycat_bridge_core::{ChildProcess, ProcessLauncher, ProcessRole, ProcessSpec, StdioMode};
 use anyhow::Result;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::config::AcpBridgeConfig;
@@ -365,7 +366,18 @@ async fn reader_task(
         match serde_json::from_str::<Value>(trimmed) {
             Ok(frame) => {
                 if frame.get("id").is_some() && frame.get("method").is_some() {
-                    respond_to_agent_request(&inner, &stdin, frame).await;
+                    // Handle every agent→client request on its own task.
+                    // `terminal/wait_for_exit` may legitimately block for
+                    // the whole command duration and must not serialize
+                    // every other request — including responses that only
+                    // this reader task can deliver — behind it.
+                    let request_inner = Arc::clone(&inner);
+                    let request_stdin = Arc::clone(&stdin);
+                    tokio::spawn(respond_to_agent_request(
+                        request_inner,
+                        request_stdin,
+                        frame,
+                    ));
                 } else {
                     inner.dispatch(frame).await;
                 }
@@ -391,17 +403,37 @@ async fn reader_task(
     }
 }
 
+/// Exit status as reported by `terminal/output` and
+/// `terminal/wait_for_exit`. `code` is `None` when the process was
+/// terminated by a signal.
 #[derive(Debug, Clone)]
-struct TerminalRecord {
-    output: String,
-    truncated: bool,
-    exit_code: Option<i64>,
+struct TerminalExit {
+    code: Option<i64>,
     signal: Option<String>,
 }
 
+/// Accumulated terminal output. Drains append at the tail; once the
+/// configured `outputByteLimit` is exceeded the front is dropped, like a
+/// real terminal's scrollback.
+#[derive(Debug, Default)]
+struct TerminalBuf {
+    text: String,
+    truncated: bool,
+}
+
+/// Live state of one client-side terminal. Clones keep pointing at the
+/// same process state, so `terminal/output`, `terminal/wait_for_exit`
+/// and `terminal/kill` all observe the same command.
+#[derive(Clone)]
+struct TerminalRecord {
+    buf: Arc<Mutex<TerminalBuf>>,
+    exit: watch::Receiver<Option<TerminalExit>>,
+    killer: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+}
+
 async fn respond_to_agent_request(
-    inner: &Arc<Inner>,
-    stdin: &Arc<Mutex<alleycat_bridge_core::ChildStdin>>,
+    inner: Arc<Inner>,
+    stdin: Arc<Mutex<alleycat_bridge_core::ChildStdin>>,
     frame: Value,
 ) {
     let id = frame.get("id").cloned().unwrap_or(Value::Null);
@@ -410,7 +442,7 @@ async fn respond_to_agent_request(
         .and_then(Value::as_str)
         .unwrap_or("<missing>");
     let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
-    let response = match handle_agent_request(inner, method, params).await {
+    let response = match handle_agent_request(&inner, method, params).await {
         Ok(result) => json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -582,6 +614,121 @@ async fn handle_fs_list_directory(params: &Value) -> std::result::Result<Value, 
     Ok(Value::Array(out))
 }
 
+/// Build the process for `terminal/create`.
+///
+/// Some agents (devin among them) put the entire shell command line into
+/// `command` and leave `args` empty. Spawning that string literally
+/// looks for an executable named e.g. `echo ok` and fails, so the
+/// args-less form goes through the platform shell. When `args` is given
+/// the pair is a plain argv and spawns directly.
+fn terminal_command(command: &str, args: &[String]) -> Command {
+    if args.is_empty() {
+        shell_command(command)
+    } else {
+        let mut cmd = Command::new(command);
+        cmd.args(args);
+        cmd
+    }
+}
+
+#[cfg(not(windows))]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.arg("-c").arg(command);
+    cmd
+}
+
+#[cfg(windows)]
+fn shell_command(command: &str) -> Command {
+    let mut cmd = Command::new("cmd");
+    cmd.arg("/C").arg(command);
+    cmd
+}
+
+/// Drain one terminal pipe into the shared scrollback buffer. Both ends
+/// drain concurrently so a chatty process can't fill one pipe and
+/// deadlock against a read on the other.
+async fn drain_terminal_pipe<R>(mut pipe: R, buf: Arc<Mutex<TerminalBuf>>, limit: usize)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut chunk = [0_u8; 8192];
+    loop {
+        match pipe.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let mut guard = buf.lock().await;
+                guard.text.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                if truncate_utf8_tail(&mut guard.text, limit) {
+                    guard.truncated = true;
+                }
+            }
+        }
+    }
+}
+
+fn terminal_exit(res: std::io::Result<std::process::ExitStatus>) -> TerminalExit {
+    match res {
+        Ok(status) => terminal_exit_status(status),
+        Err(err) => TerminalExit {
+            code: Some(-1),
+            signal: Some(format!("wait failed: {err}")),
+        },
+    }
+}
+
+#[cfg(unix)]
+fn terminal_exit_status(status: std::process::ExitStatus) -> TerminalExit {
+    use std::os::unix::process::ExitStatusExt;
+    TerminalExit {
+        code: status.code().map(i64::from),
+        signal: status.signal().map(|sig| sig.to_string()),
+    }
+}
+
+#[cfg(not(unix))]
+fn terminal_exit_status(status: std::process::ExitStatus) -> TerminalExit {
+    TerminalExit {
+        code: status.code().map(i64::from),
+        signal: None,
+    }
+}
+
+/// Wait for the terminal process to exit — or for `terminal/kill` /
+/// `terminal/release` to terminate it — and report the final status.
+async fn wait_terminal_exit(
+    child: &mut tokio::process::Child,
+    mut kill_rx: oneshot::Receiver<()>,
+) -> TerminalExit {
+    enum WaitOutcome {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        Killed,
+    }
+    let mut killed = false;
+    loop {
+        let outcome = tokio::select! {
+            res = child.wait() => WaitOutcome::Exited(res),
+            _ = &mut kill_rx, if !killed => WaitOutcome::Killed,
+        };
+        match outcome {
+            WaitOutcome::Exited(res) => break terminal_exit(res),
+            WaitOutcome::Killed => {
+                // Guarded out of future select arms so a spent oneshot
+                // can't win every poll forever.
+                killed = true;
+                let _ = child.start_kill();
+            }
+        }
+    }
+}
+
+fn terminal_exit_json(exit: &TerminalExit) -> Value {
+    json!({
+        "exitCode": exit.code,
+        "signal": exit.signal,
+    })
+}
+
 async fn handle_terminal_create(
     inner: &Arc<Inner>,
     params: &Value,
@@ -590,11 +737,18 @@ async fn handle_terminal_create(
         .get("command")
         .and_then(Value::as_str)
         .ok_or_else(|| "terminal/create missing command".to_string())?;
+    let args: Vec<String> = params
+        .get("args")
+        .and_then(Value::as_array)
+        .map(|args| {
+            args.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
     let terminal_id = format!("term_{}", REQUEST_ID_COUNTER.fetch_add(1, Ordering::SeqCst));
-    let mut cmd = Command::new(command);
-    if let Some(args) = params.get("args").and_then(Value::as_array) {
-        cmd.args(args.iter().filter_map(Value::as_str));
-    }
+    let mut cmd = terminal_command(command, &args);
     if let Some(cwd) = params.get("cwd").and_then(Value::as_str) {
         cmd.current_dir(cwd);
     }
@@ -610,25 +764,51 @@ async fn handle_terminal_create(
         .get("outputByteLimit")
         .and_then(Value::as_u64)
         .unwrap_or(1_048_576) as usize;
-    let record = match cmd.output().await {
-        Ok(output) => {
-            let mut text = String::new();
-            text.push_str(&String::from_utf8_lossy(&output.stdout));
-            text.push_str(&String::from_utf8_lossy(&output.stderr));
-            let truncated = truncate_utf8_tail(&mut text, limit);
-            TerminalRecord {
-                output: text,
-                truncated,
-                exit_code: output.status.code().map(i64::from),
-                signal: None,
-            }
+
+    // Spawn and hand back the terminal id right away — create must not
+    // block on the command itself — then drive the process to exit on a
+    // background task. Both pipes drain concurrently so a chatty process
+    // can't fill one pipe and deadlock against a read on the other.
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn {command}: {err}"))?;
+
+    let buf = Arc::new(Mutex::new(TerminalBuf::default()));
+    let mut drains = Vec::new();
+    if let Some(pipe) = child.stdout.take() {
+        drains.push(tokio::spawn(drain_terminal_pipe(
+            pipe,
+            Arc::clone(&buf),
+            limit,
+        )));
+    }
+    if let Some(pipe) = child.stderr.take() {
+        drains.push(tokio::spawn(drain_terminal_pipe(
+            pipe,
+            Arc::clone(&buf),
+            limit,
+        )));
+    }
+
+    let (exit_tx, exit_rx) = watch::channel::<Option<TerminalExit>>(None);
+    let (kill_tx, kill_rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let exit = wait_terminal_exit(&mut child, kill_rx).await;
+        // Reap the drains before publishing the exit status so the
+        // buffer holds every byte by the time it becomes visible.
+        for drain in drains {
+            let _ = drain.await;
         }
-        Err(err) => TerminalRecord {
-            output: format!("failed to spawn {command}: {err}"),
-            truncated: false,
-            exit_code: Some(-1),
-            signal: None,
-        },
+        let _ = exit_tx.send(Some(exit));
+    });
+
+    let record = TerminalRecord {
+        buf,
+        exit: exit_rx,
+        killer: Arc::new(Mutex::new(Some(kill_tx))),
     };
     inner
         .terminals
@@ -643,13 +823,15 @@ async fn handle_terminal_output(
     params: &Value,
 ) -> std::result::Result<Value, String> {
     let record = terminal_record(inner, params).await?;
+    let exit_status = match record.exit.borrow().clone() {
+        Some(exit) => terminal_exit_json(&exit),
+        None => Value::Null,
+    };
+    let buf = record.buf.lock().await;
     Ok(json!({
-        "output": record.output,
-        "truncated": record.truncated,
-        "exitStatus": {
-            "exitCode": record.exit_code,
-            "signal": record.signal,
-        },
+        "output": buf.text,
+        "truncated": buf.truncated,
+        "exitStatus": exit_status,
     }))
 }
 
@@ -657,10 +839,21 @@ async fn handle_terminal_wait(
     inner: &Arc<Inner>,
     params: &Value,
 ) -> std::result::Result<Value, String> {
-    let record = terminal_record(inner, params).await?;
+    let mut exit_rx = {
+        let record = terminal_record(inner, params).await?;
+        record.exit
+    };
+    let _ = exit_rx
+        .wait_for(|exit| exit.is_some())
+        .await
+        .map_err(|_| "terminal driver stopped without an exit status".to_string())?;
+    let exit = exit_rx.borrow().clone().unwrap_or(TerminalExit {
+        code: Some(-1),
+        signal: None,
+    });
     Ok(json!({
-        "exitCode": record.exit_code,
-        "signal": record.signal,
+        "exitCode": exit.code,
+        "signal": exit.signal,
     }))
 }
 
@@ -669,7 +862,13 @@ async fn handle_terminal_release(
     params: &Value,
 ) -> std::result::Result<Value, String> {
     let id = required_terminal_id(params)?;
-    inner.terminals.lock().await.remove(id);
+    if let Some(record) = inner.terminals.lock().await.remove(id) {
+        // Release kills a still-running command per spec.
+        let mut killer = record.killer.lock().await;
+        if let Some(kill) = killer.take() {
+            let _ = kill.send(());
+        }
+    }
     Ok(Value::Null)
 }
 
@@ -678,10 +877,13 @@ async fn handle_terminal_kill(
     params: &Value,
 ) -> std::result::Result<Value, String> {
     let id = required_terminal_id(params)?;
-    if let Some(record) = inner.terminals.lock().await.get_mut(id) {
-        if record.exit_code.is_none() {
-            record.exit_code = Some(-1);
-            record.signal = Some("killed".to_string());
+    let map = inner.terminals.lock().await;
+    if let Some(record) = map.get(id)
+        && record.exit.borrow().is_none()
+    {
+        let mut killer = record.killer.lock().await;
+        if let Some(kill) = killer.take() {
+            let _ = kill.send(());
         }
     }
     Ok(Value::Null)
@@ -733,4 +935,166 @@ fn truncate_utf8_tail(text: &mut String, limit: usize) -> bool {
     }
     *text = text[start..].to_string();
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn inner() -> Arc<Inner> {
+        Arc::new(Inner::new())
+    }
+
+    fn params(terminal_id: &str) -> Value {
+        json!({ "sessionId": "s", "terminalId": terminal_id })
+    }
+
+    async fn create(inner: &Arc<Inner>, create_params: Value) -> String {
+        let result = handle_terminal_create(inner, &create_params).await.unwrap();
+        result["terminalId"].as_str().unwrap().to_string()
+    }
+
+    async fn wait(inner: &Arc<Inner>, id: &str) -> Value {
+        handle_terminal_wait(inner, &params(id)).await.unwrap()
+    }
+
+    async fn output(inner: &Arc<Inner>, id: &str) -> Value {
+        handle_terminal_output(inner, &params(id)).await.unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_runs_shell_command_line_without_args() {
+        // Agents may put the whole shell line in `command` with no args;
+        // it must run through the shell rather than spawn as one argv[0].
+        let inner = inner();
+        let id = create(
+            &inner,
+            json!({ "sessionId": "s", "command": "echo acp-shell-ok" }),
+        )
+        .await;
+        let exit = wait(&inner, &id).await;
+        assert_eq!(exit["exitCode"], json!(0));
+        let out = output(&inner, &id).await;
+        assert!(out["output"].as_str().unwrap().contains("acp-shell-ok"));
+        assert_eq!(out["exitStatus"]["exitCode"], json!(0));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_supports_shell_operators() {
+        let inner = inner();
+        let id = create(
+            &inner,
+            json!({ "sessionId": "s", "command": "printf 'x' | wc -c" }),
+        )
+        .await;
+        let exit = wait(&inner, &id).await;
+        assert_eq!(exit["exitCode"], json!(0));
+        let out = output(&inner, &id).await;
+        assert_eq!(out["output"].as_str().unwrap().trim(), "1");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_runs_argv_form_directly() {
+        let inner = inner();
+        let id = create(
+            &inner,
+            json!({
+                "sessionId": "s",
+                "command": "echo",
+                "args": ["acp-argv-ok"],
+            }),
+        )
+        .await;
+        let exit = wait(&inner, &id).await;
+        assert_eq!(exit["exitCode"], json!(0));
+        let out = output(&inner, &id).await;
+        assert!(out["output"].as_str().unwrap().contains("acp-argv-ok"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_reports_exit_code() {
+        let inner = inner();
+        let id = create(&inner, json!({ "sessionId": "s", "command": "exit 7" })).await;
+        let exit = wait(&inner, &id).await;
+        assert_eq!(exit["exitCode"], json!(7));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_honors_cwd_and_env() {
+        let inner = inner();
+        let id = create(
+            &inner,
+            json!({
+                "sessionId": "s",
+                "command": "printf 'VAL=%s' \"$ACP_TEST_ENV\"",
+                "cwd": "/tmp",
+                "env": [{ "name": "ACP_TEST_ENV", "value": "env-ok" }],
+            }),
+        )
+        .await;
+        let exit = wait(&inner, &id).await;
+        assert_eq!(exit["exitCode"], json!(0));
+        let out = output(&inner, &id).await;
+        assert_eq!(out["output"].as_str().unwrap(), "VAL=env-ok");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_with_bad_cwd_fails() {
+        let inner = inner();
+        let result = handle_terminal_create(
+            &inner,
+            &json!({
+                "sessionId": "s",
+                "command": "echo never",
+                "cwd": "/nonexistent-dir-for-acp-test",
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn create_returns_while_command_still_runs_then_kill_terminates() {
+        // create must answer promptly — a long-running command can't
+        // block the request path, and kill must stop it.
+        let inner = inner();
+        let started = std::time::Instant::now();
+        let id = create(&inner, json!({ "sessionId": "s", "command": "sleep 30" })).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        handle_terminal_kill(&inner, &params(&id)).await.unwrap();
+        let exit = wait(&inner, &id).await;
+        assert!(exit["exitCode"].is_null());
+        assert!(exit["signal"].is_string());
+        assert!(started.elapsed() < std::time::Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn unknown_terminal_id_errors() {
+        let inner = inner();
+        assert!(
+            handle_terminal_output(&inner, &params("missing"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn release_removes_terminal() {
+        let inner = inner();
+        let id = create(
+            &inner,
+            json!({ "sessionId": "s", "command": "echo release-ok" }),
+        )
+        .await;
+        handle_terminal_release(&inner, &params(&id)).await.unwrap();
+        assert!(handle_terminal_output(&inner, &params(&id)).await.is_err());
+    }
 }
