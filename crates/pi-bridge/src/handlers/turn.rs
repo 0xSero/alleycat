@@ -636,42 +636,39 @@ async fn run_event_pump(mut args: EventPumpArgs) {
                 approval::ApprovalKind::Command,
             )
         {
+            // Pi is already running the command, so the approval only decides
+            // whether to abort. Ask off the pump: awaiting here stalled the
+            // event stream up to the approval timeout per tool call, which
+            // lagged the broadcast channel and froze the client transcript.
             let item_id = Uuid::now_v7().to_string();
             let cmd_str = tool_args
                 .get("command")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let outcome = approval::request_command_approval(
-                &args.state,
-                p::CommandExecutionRequestApprovalParams {
-                    thread_id: args.thread_id.clone(),
-                    turn_id: args.turn_id.clone(),
-                    item_id,
-                    command: cmd_str,
-                    ..Default::default()
-                },
-                None,
-            )
-            .await;
-            if let Ok(outcome) = outcome {
-                if outcome.should_abort_turn() {
-                    let _ = args
-                        .handle
-                        .send_request(pi::RpcCommand::Abort(pi::BareCmd::default()))
-                        .await;
+            let state = Arc::clone(&args.state);
+            let handle = Arc::clone(&args.handle);
+            let thread_id = args.thread_id.clone();
+            let params = p::CommandExecutionRequestApprovalParams {
+                thread_id: args.thread_id.clone(),
+                turn_id: args.turn_id.clone(),
+                item_id,
+                command: cmd_str,
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                match approval::request_command_approval(&state, params, None).await {
+                    Ok(outcome) if outcome.should_abort_turn() => {
+                        let _ = handle
+                            .send_request(pi::RpcCommand::Abort(pi::BareCmd::default()))
+                            .await;
+                    }
+                    Ok(_) => {}
+                    Err(_) => tracing::warn!(
+                        thread_id = %thread_id,
+                        "approval request failed; command already running"
+                    ),
                 }
-                // Approve / decline: we still forward pi's events
-                // since the command is already running. The codex
-                // client treats `decline` as "let it finish but
-                // don't auto-trust similar commands later" — that
-                // matches pi's behavior anyway.
-                let _ = outcome;
-            } else {
-                tracing::warn!(
-                    thread_id = %args.thread_id,
-                    "approval request failed; forwarding tool item anyway"
-                );
-            }
+            });
         }
 
         // Extension UI bridging. Pi → codex → client → codex → pi.
