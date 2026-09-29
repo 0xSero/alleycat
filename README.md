@@ -110,6 +110,8 @@ The daemon answers with `{ok, agents?, error?}`. On `connect`, after the respons
 
 ## Configuration
 
+Runtime settings discovery, native file scopes, and schema limitations are documented in [Native runtime settings](NATIVE_SETTINGS.md).
+
 `host.toml` is created on first run with sensible defaults; edit and `alleycat reload` to apply.
 
 ```toml

@@ -11,6 +11,9 @@ use std::sync::Mutex;
 pub struct HermesBinding {
     pub thread_id: String,
     pub hermes_session_id: String,
+    /// The native CLI assigns its own ID after the first one-shot turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_session_id: Option<String>,
     pub model: Option<String>,
     pub created_at: i64,
     #[serde(default)]

@@ -34,6 +34,7 @@ async fn fake_amp_turn_persists_thread_and_emits_lifecycle() {
         &fake_amp,
         r#"#!/usr/bin/env bash
 set -euo pipefail
+if [[ "$*" == "plugins list" ]]; then exit 0; fi
 continuing=0
 case " $* " in
   *" threads continue T-fake-amp "*) continuing=1 ;;

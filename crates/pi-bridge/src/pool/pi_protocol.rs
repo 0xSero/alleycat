@@ -338,7 +338,7 @@ pub struct SessionState {
     pub auto_compaction_enabled: bool,
     #[serde(rename = "messageCount")]
     pub message_count: u64,
-    #[serde(rename = "pendingMessageCount")]
+    #[serde(rename = "pendingMessageCount", alias = "queuedMessageCount")]
     pub pending_message_count: u64,
 }
 
@@ -1685,5 +1685,19 @@ mod tests {
         let event: PiEvent = serde_json::from_value(body.clone()).unwrap();
         assert_eq!(event, PiEvent::AgentSettled);
         assert_eq!(serde_json::to_value(&event).unwrap(), body);
+    }
+
+    #[test]
+    fn session_state_preserves_pi_and_omp_queue_counts() {
+        for field in ["pendingMessageCount", "queuedMessageCount"] {
+            let mut body = json!({
+                "thinkingLevel":"off", "isStreaming":false, "isCompacting":false,
+                "steeringMode":"all", "followUpMode":"all", "sessionId":"test",
+                "autoCompactionEnabled":true, "messageCount":0
+            });
+            body[field] = json!(2);
+            let state: SessionState = serde_json::from_value(body).unwrap();
+            assert_eq!(state.pending_message_count, 2);
+        }
     }
 }

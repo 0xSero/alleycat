@@ -19,7 +19,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use alleycat_codex_proto::{SortDirection, ThreadSortKey, ThreadSourceKind};
+use alleycat_codex_proto::{
+    GitInfo, SessionSource, SortDirection, Thread, ThreadSortKey, ThreadSourceKind, ThreadStatus,
+};
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -61,6 +63,44 @@ pub struct IndexEntry<M> {
     /// compatible with the pre-refactor shape.
     #[serde(flatten)]
     pub metadata: M,
+}
+
+impl<M> IndexEntry<M> {
+    /// Shared wire projection; adapters supply only native session metadata.
+    pub fn to_thread(
+        &self,
+        session_id: String,
+        path: Option<String>,
+        cli_version: &str,
+        git_info: Option<GitInfo>,
+    ) -> Thread {
+        Thread {
+            id: self.thread_id.clone(),
+            session_id,
+            forked_from_id: self.forked_from_id.clone(),
+            preview: self.preview.clone(),
+            ephemeral: false,
+            model_provider: self.model_provider.clone(),
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            status: ThreadStatus::NotLoaded,
+            path,
+            cwd: self.cwd.clone(),
+            cli_version: cli_version.to_string(),
+            source: match self.source {
+                ThreadSourceKind::Cli => SessionSource::Cli,
+                ThreadSourceKind::VsCode => SessionSource::VsCode,
+                ThreadSourceKind::Exec => SessionSource::Exec,
+                _ => SessionSource::AppServer,
+            },
+            thread_source: None,
+            agent_nickname: None,
+            agent_role: None,
+            git_info,
+            name: self.name.clone(),
+            turns: Vec::new(),
+        }
+    }
 }
 
 /// Filter knobs accepted by `ThreadIndex::list`. Mirrors the codex
@@ -228,9 +268,19 @@ where
 
     /// Insert (or replace) an entry.
     pub async fn insert(&self, entry: IndexEntry<M>) -> Result<()> {
+        self.insert_batch(vec![entry]).await
+    }
+
+    /// Insert or replace a batch, persisting once after all rows are visible.
+    pub async fn insert_batch(&self, entries: Vec<IndexEntry<M>>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
         {
             let mut guard = self.inner.write().await;
-            guard.insert(entry.thread_id.clone(), entry);
+            for entry in entries {
+                guard.insert(entry.thread_id.clone(), entry);
+            }
         }
         self.persist().await
     }
@@ -311,20 +361,31 @@ where
         thread_id: &str,
         forked_from_id: Option<String>,
     ) -> Result<bool> {
-        let changed = {
+        Ok(self
+            .set_forked_from_ids(vec![(thread_id.to_owned(), forked_from_id)])
+            .await?
+            > 0)
+    }
+
+    /// Resolve a hydration batch of fork links with one disk write.
+    pub async fn set_forked_from_ids(
+        &self,
+        updates: Vec<(String, Option<String>)>,
+    ) -> Result<usize> {
+        let mut found = 0;
+        {
             let mut guard = self.inner.write().await;
-            match guard.get_mut(thread_id) {
-                Some(row) => {
-                    row.forked_from_id = forked_from_id;
-                    true
+            for (thread_id, parent) in updates {
+                if let Some(row) = guard.get_mut(&thread_id) {
+                    row.forked_from_id = parent;
+                    found += 1;
                 }
-                None => false,
             }
-        };
-        if changed {
+        }
+        if found > 0 {
             self.persist().await?;
         }
-        Ok(changed)
+        Ok(found)
     }
 
     /// Rewrite the provider label for every indexed row. Embedders that
@@ -375,9 +436,9 @@ where
         cursor: Option<&str>,
         limit: Option<u32>,
     ) -> Result<ListPage<M>> {
-        let snapshot: Vec<IndexEntry<M>> = self.inner.read().await.values().cloned().collect();
-        let mut filtered: Vec<IndexEntry<M>> = snapshot
-            .into_iter()
+        let guard = self.inner.read().await;
+        let mut filtered: Vec<&IndexEntry<M>> = guard
+            .values()
             .filter(|e| matches_filter(e, filter))
             .collect();
 
@@ -396,16 +457,16 @@ where
         };
 
         let limit = limit.map(|l| l as usize).unwrap_or(filtered.len());
-        let end = (starting + limit).min(filtered.len());
+        let end = starting.saturating_add(limit).min(filtered.len());
         let page = &filtered[starting..end];
-        let next_cursor = if end < filtered.len() {
+        let next_cursor = if !page.is_empty() && end < filtered.len() {
             Some(encode_cursor(&page[page.len() - 1], sort))
         } else {
             None
         };
 
         Ok(ListPage {
-            data: page.to_vec(),
+            data: page.iter().map(|entry| (*entry).clone()).collect(),
             next_cursor,
         })
     }
@@ -549,7 +610,7 @@ fn matches_filter<M>(entry: &IndexEntry<M>, filter: &ListFilter) -> bool {
     true
 }
 
-fn sort_entries<M>(entries: &mut [IndexEntry<M>], sort: ListSort) {
+fn sort_entries<M>(entries: &mut [&IndexEntry<M>], sort: ListSort) {
     entries.sort_by(|a, b| {
         let (ak, bk) = match sort.key {
             ThreadSortKey::CreatedAt => (a.created_at, b.created_at),
@@ -620,4 +681,80 @@ where
     M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
 {
     ThreadIndex::open_at(dir.join("threads.json")).await
+}
+
+#[cfg(test)]
+mod scalability_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct CountedMetadata {
+        #[serde(skip)]
+        clones: Arc<AtomicUsize>,
+    }
+
+    impl Clone for CountedMetadata {
+        fn clone(&self) -> Self {
+            self.clones.fetch_add(1, Ordering::Relaxed);
+            Self {
+                clones: self.clones.clone(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_clones_only_the_requested_page_and_handles_zero_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let index = ThreadIndex::open_at(dir.path().join("threads.json"))
+            .await
+            .unwrap();
+        let clones = Arc::new(AtomicUsize::new(0));
+        let entries = (0..1000)
+            .map(|n| IndexEntry {
+                thread_id: format!("thread-{n:04}"),
+                cwd: "/work".into(),
+                created_at: n,
+                updated_at: n,
+                archived: false,
+                name: None,
+                preview: "preview".into(),
+                forked_from_id: None,
+                model_provider: "pi".into(),
+                source: ThreadSourceKind::AppServer,
+                metadata: CountedMetadata {
+                    clones: clones.clone(),
+                },
+            })
+            .collect();
+        index.insert_batch(entries).await.unwrap();
+        clones.store(0, Ordering::Relaxed);
+        let page = index
+            .list(&ListFilter::default(), ListSort::default(), None, Some(25))
+            .await
+            .unwrap();
+        assert_eq!(page.data.len(), 25);
+        assert_eq!(clones.load(Ordering::Relaxed), 25);
+        assert_eq!(page.data[0].thread_id, "thread-0999");
+        let next = index
+            .list(
+                &ListFilter::default(),
+                ListSort::default(),
+                page.next_cursor.as_deref(),
+                Some(25),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.data[0].thread_id, "thread-0974");
+        let empty = index
+            .list(&ListFilter::default(), ListSort::default(), None, Some(0))
+            .await
+            .unwrap();
+        assert!(empty.data.is_empty());
+        assert!(empty.next_cursor.is_none());
+        let reopened = ThreadIndex::<CountedMetadata>::open_at(dir.path().join("threads.json"))
+            .await
+            .unwrap();
+        assert_eq!(reopened.snapshot().await.len(), 1000);
+    }
 }

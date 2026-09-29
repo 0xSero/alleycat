@@ -12,6 +12,10 @@
 //! Keeping this devin-aware logic out of `acp-bridge` lets that crate stay a
 //! generic adapter usable by any ACP agent.
 
+mod models;
+mod settings;
+pub use models::parse_model_catalog;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -156,6 +160,44 @@ impl Bridge for DevinBridge {
         method: &str,
         params: Value,
     ) -> Result<Value, JsonRpcError> {
+        if matches!(
+            method,
+            "config/read" | "config/value/write" | "config/batchWrite"
+        ) {
+            let result: anyhow::Result<Value> = async {
+                let path = settings::path()?;
+                if method == "config/read" {
+                    let mut response = settings::read(&path).await?;
+                    if let Some(session) =
+                        self.inner.native_settings().config["_litterSettings"].as_array()
+                    {
+                        response.config["_litterSettings"]
+                            .as_array_mut()
+                            .unwrap()
+                            .extend(session.iter().cloned());
+                    }
+                    Ok(serde_json::to_value(response)?)
+                } else {
+                    let edits = if method == "config/value/write" {
+                        alleycat_bridge_core::settings::batch_from_one(serde_json::from_value(
+                            params,
+                        )?)
+                    } else {
+                        serde_json::from_value(params)?
+                    };
+                    let edits: alleycat_codex_proto::ConfigBatchWriteParams = edits;
+                    let session = self.inner.native_settings();
+                    anyhow::ensure!(!edits.edits.iter().any(|edit| session.config["_litterSettings"].as_array().is_some_and(|rows| rows.iter().any(|row| row["key"] == edit.key_path))), "ACP session settings are read-only here");
+                    Ok(serde_json::to_value(settings::write(&path, edits)?)?)
+                }
+            }
+            .await;
+            return result.map_err(|e| JsonRpcError {
+                code: error_codes::INVALID_PARAMS,
+                message: e.to_string(),
+                data: None,
+            });
+        }
         if method == "thread/list" {
             return self.handle_thread_list().await;
         }

@@ -15,11 +15,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::codex_proto::{SessionSource, Thread, ThreadSourceKind, ThreadStatus};
+use crate::codex_proto::{Thread, ThreadSourceKind};
 
 pub use pi_session_scan::{
     PiSessionInfo, list_all, list_sessions_from_dir, list_sessions_modified_since, pi_sessions_dir,
@@ -89,50 +89,60 @@ impl ThreadIndex {
         let path = codex_home.join("threads.json");
         let inner = alleycat_bridge_core::ThreadIndex::<PiSessionRef>::open_at(path).await?;
 
-        // Step 1: scan and insert any rows we haven't seen before.
         let scanned = hydrator.scan_sessions().await;
-        if !scanned.is_empty() {
-            let known_paths: std::collections::HashMap<PathBuf, IndexEntry> = inner
-                .snapshot()
-                .await
-                .into_iter()
-                .map(|entry| (entry.metadata.pi_session_path.clone(), entry))
-                .collect();
-            for info in &scanned {
-                if let Some(existing) = known_paths.get(&info.path) {
-                    refresh_entry_summary(&inner, existing, info, false).await?;
-                    continue;
+        // This index is not shared until hydration completes. Assemble summary
+        // and fork changes in memory, then persist the complete batch once.
+        let mut by_path: BTreeMap<PathBuf, IndexEntry> = inner
+            .snapshot()
+            .await
+            .into_iter()
+            .map(|entry| (entry.metadata.pi_session_path.clone(), entry))
+            .collect();
+        let mut changed = false;
+        for info in &scanned {
+            match by_path.entry(info.path.clone()) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(entry_from_pi(info));
+                    changed = true;
                 }
-                inner.insert(entry_from_pi(info)).await.with_context(|| {
-                    format!("inserting hydrated row for {}", info.path.display())
-                })?;
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let existing = slot.get_mut();
+                    if (existing.preview.trim().is_empty() || existing.preview == "(no messages)")
+                        && info.first_message != "(no messages)"
+                    {
+                        existing.preview = info.first_message.clone();
+                        existing.updated_at = info.modified.timestamp_millis();
+                        changed = true;
+                    }
+                    if existing.name.is_none() && info.name.is_some() {
+                        existing.name = info
+                            .name
+                            .clone()
+                            .filter(|name| !name.trim().is_empty())
+                            .map(|name| name.trim().to_owned());
+                        changed |= existing.name.is_some();
+                    }
+                }
             }
         }
-
-        // Step 2: resolve fork chains.
-        let snapshot = inner.snapshot().await;
-        let path_to_thread: BTreeMap<PathBuf, String> = snapshot
-            .iter()
-            .map(|e| (e.metadata.pi_session_path.clone(), e.thread_id.clone()))
-            .collect();
-        let mut updates: Vec<(String, String)> = Vec::new();
-        for entry in &snapshot {
-            if entry.forked_from_id.is_some() {
-                continue;
-            }
-            let Some(parent_path) = scanned
-                .iter()
-                .find(|s| s.path == entry.metadata.pi_session_path)
-                .and_then(|s| s.parent_session_path.as_ref())
+        for info in &scanned {
+            let Some(parent_id) = info
+                .parent_session_path
+                .as_ref()
+                .and_then(|path| by_path.get(path))
+                .map(|entry| entry.thread_id.clone())
             else {
                 continue;
             };
-            if let Some(parent_thread) = path_to_thread.get(parent_path) {
-                updates.push((entry.thread_id.clone(), parent_thread.clone()));
+            if let Some(child) = by_path.get_mut(&info.path) {
+                if child.forked_from_id.is_none() {
+                    child.forked_from_id = Some(parent_id);
+                    changed = true;
+                }
             }
         }
-        for (child, parent) in updates {
-            inner.set_forked_from_id(&child, Some(parent)).await?;
+        if changed {
+            inner.insert_batch(by_path.into_values().collect()).await?;
         }
 
         Ok(unsafe {
@@ -175,26 +185,30 @@ impl ThreadIndex {
             .into_iter()
             .map(|e| (e.metadata.pi_session_path.clone(), e.thread_id.clone()))
             .collect();
+        let mut new_entries = Vec::new();
         for info in &scanned {
             if known_paths.contains(&info.path) {
                 continue;
             }
             let entry = entry_from_pi(info);
             path_to_thread.insert(info.path.clone(), entry.thread_id.clone());
-            self.0.insert(entry).await?;
+            new_entries.push(entry);
             added += 1;
         }
 
+        self.0.insert_batch(new_entries).await?;
+
         // Resolve fork chains.
+        let scanned_by_path: BTreeMap<_, _> =
+            scanned.iter().map(|info| (&info.path, info)).collect();
         let snapshot = self.0.snapshot().await;
         let mut updates: Vec<(String, String)> = Vec::new();
         for entry in &snapshot {
             if entry.forked_from_id.is_some() {
                 continue;
             }
-            let Some(parent_path) = scanned
-                .iter()
-                .find(|s| s.path == entry.metadata.pi_session_path)
+            let Some(parent_path) = scanned_by_path
+                .get(&entry.metadata.pi_session_path)
                 .and_then(|s| s.parent_session_path.as_ref())
             else {
                 continue;
@@ -203,9 +217,14 @@ impl ThreadIndex {
                 updates.push((entry.thread_id.clone(), parent_thread.clone()));
             }
         }
-        for (child, parent) in updates {
-            self.0.set_forked_from_id(&child, Some(parent)).await?;
-        }
+        self.0
+            .set_forked_from_ids(
+                updates
+                    .into_iter()
+                    .map(|(child, parent)| (child, Some(parent)))
+                    .collect(),
+            )
+            .await?;
         Ok(added)
     }
 
@@ -335,39 +354,25 @@ pub fn entry_from_pi(info: &PiSessionInfo) -> IndexEntry {
 /// Fold an `IndexEntry` into a codex `Thread` with no turns populated.
 /// `thread/read` fills `turns` separately when `include_turns` is set.
 pub fn thread_from_entry(entry: &IndexEntry) -> Thread {
-    Thread {
-        id: entry.thread_id.clone(),
-        session_id: entry.metadata.pi_session_id.clone(),
-        forked_from_id: entry.forked_from_id.clone(),
-        preview: entry.preview.clone(),
-        ephemeral: false,
-        model_provider: entry.model_provider.clone(),
-        created_at: entry.created_at,
-        updated_at: entry.updated_at,
-        status: ThreadStatus::NotLoaded,
-        path: Some(
+    thread_from_entry_with_git_info(entry, alleycat_bridge_core::git_info_for_cwd(&entry.cwd))
+}
+
+pub fn thread_from_entry_with_git_info(
+    entry: &IndexEntry,
+    git_info: Option<alleycat_codex_proto::GitInfo>,
+) -> Thread {
+    entry.to_thread(
+        entry.metadata.pi_session_id.clone(),
+        Some(
             entry
                 .metadata
                 .pi_session_path
                 .to_string_lossy()
                 .into_owned(),
         ),
-        cwd: entry.cwd.clone(),
-        cli_version: CLI_VERSION.to_string(),
-        source: match entry.source {
-            ThreadSourceKind::Cli => SessionSource::Cli,
-            ThreadSourceKind::VsCode => SessionSource::VsCode,
-            ThreadSourceKind::Exec => SessionSource::Exec,
-            ThreadSourceKind::AppServer => SessionSource::AppServer,
-            _ => SessionSource::AppServer,
-        },
-        thread_source: None,
-        agent_nickname: None,
-        agent_role: None,
-        git_info: alleycat_bridge_core::git_info_for_cwd(&entry.cwd),
-        name: entry.name.clone(),
-        turns: Vec::new(),
-    }
+        CLI_VERSION,
+        git_info,
+    )
 }
 
 /// Pi-specific hydrator: walks `~/.pi/agent/sessions/` (or its env-var
@@ -693,5 +698,44 @@ mod tests {
             !raw.contains("\"metadata\""),
             "metadata must be flattened, not nested: {raw}"
         );
+    }
+}
+
+#[cfg(test)]
+mod scalability_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "manual matched before/after timing"]
+    async fn benchmark_hydration_and_pagination() {
+        for count in [100, 1000] {
+            let dir = tempfile::tempdir().unwrap();
+            let sessions = dir.path().join("sessions/encoded");
+            std::fs::create_dir_all(&sessions).unwrap();
+            for n in 0..count {
+                let header = serde_json::json!({"type":"session", "version":3,
+                    "id":format!("session-{n}"), "timestamp":"2026-04-27T10:00:00Z", "cwd":"/p"});
+                std::fs::write(sessions.join(format!("{n}.jsonl")), format!("{header}\n")).unwrap();
+            }
+            let hydrator = PiHydrator::with_override(dir.path().join("sessions"));
+            let started = std::time::Instant::now();
+            let index = ThreadIndex::open_and_hydrate_with(&dir.path().join("index"), &hydrator)
+                .await
+                .unwrap();
+            let hydration = started.elapsed();
+            let started = std::time::Instant::now();
+            for _ in 0..100 {
+                let page = index
+                    .list(&ListFilter::default(), ListSort::default(), None, Some(25))
+                    .await
+                    .unwrap();
+                assert_eq!(page.data.len(), 25);
+            }
+            eprintln!(
+                "SCALABILITY count={count} hydration_ms={:.3} first_page_100_ms={:.3}",
+                hydration.as_secs_f64() * 1000.0,
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
     }
 }

@@ -8,9 +8,7 @@
 //! no live processes at all. The utility spawn is short-lived: callers
 //! must not `mark_active` it, and the next idle reap sweeps it.
 //!
-//! Returns an empty list when pi spawn fails — codex clients tolerate
-//! empty `model/list` responses (no model picker contents; they fall back
-//! to the thread's active model).
+//! Discovery errors propagate so clients can retain their last good catalog and retry.
 //!
 //! `experimentalFeature/list`, `collaborationMode/list`, and
 //! `mock/experimentalMethod` are inlined in `main.rs`'s dispatcher; this
@@ -36,8 +34,12 @@ const THINKING_SUFFIXES: &[&str] = &["off", "minimal", "low", "medium", "high", 
 pub async fn handle_model_list(
     state: &Arc<ConnectionState>,
     _params: p::ModelListParams,
-) -> p::ModelListResponse {
-    let pi_models = fetch_models_via_pool(state).await;
+) -> anyhow::Result<p::ModelListResponse> {
+    let pi_models = fetch_models_via_pool(state).await?;
+    let omp = state
+        .native_settings_path()
+        .and_then(Path::extension)
+        .is_some_and(|ext| ext == "yml" || ext == "yaml");
     let default_index = pi_models
         .iter()
         .position(|model| model.active == Some(true));
@@ -48,13 +50,14 @@ pub async fn handle_model_list(
             translate_pi_model(
                 &model,
                 default_index.map_or(idx == 0, |default| idx == default),
+                !omp,
             )
         })
         .collect();
-    p::ModelListResponse {
+    Ok(p::ModelListResponse {
         data,
         next_cursor: None,
-    }
+    })
 }
 
 /// Return the controller's currently active model as a provider-qualified id.
@@ -78,34 +81,28 @@ fn qualified_active_model(models: &[PiAvailableModel]) -> Option<String> {
     (!provider.is_empty() && !model_id.is_empty()).then(|| format!("{provider}/{model_id}"))
 }
 
-/// Fetch `Model[]` via the pool. Returns `Vec::new()` on any spawn or RPC
-/// failure — the codex client interprets an empty list as "no model
-/// picker today" and falls back to the thread's active model. Spawn
-/// failure is logged at WARN so it's visible in bridge logs.
-async fn fetch_models_via_pool(state: &Arc<ConnectionState>) -> Vec<PiAvailableModel> {
+/// Fetch the authoritative catalog, propagating failures so callers can retry
+/// without replacing their last successful catalog with an empty list.
+async fn fetch_models_via_pool(
+    state: &Arc<ConnectionState>,
+) -> anyhow::Result<Vec<PiAvailableModel>> {
     if let Some(path) = state.model_catalog_path() {
         match fetch_models_from_catalog(path, state.model_provider_prefixes()).await {
-            Ok(models) => return filter_models_by_enabled_models(models),
+            Ok(models) => return Ok(filter_models_by_enabled_models(state, models).await),
             Err(err) => {
                 tracing::warn!(%err, path = %path.display(), "model/list: controller catalog unavailable; falling back to pi RPC");
             }
         }
     }
 
-    match tokio::time::timeout(MODEL_RPC_TIMEOUT, fetch_models_via_rpc(state)).await {
-        Ok(Ok(models)) => filter_models_by_enabled_models(filter_models_by_provider(
-            models,
-            state.model_provider_prefixes(),
-        )),
-        Ok(Err(err)) => {
-            tracing::warn!(%err, "model/list: pi RPC failed");
-            Vec::new()
-        }
-        Err(_) => {
-            tracing::warn!("model/list: pi RPC timed out");
-            Vec::new()
-        }
-    }
+    let models = tokio::time::timeout(MODEL_RPC_TIMEOUT, fetch_models_via_rpc(state))
+        .await
+        .map_err(|_| anyhow::anyhow!("Pi model discovery timed out"))??;
+    Ok(filter_models_by_enabled_models(
+        state,
+        filter_models_by_provider(models, state.model_provider_prefixes()),
+    )
+    .await)
 }
 
 async fn fetch_models_via_rpc(
@@ -178,7 +175,7 @@ fn filter_models_by_provider(
 /// Translate one pi `Model<any>` into codex `Model`. Pi's catalog is loose
 /// JSON so we work through the [`PiAvailableModel`] sieve, taking only what
 /// codex needs.
-fn translate_pi_model(model: &PiAvailableModel, is_default: bool) -> p::Model {
+fn translate_pi_model(model: &PiAvailableModel, is_default: bool, pi_defaults: bool) -> p::Model {
     let provider = model.provider.as_deref().unwrap_or("pi");
     let model_id = model
         .model_id
@@ -194,36 +191,58 @@ fn translate_pi_model(model: &PiAvailableModel, is_default: bool) -> p::Model {
     let display_name = display_name_with_provider(provider, &base_display_name);
     let description = model.description.clone().unwrap_or_default();
 
-    // Codex contract: `supported_reasoning_efforts` is a list of
-    // `{ reasoning_effort, description }` pairs. Pi's `ThinkingLevel`
-    // vocabulary maps directly to the app-server effort levels. Advertising
-    // both xhigh and max matters for controller models that distinguish them.
-    let supported_reasoning_efforts = vec![
-        p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Minimal,
-            description: "Lowest latency, no extended thinking".to_string(),
-        },
-        p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Low,
-            description: "Brief reasoning".to_string(),
-        },
-        p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Medium,
-            description: "Default depth of reasoning".to_string(),
-        },
-        p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::High,
-            description: "Deep reasoning".to_string(),
-        },
-        p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::XHigh,
-            description: "Very deep reasoning".to_string(),
-        },
-        p::ReasoningEffortOption {
-            reasoning_effort: p::ReasoningEffort::Max,
-            description: "Maximum reasoning effort".to_string(),
-        },
-    ];
+    // OMP advertises exact efforts. Pi uses its native thinkingLevelMap rules:
+    // explicit null disables a level, and xhigh/max require an explicit mapping.
+    let levels: Vec<String> = if model.reasoning != Some(true) {
+        Vec::new()
+    } else if let Some(thinking) = &model.thinking {
+        thinking.efforts.clone()
+    } else if pi_defaults {
+        ["minimal", "low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .filter(|level| match model.thinking_level_map.get(*level) {
+                Some(Value::Null) => false,
+                Some(_) => true,
+                None => !matches!(*level, "xhigh" | "max"),
+            })
+            .map(str::to_owned)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let supported_reasoning_efforts: Vec<p::ReasoningEffortOption> = levels
+        .into_iter()
+        .filter_map(|level| {
+            serde_json::from_value(json!(level))
+                .ok()
+                .map(|reasoning_effort| p::ReasoningEffortOption {
+                    reasoning_effort,
+                    description: format!("{level} reasoning"),
+                })
+        })
+        .collect();
+    let default_reasoning_effort = model
+        .thinking
+        .as_ref()
+        .and_then(|thinking| thinking.default_level.as_ref())
+        .and_then(|level| serde_json::from_value(json!(level)).ok())
+        .filter(|effort| {
+            supported_reasoning_efforts
+                .iter()
+                .any(|option| option.reasoning_effort == *effort)
+        })
+        .or_else(|| {
+            supported_reasoning_efforts
+                .iter()
+                .find(|option| option.reasoning_effort == p::ReasoningEffort::Medium)
+                .map(|option| option.reasoning_effort)
+        })
+        .or_else(|| {
+            supported_reasoning_efforts
+                .first()
+                .map(|option| option.reasoning_effort)
+        })
+        .unwrap_or(p::ReasoningEffort::None);
 
     p::Model {
         id,
@@ -235,7 +254,7 @@ fn translate_pi_model(model: &PiAvailableModel, is_default: bool) -> p::Model {
         description,
         hidden: false,
         supported_reasoning_efforts,
-        default_reasoning_effort: p::ReasoningEffort::Medium,
+        default_reasoning_effort,
         input_modalities: model
             .input_modalities
             .clone()
@@ -247,8 +266,11 @@ fn translate_pi_model(model: &PiAvailableModel, is_default: bool) -> p::Model {
     }
 }
 
-fn filter_models_by_enabled_models(models: Vec<PiAvailableModel>) -> Vec<PiAvailableModel> {
-    let Some(patterns) = enabled_model_patterns_from_settings() else {
+async fn filter_models_by_enabled_models(
+    state: &ConnectionState,
+    models: Vec<PiAvailableModel>,
+) -> Vec<PiAvailableModel> {
+    let Some(patterns) = enabled_model_patterns_from_settings(state).await else {
         return models;
     };
     filter_models_with_patterns(models, &patterns)
@@ -275,9 +297,22 @@ fn filter_models_with_patterns(
     filtered
 }
 
-fn enabled_model_patterns_from_settings() -> Option<Vec<String>> {
-    let path = pi_settings_path()?;
-    let bytes = std::fs::read_to_string(&path).ok()?;
+async fn enabled_model_patterns_from_settings(state: &ConnectionState) -> Option<Vec<String>> {
+    // Remote/native catalogs must never be filtered by files on the client device.
+    if state.trust_persisted_cwd() {
+        return None;
+    }
+    let path = state
+        .native_settings_path()
+        .map(Path::to_path_buf)
+        .or_else(|| state.model_catalog_path().and_then(|_| pi_settings_path()))?;
+    if path
+        .extension()
+        .is_some_and(|ext| ext == "yml" || ext == "yaml")
+    {
+        return None;
+    }
+    let bytes = tokio::fs::read_to_string(&path).await.ok()?;
     let value: Value = serde_json::from_str(&bytes).ok()?;
     let patterns = value.get("enabledModels")?.as_array()?;
     Some(
@@ -421,6 +456,12 @@ fn display_name_with_provider(provider: &str, display_name: &str) -> String {
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PiAvailableModel {
+    #[serde(default)]
+    reasoning: Option<bool>,
+    #[serde(default)]
+    thinking_level_map: std::collections::HashMap<String, Value>,
+    #[serde(default)]
+    thinking: Option<PiThinkingConfig>,
     /// Provider key (e.g. "openai", "anthropic", "groq").
     #[serde(default)]
     provider: Option<String>,
@@ -444,6 +485,14 @@ struct PiAvailableModel {
     /// pass through verbatim and let codex pick what it understands.
     #[serde(default, alias = "input")]
     input_modalities: Option<Vec<Value>>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PiThinkingConfig {
+    #[serde(default)]
+    efforts: Vec<String>,
+    default_level: Option<String>,
 }
 
 fn parse_pi_models_response(value: &Value) -> Vec<PiAvailableModel> {
@@ -474,21 +523,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn translate_pi_model_synthesizes_id_and_efforts() {
+    fn native_capabilities_do_not_advertise_unsupported_efforts() {
+        let native: PiAvailableModel = serde_json::from_value(json!({
+            "id": "native", "reasoning": true,
+            "thinkingLevelMap": {"minimal": null, "high": null, "max": "max"}
+        }))
+        .unwrap();
+        let model = translate_pi_model(&native, true, true);
+        assert_eq!(
+            model
+                .supported_reasoning_efforts
+                .iter()
+                .map(|option| option.reasoning_effort)
+                .collect::<Vec<_>>(),
+            vec![
+                p::ReasoningEffort::Low,
+                p::ReasoningEffort::Medium,
+                p::ReasoningEffort::Max
+            ]
+        );
+        let non_reasoning: PiAvailableModel = serde_json::from_value(json!({
+            "id": "fast", "reasoning": false, "thinkingLevelMap": {"max": "max"}
+        }))
+        .unwrap();
+        let model = translate_pi_model(&non_reasoning, false, true);
+        assert!(model.supported_reasoning_efforts.is_empty());
+        assert_eq!(model.default_reasoning_effort, p::ReasoningEffort::None);
+    }
+
+    #[test]
+    fn omp_uses_explicit_efforts_and_native_default() {
+        let native: PiAvailableModel = serde_json::from_value(json!({
+            "id": "native", "reasoning": true,
+            "thinking": {"efforts": ["low", "xhigh", "max"], "defaultLevel": "xhigh"}
+        }))
+        .unwrap();
+        let model = translate_pi_model(&native, true, false);
+        assert_eq!(model.supported_reasoning_efforts.len(), 3);
+        assert_eq!(model.default_reasoning_effort, p::ReasoningEffort::XHigh);
+        let native: PiAvailableModel =
+            serde_json::from_value(json!({"id": "fixed", "reasoning": true})).unwrap();
+        assert!(
+            translate_pi_model(&native, false, false)
+                .supported_reasoning_efforts
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn translate_pi_model_preserves_declared_capabilities() {
         let pi = PiAvailableModel {
             provider: Some("openai".into()),
             model_id: Some("gpt-5".into()),
             display_name: Some("GPT-5".into()),
             description: Some("Codex flagship model".into()),
+            reasoning: Some(true),
             input_modalities: Some(vec![json!("text"), json!("image")]),
             ..Default::default()
         };
-        let m = translate_pi_model(&pi, true);
+        let m = translate_pi_model(&pi, true, true);
         assert_eq!(m.id, "openai/gpt-5");
         assert_eq!(m.model, "gpt-5");
         assert_eq!(m.display_name, "GPT-5 (openai)");
         assert!(m.is_default);
-        assert_eq!(m.supported_reasoning_efforts.len(), 6);
+        assert_eq!(m.supported_reasoning_efforts.len(), 4);
         assert!(matches!(
             m.default_reasoning_effort,
             p::ReasoningEffort::Medium
@@ -503,7 +601,7 @@ mod tests {
             id: Some("haiku".into()),
             ..Default::default()
         };
-        let m = translate_pi_model(&pi, false);
+        let m = translate_pi_model(&pi, false, true);
         assert_eq!(m.id, "pi/haiku");
         assert_eq!(m.model, "haiku");
         assert_eq!(m.display_name, "haiku");
@@ -518,7 +616,7 @@ mod tests {
             display_name: Some("OpenAI GPT-5".into()),
             ..Default::default()
         };
-        let m = translate_pi_model(&pi, false);
+        let m = translate_pi_model(&pi, false, true);
         assert_eq!(m.display_name, "OpenAI GPT-5");
     }
 
@@ -559,6 +657,7 @@ mod tests {
                 translate_pi_model(
                     model,
                     default_index.map_or(index == 0, |default| index == default),
+                    true,
                 )
             })
             .collect::<Vec<_>>();
@@ -692,11 +791,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_model_list_returns_empty_when_pi_spawn_fails() {
-        // The dummy pool's `pi_bin` is `/dev/null`, so `acquire_utility`
-        // tries to spawn `/dev/null --mode rpc` and fails. The handler
-        // contract is to log + return an empty list, never propagate the
-        // spawn error to the codex client.
+    async fn handle_model_list_propagates_discovery_failure() {
+        // Failed discovery must not erase a previously successful client catalog.
         let dir = tempfile::tempdir().unwrap();
         let index = crate::index::ThreadIndex::open_at(dir.path().join("threads.json"))
             .await
@@ -708,7 +804,6 @@ mod tests {
             Default::default(),
         );
         let resp = handle_model_list(&state, p::ModelListParams::default()).await;
-        assert!(resp.data.is_empty());
-        assert!(resp.next_cursor.is_none());
+        assert!(resp.is_err());
     }
 }

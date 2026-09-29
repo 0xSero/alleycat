@@ -37,7 +37,7 @@ async fn detach_then_reattach_replays_missed_frames() {
     assert_eq!(f1.payload["method"], "turn/started");
 
     // Client disconnects.
-    session.drop_attachment();
+    session.drop_attachment(a.generation);
     drop(a);
 
     // Producer keeps running while detached.
@@ -66,7 +66,7 @@ async fn fresh_attach_after_drop_when_resume_cursor_omitted() {
     let session = Arc::new(Session::new("pi", "node-A".into(), 64, 1 << 20));
     session.enqueue(notif("event-1"));
     let _a = session.install_attachment(None);
-    session.drop_attachment();
+    session.drop_attachment(_a.generation);
 
     // Reattach without resume cursor — caller treats it as a fresh client,
     // backlog is empty even though the ring still has the frame.
@@ -82,7 +82,7 @@ async fn drift_when_cursor_predates_ring_floor() {
     session.enqueue(notif("a"));
     session.enqueue(notif("b"));
     session.enqueue(notif("c"));
-    session.drop_attachment();
+    session.drop_attachment(_a.generation);
 
     let b = session.install_attachment(Some(0));
     assert!(matches!(
@@ -117,7 +117,7 @@ async fn outstanding_server_request_redelivered_on_reattach() {
     session.enqueue(notif("turn/progress"));
 
     // Client disconnects mid-prompt, before answering.
-    session.drop_attachment();
+    session.drop_attachment(_a.generation);
 
     // Reattach within the grace window. After backlog replay, the drainer
     // emits a `serverRequest/replay` notification listing the still-
@@ -158,7 +158,7 @@ async fn pending_grace_expiry_cancels_outstanding_requests() {
     let (tx, rx) = oneshot::channel::<Result<Value, ServerRequestError>>();
     let req_id = session.next_request_id();
     session.register_pending(req_id, "command/approve".into(), json!({}), tx);
-    session.drop_attachment();
+    session.drop_attachment(_a.generation);
 
     // Manual reaper tick: pending_grace=0 so we cancel immediately;
     // idle_ttl is large so the session itself sticks around.
@@ -218,7 +218,7 @@ async fn auto_resume_uses_server_tracked_cursor_when_no_resume_field() {
     session.note_drainer_attempt(f2.seq);
 
     // Stream dies before the drainer gets to seq 3 / 4.
-    session.drop_attachment();
+    session.drop_attachment(a.generation);
     drop(a);
     session.enqueue(notif("item/completed"));
     session.enqueue(notif("turn/completed"));
@@ -263,7 +263,7 @@ async fn auto_resume_picks_drift_when_buffer_overflowed() {
     let _a = session.install_attachment(None);
     session.note_drainer_attempt(session.enqueue(notif("a")));
     session.note_drainer_attempt(session.enqueue(notif("b")));
-    session.drop_attachment();
+    session.drop_attachment(_a.generation);
     // After detach, the gap continues to fill — pushes seqs that evict
     // the previously-attempted ones from the ring.
     session.enqueue(notif("c"));

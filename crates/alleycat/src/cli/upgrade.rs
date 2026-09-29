@@ -27,8 +27,10 @@ pub async fn run() -> anyhow::Result<()> {
         return Ok(());
     };
 
-    if daemon_version == cli_version {
-        println!("{cli_name}: already running v{cli_version}; nothing to do.");
+    if cli::daemon_is_current_or_newer(&daemon_version, cli_version) {
+        println!(
+            "{cli_name}: daemon v{daemon_version} is current or newer than CLI v{cli_version}; nothing to do."
+        );
         return Ok(());
     }
 

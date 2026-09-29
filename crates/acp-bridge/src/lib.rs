@@ -2,6 +2,7 @@
 
 pub mod acp_client;
 pub mod bridge;
+pub mod catalog;
 pub mod config;
 pub mod handlers;
 pub mod persistence;

@@ -58,6 +58,7 @@ impl Default for SessionConfig {
 pub struct AgentsConfig {
     pub codex: CodexAgentConfig,
     pub pi: PiAgentConfig,
+    pub omp: OmpAgentConfig,
     pub amp: AmpAgentConfig,
     pub opencode: OpencodeAgentConfig,
     pub claude: ClaudeAgentConfig,
@@ -100,6 +101,22 @@ impl Default for PiAgentConfig {
         Self {
             enabled: true,
             bin: "pi".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct OmpAgentConfig {
+    pub enabled: bool,
+    pub bin: String,
+}
+
+impl Default for OmpAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bin: "omp".to_string(),
         }
     }
 }
@@ -389,6 +406,8 @@ mod tests {
         assert_eq!(config.agents.codex.host, "127.0.0.1");
         assert_eq!(config.agents.codex.port, 8390);
         assert!(config.agents.pi.enabled);
+        assert!(config.agents.omp.enabled);
+        assert_eq!(config.agents.omp.bin, "omp");
         assert!(config.agents.opencode.enabled);
         assert!(config.agents.claude.enabled);
         assert!(config.agents.droid.enabled);

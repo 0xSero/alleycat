@@ -56,20 +56,15 @@ const CONTROL_INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// surfaces as an error rather than hanging the turn handler.
 const CONTROL_SET_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Map codex `ReasoningEffort` onto a `--max-thinking-tokens` budget. Values
-/// match the conventions the Anthropic SDK ships with (extended-thinking docs)
-/// — tweak in lockstep with `pi-bridge`'s `ThinkingLevel` if those drift.
 fn effort_to_thinking_tokens(effort: p::ReasoningEffort) -> u32 {
     match effort {
         p::ReasoningEffort::None => 0,
         p::ReasoningEffort::Minimal => 1024,
         p::ReasoningEffort::Low => 4096,
         p::ReasoningEffort::Medium => 16_384,
-        p::ReasoningEffort::High => 32_768,
-        // codex uses XHigh only on a few gpt-5.x models; claude has no
-        // direct equivalent so we cap at the High budget.
-        p::ReasoningEffort::XHigh => 32_768,
-        p::ReasoningEffort::Max => 32_768,
+        p::ReasoningEffort::High
+        | p::ReasoningEffort::XHigh
+        | p::ReasoningEffort::Max => 32_768,
     }
 }
 
@@ -146,6 +141,18 @@ pub async fn handle_turn_start(
         return Err(TurnError::ClaudeRpc(format!(
             "applying runtime overrides: {err}"
         )));
+    }
+
+    if let Some(effort) = params.effort.filter(|effort| {
+        !matches!(
+            effort,
+            p::ReasoningEffort::None | p::ReasoningEffort::Minimal
+        )
+    }) {
+        handle
+            .apply_effort(effort, CONTROL_SET_TIMEOUT)
+            .await
+            .map_err(|error| TurnError::ClaudeRpc(format!("applying native effort: {error}")))?;
     }
 
     let turn_id = Uuid::now_v7().to_string();

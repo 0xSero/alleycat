@@ -8,6 +8,7 @@ const FACTORY_PROTOCOL_VERSION: &str = "1.36.0";
 fn main() {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let mut settings = json!({"modelId":"gpt-5.6-sol", "reasoningEffort":"medium"});
     for line in stdin.lock().lines().map_while(Result::ok) {
         let Ok(frame) = serde_json::from_str::<Value>(&line) else {
             continue;
@@ -17,11 +18,23 @@ fn main() {
         let params = frame.get("params").cloned().unwrap_or_else(|| json!({}));
         match method {
             "droid.initialize_session" | "droid.load_session" => {
+                if let Some(model) = params.get("modelId").and_then(Value::as_str) {
+                    settings["modelId"] = json!(model);
+                }
                 response(
                     &mut stdout,
                     id,
-                    json!({"sessionId": params.get("sessionId")}),
+                    json!({"sessionId": params.get("sessionId"), "settings": settings}),
                 );
+            }
+            "droid.list_models" => {
+                response(&mut stdout, id, serde_json::from_str(include_str!("../fixtures/models.json")).unwrap());
+            }
+            "droid.update_session_settings" => {
+                for key in ["modelId", "reasoningEffort"] {
+                    if let Some(value) = params.get(key) { settings[key] = value.clone(); }
+                }
+                response(&mut stdout, id, json!({"settings":settings}));
             }
             "droid.list_tools" => {
                 response(
@@ -38,6 +51,10 @@ fn main() {
             }
             "droid.add_user_message" => {
                 let prompt = prompt_text(&params);
+                if prompt.contains("check-native-model-effort") && (settings["modelId"] != "claude-opus-5" || settings["reasoningEffort"] != "max") {
+                    error(&mut stdout, id, -32602, "model/effort settings did not reach native runtime");
+                    continue;
+                }
                 response(&mut stdout, id, json!({}));
                 scripted_turn(&mut stdout, &prompt);
             }

@@ -696,7 +696,6 @@ impl EventTranslatorState {
                 }
                 AgentMessage::ToolResult(_) | AgentMessage::Other(_) => {}
             }
-
         }
         if (self.open_message_item.is_some() || self.open_reasoning_item.is_some())
             && !self

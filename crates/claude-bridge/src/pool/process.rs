@@ -177,6 +177,7 @@ struct InitSlot {
 struct RuntimeState {
     model: Option<String>,
     thinking_tokens: Option<u32>,
+    effort: Option<serde_json::Value>,
     permission_mode: Option<String>,
 }
 
@@ -330,6 +331,7 @@ impl ClaudeProcessHandle {
         let runtime_state = Arc::new(Mutex::new(RuntimeState {
             model: model.clone(),
             thinking_tokens: None,
+            effort: None,
             permission_mode: None,
         }));
 
@@ -503,6 +505,36 @@ impl ClaudeProcessHandle {
         }
     }
 
+    /// Apply native adaptive effort without translating distinct levels into
+    /// the same legacy fixed-token budget. The flag layer is session-only.
+    pub async fn apply_effort(
+        &self,
+        effort: alleycat_codex_proto::ReasoningEffort,
+        deadline: Duration,
+    ) -> Result<(), ClaudeProcessError> {
+        let value = serde_json::to_value(effort)?;
+        if self.runtime_state.lock().await.effort.as_ref() == Some(&value) {
+            return Ok(());
+        }
+        if self.runtime_state.lock().await.thinking_tokens.is_some() {
+            self.request_control(
+                ControlRequestBody::SetMaxThinkingTokens { max_thinking_tokens: None },
+                deadline,
+            )
+            .await?;
+            self.runtime_state.lock().await.thinking_tokens = None;
+        }
+        self.request_control(
+            ControlRequestBody::ApplyFlagSettings {
+                settings: serde_json::json!({"effortLevel":value}),
+            },
+            deadline,
+        )
+        .await?;
+        self.runtime_state.lock().await.effort = Some(value);
+        Ok(())
+    }
+
     /// Apply per-turn runtime overrides via `control_request` setters and
     /// remember what was applied so subsequent calls only dispatch the diff.
     ///
@@ -535,6 +567,7 @@ impl ClaudeProcessHandle {
                 .await?;
                 let mut guard = self.runtime_state.lock().await;
                 guard.model = Some(want.to_string());
+                guard.effort = None;
             }
         }
         if let Some(want) = thinking_tokens {
@@ -544,12 +577,13 @@ impl ClaudeProcessHandle {
             };
             if need_dispatch {
                 self.request_control(
-                    ControlRequestBody::SetMaxThinkingTokens { tokens: want },
+                    ControlRequestBody::SetMaxThinkingTokens { max_thinking_tokens: Some(want) },
                     deadline,
                 )
                 .await?;
                 let mut guard = self.runtime_state.lock().await;
                 guard.thinking_tokens = Some(want);
+                guard.effort = None;
             }
         }
         if let Some(want) = permission_mode {
@@ -797,6 +831,79 @@ mod tests {
             ClaudeProcessHandle::__test_dangling(writer_tx, events_tx, PathBuf::from("/tmp"));
         let result = handle.wait_for_init(Duration::from_millis(50)).await;
         assert!(matches!(result, Err(ClaudeProcessError::InitTimeout)));
+    }
+
+    async fn answer_control(
+        handle: &ClaudeProcessHandle,
+        writer: &mut mpsc::UnboundedReceiver<String>,
+        response: ControlResponseBody,
+    ) -> serde_json::Value {
+        let line = writer.recv().await.expect("control request");
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let waiter = handle.pending_controls_handle().lock().await
+            .remove(request["request_id"].as_str().unwrap()).unwrap();
+        waiter.send(response).unwrap();
+        request["request"].clone()
+    }
+
+    #[tokio::test]
+    async fn native_effort_preserves_levels_and_skips_unchanged_setting() {
+        use alleycat_codex_proto::ReasoningEffort;
+        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel();
+        let (events_tx, _) = broadcast::channel(8);
+        let handle = Arc::new(ClaudeProcessHandle::__test_dangling(
+            writer_tx, events_tx, PathBuf::from("/tmp"),
+        ));
+        for (effort, expected) in [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::XHigh, "xhigh"),
+            (ReasoningEffort::Max, "max"),
+        ] {
+            let h = handle.clone();
+            let task = tokio::spawn(async move { h.apply_effort(effort, Duration::from_secs(1)).await });
+            let request = answer_control(&handle, &mut writer_rx,
+                ControlResponseBody::Success { response: None }).await;
+            assert_eq!(request, serde_json::json!({
+                "subtype": "apply_flag_settings", "settings": { "effortLevel": expected }
+            }));
+            task.await.unwrap().unwrap();
+            handle.apply_effort(effort, Duration::from_millis(10)).await.unwrap();
+            assert!(writer_rx.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn native_effort_resets_legacy_budget_and_retries_failed_changes() {
+        use alleycat_codex_proto::ReasoningEffort;
+        let (writer_tx, mut writer_rx) = mpsc::unbounded_channel();
+        let (events_tx, _) = broadcast::channel(8);
+        let handle = Arc::new(ClaudeProcessHandle::__test_dangling(
+            writer_tx, events_tx, PathBuf::from("/tmp"),
+        ));
+        let h = handle.clone();
+        let task = tokio::spawn(async move {
+            h.apply_runtime_overrides(None, Some(1024), None, Duration::from_secs(1)).await
+        });
+        assert_eq!(answer_control(&handle, &mut writer_rx,
+            ControlResponseBody::Success { response: None }).await,
+            serde_json::json!({ "subtype": "set_max_thinking_tokens", "max_thinking_tokens": 1024 }));
+        task.await.unwrap().unwrap();
+        let h = handle.clone();
+        let task = tokio::spawn(async move { h.apply_effort(ReasoningEffort::Max, Duration::from_secs(1)).await });
+        assert_eq!(answer_control(&handle, &mut writer_rx,
+            ControlResponseBody::Success { response: None }).await,
+            serde_json::json!({ "subtype": "set_max_thinking_tokens", "max_thinking_tokens": null }));
+        answer_control(&handle, &mut writer_rx,
+            ControlResponseBody::Error { error: "try again".into() }).await;
+        assert!(task.await.unwrap().is_err());
+        let h = handle.clone();
+        let task = tokio::spawn(async move { h.apply_effort(ReasoningEffort::Max, Duration::from_secs(1)).await });
+        let request = answer_control(&handle, &mut writer_rx,
+            ControlResponseBody::Success { response: None }).await;
+        assert_eq!(request["settings"]["effortLevel"], "max");
+        task.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -11,11 +11,11 @@ mod framing;
 pub mod grants;
 mod host;
 mod ipc;
+mod local_studio;
+pub mod paths;
 // Typed Local Studio realtime contract only. This module is intentionally
 // private until the transport and capability policy land together.
 mod local_studio_realtime;
-mod local_studio;
-pub mod paths;
 mod protocol;
 mod service;
 mod state;

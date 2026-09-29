@@ -19,6 +19,7 @@
 //! to re-implement the eviction / capacity loop.
 
 pub mod claude_protocol;
+mod catalog;
 pub mod process;
 
 use std::path::{Path, PathBuf};

@@ -35,6 +35,7 @@ pub struct DroidProcess {
     events_tx: broadcast::Sender<Value>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     _tasks: Arc<TaskSet>,
+    pub(crate) settings: Mutex<Value>,
 }
 
 struct TaskSet {
@@ -174,6 +175,7 @@ impl DroidProcess {
             writer_tx,
             events_tx,
             pending,
+            settings: Mutex::new(json!({})),
             _tasks: Arc::new(TaskSet {
                 writer: Mutex::new(Some(writer)),
                 reader: Mutex::new(Some(reader)),
@@ -233,7 +235,11 @@ impl DroidProcess {
                     .unwrap_or("unknown error")
             ));
         }
-        Ok(response.get("result").cloned().unwrap_or(Value::Null))
+        let result = response.get("result").cloned().unwrap_or(Value::Null);
+        if result["settings"].is_object() {
+            *self.settings.lock().await = result["settings"].clone();
+        }
+        Ok(result)
     }
 }
 

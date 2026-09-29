@@ -115,7 +115,9 @@ pub enum ControlRequestBody {
     /// Toggle permission mode mid-thread (e.g. `default → bypassPermissions`).
     SetPermissionMode { mode: String },
     /// Cap the thinking budget in tokens.
-    SetMaxThinkingTokens { tokens: u32 },
+    SetMaxThinkingTokens { max_thinking_tokens: Option<u32> },
+    /// Session-scoped native settings, including adaptive effort (xhigh/max).
+    ApplyFlagSettings { settings: Value },
     /// Cancel a single subagent task by its task id.
     StopTask { task_id: String },
     /// Roll the on-disk transcript back to the supplied user message id.

@@ -1,0 +1,74 @@
+{
+  "models": [
+    {
+      "id": "claude-opus-5",
+      "modelId": "claude-opus-5",
+      "modelProvider": "anthropic",
+      "displayName": "Opus 5",
+      "supportedReasoningEfforts": [
+        "off",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoningEffort": "high",
+      "noImageSupport": false,
+      "disabled": false,
+      "deprecated": false,
+      "isCustom": false
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "modelId": "gpt-5.6-sol",
+      "modelProvider": "openai",
+      "displayName": "GPT-5.6 Sol",
+      "supportedReasoningEfforts": [
+        "none",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
+      "defaultReasoningEffort": "medium",
+      "noImageSupport": false,
+      "disabled": false,
+      "deprecated": false,
+      "isCustom": false
+    },
+    {
+      "id": "glm-5.3",
+      "modelId": "glm-5.3",
+      "modelProvider": "factory",
+      "displayName": "GLM-5.3",
+      "supportedReasoningEfforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "defaultReasoningEffort": "max",
+      "noImageSupport": true,
+      "disabled": false,
+      "deprecated": false,
+      "isCustom": false
+    },
+    {
+      "id": "custom:Direct-Claude-Opus-4.6-0",
+      "modelProvider": "anthropic",
+      "displayName": "Direct - Claude Opus 4.6",
+      "supportedReasoningEfforts": [
+        "off",
+        "low",
+        "medium",
+        "high",
+        "max"
+      ],
+      "defaultReasoningEffort": "high",
+      "noImageSupport": false,
+      "disabled": false,
+      "isCustom": true
+    }
+  ]
+}

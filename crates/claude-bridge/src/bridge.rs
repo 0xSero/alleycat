@@ -378,18 +378,21 @@ async fn dispatch_request(
                 decode(params)?
             };
             let resp = handlers::config::handle_config_read(state, codex_home, typed)
+                .await
                 .map_err(|err| internal(err.to_string()))?;
             to_value(resp)
         }
         "config/value/write" => {
             let typed: p::ConfigValueWriteParams = decode(params)?;
             let resp = handlers::config::handle_config_value_write(state, codex_home, typed)
+                .await
                 .map_err(|err| internal(err.to_string()))?;
             to_value(resp)
         }
         "config/batchWrite" => {
             let typed: p::ConfigBatchWriteParams = decode(params)?;
             let resp = handlers::config::handle_config_batch_write(state, codex_home, typed)
+                .await
                 .map_err(|err| internal(err.to_string()))?;
             to_value(resp)
         }
@@ -430,7 +433,11 @@ async fn dispatch_request(
             } else {
                 decode(params)?
             };
-            to_value(handlers::model::handle_model_list(state, typed).await)
+            to_value(
+                handlers::model::handle_model_list(state, typed)
+                    .await
+                    .map_err(|error| internal(error.to_string()))?,
+            )
         }
         "skills/list" => {
             let typed: p::SkillsListParams = if params.is_null() {

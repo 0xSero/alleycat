@@ -3,6 +3,33 @@ use std::process::Command;
 
 use alleycat_codex_proto::GitInfo;
 
+/// Render a page without re-running Git for every thread in the same directory.
+/// The cache lasts only for this response; the next request sees fresh metadata.
+/// Git subprocesses run off the async executor so they cannot stall other RPCs.
+pub async fn map_entries_with_git_info<M, T, F>(
+    entries: Vec<crate::IndexEntry<M>>,
+    mut convert: F,
+) -> anyhow::Result<Vec<T>>
+where
+    M: Send + 'static,
+    T: Send + 'static,
+    F: FnMut(&crate::IndexEntry<M>, Option<GitInfo>) -> T + Send + 'static,
+{
+    Ok(tokio::task::spawn_blocking(move || {
+        let mut by_cwd = std::collections::HashMap::new();
+        entries
+            .iter()
+            .map(|entry| {
+                let info = by_cwd
+                    .entry(&entry.cwd)
+                    .or_insert_with(|| git_info_for_cwd(&entry.cwd));
+                convert(entry, info.clone())
+            })
+            .collect()
+    })
+    .await?)
+}
+
 /// Best-effort Git metadata for a thread cwd.
 ///
 /// Codex derives this from the working directory when listing threads. Bridges
@@ -52,6 +79,95 @@ fn git_output(cwd: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn entry(cwd: &Path, id: usize) -> crate::IndexEntry<()> {
+        serde_json::from_value(serde_json::json!({
+            "threadId": id.to_string(), "cwd": cwd.to_string_lossy(),
+            "createdAt": 0, "updatedAt": 0, "preview": "", "modelProvider": "test",
+            "source": "appServer"
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn page_lookup_is_fresh_between_requests_and_runs_off_executor() {
+        let repo = tempfile::tempdir().unwrap();
+        let plain = tempfile::tempdir().unwrap();
+        assert!(run_git(repo.path(), &["init", "-b", "main"]));
+        assert!(run_git(
+            repo.path(),
+            &["remote", "add", "origin", "https://example.com/old.git"]
+        ));
+        let entries = vec![
+            entry(repo.path(), 0),
+            entry(repo.path(), 1),
+            entry(plain.path(), 2),
+            entry(plain.path(), 3),
+        ];
+        let executor = std::thread::current().id();
+        let page = map_entries_with_git_info(entries.clone(), move |entry, info| {
+            assert_ne!(std::thread::current().id(), executor);
+            // Changes during projection must not trigger repeat lookups in a page.
+            if entry.thread_id == "0" {
+                assert!(run_git(
+                    Path::new(&entry.cwd),
+                    &["remote", "set-url", "origin", "https://example.com/new.git"]
+                ));
+            } else if entry.thread_id == "2" {
+                assert!(run_git(Path::new(&entry.cwd), &["init", "-b", "new-repo"]));
+            }
+            (entry.thread_id.clone(), info)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            page.iter().map(|row| row.0.as_str()).collect::<Vec<_>>(),
+            ["0", "1", "2", "3"]
+        );
+        for (_, info) in &page[..2] {
+            assert_eq!(
+                info.as_ref().unwrap().origin_url.as_deref(),
+                Some("https://example.com/old.git")
+            );
+        }
+        assert!(page[2].1.is_none() && page[3].1.is_none());
+        let refreshed = map_entries_with_git_info(entries, |_, info| info)
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed[0].as_ref().unwrap().origin_url.as_deref(),
+            Some("https://example.com/new.git")
+        );
+        assert_eq!(
+            refreshed[2].as_ref().unwrap().branch.as_deref(),
+            Some("new-repo")
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "manual subprocess latency measurement"]
+    async fn profile_repeated_directory_page() {
+        let repo = tempfile::tempdir().unwrap();
+        assert!(run_git(repo.path(), &["init", "-b", "main"]));
+        let entries: Vec<_> = (0..25).map(|id| entry(repo.path(), id)).collect();
+        for iteration in 0..5 {
+            let start = std::time::Instant::now();
+            let baseline: Vec<_> = entries
+                .iter()
+                .map(|entry| git_info_for_cwd(&entry.cwd))
+                .collect();
+            let baseline_ms = start.elapsed().as_secs_f64() * 1000.0;
+            let start = std::time::Instant::now();
+            let actual = map_entries_with_git_info(entries.clone(), |_, info| info)
+                .await
+                .unwrap();
+            let candidate_ms = start.elapsed().as_secs_f64() * 1000.0;
+            assert_eq!(actual, baseline);
+            eprintln!(
+                "iteration={iteration} baseline_ms={baseline_ms:.3} candidate_ms={candidate_ms:.3} threads=25 distinct_cwds=1"
+            );
+        }
+    }
 
     fn run_git(cwd: &Path, args: &[&str]) -> bool {
         Command::new("git")
