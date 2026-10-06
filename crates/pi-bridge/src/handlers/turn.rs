@@ -597,6 +597,7 @@ async fn run_event_pump(mut args: EventPumpArgs) {
     );
     let mut stop_reason: Option<pi::StopReason> = None;
     let mut error_message: Option<String> = None;
+    let mut saw_agent_start = false;
 
     loop {
         let event = match args.events_rx.recv().await {
@@ -635,42 +636,39 @@ async fn run_event_pump(mut args: EventPumpArgs) {
                 approval::ApprovalKind::Command,
             )
         {
+            // Pi is already running the command, so the approval only decides
+            // whether to abort. Ask off the pump: awaiting here stalled the
+            // event stream up to the approval timeout per tool call, which
+            // lagged the broadcast channel and froze the client transcript.
             let item_id = Uuid::now_v7().to_string();
             let cmd_str = tool_args
                 .get("command")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
-            let outcome = approval::request_command_approval(
-                &args.state,
-                p::CommandExecutionRequestApprovalParams {
-                    thread_id: args.thread_id.clone(),
-                    turn_id: args.turn_id.clone(),
-                    item_id,
-                    command: cmd_str,
-                    ..Default::default()
-                },
-                None,
-            )
-            .await;
-            if let Ok(outcome) = outcome {
-                if outcome.should_abort_turn() {
-                    let _ = args
-                        .handle
-                        .send_request(pi::RpcCommand::Abort(pi::BareCmd::default()))
-                        .await;
+            let state = Arc::clone(&args.state);
+            let handle = Arc::clone(&args.handle);
+            let thread_id = args.thread_id.clone();
+            let params = p::CommandExecutionRequestApprovalParams {
+                thread_id: args.thread_id.clone(),
+                turn_id: args.turn_id.clone(),
+                item_id,
+                command: cmd_str,
+                ..Default::default()
+            };
+            tokio::spawn(async move {
+                match approval::request_command_approval(&state, params, None).await {
+                    Ok(outcome) if outcome.should_abort_turn() => {
+                        let _ = handle
+                            .send_request(pi::RpcCommand::Abort(pi::BareCmd::default()))
+                            .await;
+                    }
+                    Ok(_) => {}
+                    Err(_) => tracing::warn!(
+                        thread_id = %thread_id,
+                        "approval request failed; command already running"
+                    ),
                 }
-                // Approve / decline: we still forward pi's events
-                // since the command is already running. The codex
-                // client treats `decline` as "let it finish but
-                // don't auto-trust similar commands later" — that
-                // matches pi's behavior anyway.
-                let _ = outcome;
-            } else {
-                tracing::warn!(
-                    thread_id = %args.thread_id,
-                    "approval request failed; forwarding tool item anyway"
-                );
-            }
+            });
         }
 
         // Extension UI bridging. Pi → codex → client → codex → pi.
@@ -699,6 +697,19 @@ async fn run_event_pump(mut args: EventPumpArgs) {
         if matches!(&event, pi::PiEvent::AgentEnd { .. }) {
             break;
         }
+        // Newer omp reports prompts that never started an agent run; no
+        // `agent_end` follows, so without this the turn stays open forever
+        // and every later prompt is queued behind it.
+        if let Some(message) = prompt_never_ran(&event, saw_agent_start) {
+            if stop_reason.is_none() {
+                stop_reason = Some(pi::StopReason::Error);
+                error_message = Some(message);
+            }
+            break;
+        }
+        if matches!(&event, pi::PiEvent::AgentStart) {
+            saw_agent_start = true;
+        }
     }
 
     for notif in translator.finish() {
@@ -720,6 +731,35 @@ async fn run_event_pump(mut args: EventPumpArgs) {
 
     clear_active_turn(&args.thread_id);
     args.state.pi_pool().mark_idle(&args.thread_id).await;
+}
+
+/// `Some(error text)` when omp says this prompt ended without an agent run
+/// (or the session settled before one began).
+fn prompt_never_ran(event: &pi::PiEvent, saw_agent_start: bool) -> Option<String> {
+    match event {
+        pi::PiEvent::PromptResult {
+            agent_invoked: false,
+            error,
+            session_settled,
+            ..
+        } if error.is_some() || *session_settled => Some(
+            error
+                .as_ref()
+                .map(|e| match e {
+                    serde_json::Value::String(s) => s.clone(),
+                    other => other
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| other.to_string()),
+                })
+                .unwrap_or_else(|| "the agent did not start".to_string()),
+        ),
+        pi::PiEvent::SessionSettled if !saw_agent_start => {
+            Some("the agent did not start".to_string())
+        }
+        _ => None,
+    }
 }
 
 fn event_terminal_state(event: &pi::PiEvent) -> Option<(pi::StopReason, Option<String>)> {

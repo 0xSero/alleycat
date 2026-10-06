@@ -4,12 +4,14 @@ pub mod framing;
 pub mod git_info;
 pub mod launch_environment;
 pub mod launcher;
+pub mod model_catalog;
 pub mod notify;
 pub mod pool;
 pub mod server;
 pub mod session;
 pub mod state;
 pub mod thread_index;
+pub mod turn_interrupt;
 
 pub use envelope::{
     InboundMessage, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
@@ -23,7 +25,9 @@ pub use launcher::{
     ChildProcess, ChildStderr, ChildStdin, ChildStdout, LocalLauncher, ProcessLauncher,
     ProcessRole, ProcessSpec, StdioMode,
 };
+pub use model_catalog::{CachedCatalogBridge, ModelCatalogCache};
 pub use notify::NotificationSender;
+pub use turn_interrupt::InterruptCompletionBridge;
 pub use server::{Bridge, Conn, serve_stdio, serve_stream, serve_stream_with_session};
 #[cfg(unix)]
 pub use server::{ServerOptions, serve_unix};
